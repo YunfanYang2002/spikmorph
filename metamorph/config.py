@@ -365,6 +365,9 @@ _C.MODEL.OBS_TO_NORM = ["proprioceptive"]
 # Wrappers to add specific to model
 _C.MODEL.WRAPPERS = ["MultiUnimalNodeCentricObservation", "MultiUnimalNodeCentricAction"]
 
+# Encoder backend for limb sequence modeling
+_C.MODEL.ENCODER_TYPE = "transformer"
+
 # --------------------------------------------------------------------------- #
 # Transformer Options
 # --------------------------------------------------------------------------- #
@@ -397,6 +400,26 @@ _C.MODEL.TRANSFORMER.EXT_MIX = "none"
 
 # Type of position embedding to use: None, learnt
 _C.MODEL.TRANSFORMER.POS_EMBEDDING = "learnt"
+
+# --------------------------------------------------------------------------- #
+# Spiking Encoder Options
+# --------------------------------------------------------------------------- #
+_C.MODEL.SPIKE = CN()
+
+# Number of internal SNN timesteps
+_C.MODEL.SPIKE.T = 4
+
+# Spiking neuron type: lif, plif
+_C.MODEL.SPIKE.NEURON = "lif"
+
+# Membrane time constant / initial tau
+_C.MODEL.SPIKE.TAU = 2.0
+
+# Whether to detach spike reset from gradients
+_C.MODEL.SPIKE.DETACH_RESET = True
+
+# SpikingJelly backend. Prefer cupy and fall back to torch at runtime if needed.
+_C.MODEL.SPIKE.BACKEND = "cupy"
 
 # --------------------------------------------------------------------------- #
 # Finetuning Options

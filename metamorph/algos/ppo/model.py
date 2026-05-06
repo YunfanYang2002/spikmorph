@@ -31,17 +31,45 @@ class TransformerModel(nn.Module):
         elif self.model_args.POS_EMBEDDING == "abs":
             self.pos_embedding = PositionalEncoding1D(self.d_model, self.seq_len)
 
-        # Transformer Encoder
-        encoder_layers = TransformerEncoderLayerResidual(
-            cfg.MODEL.LIMB_EMBED_SIZE,
-            self.model_args.NHEAD,
-            self.model_args.DIM_FEEDFORWARD,
-            self.model_args.DROPOUT,
-        )
+        encoder_type = cfg.MODEL.ENCODER_TYPE.lower()
+        if encoder_type == "transformer":
+            encoder_layers = TransformerEncoderLayerResidual(
+                cfg.MODEL.LIMB_EMBED_SIZE,
+                self.model_args.NHEAD,
+                self.model_args.DIM_FEEDFORWARD,
+                self.model_args.DROPOUT,
+            )
+            self.transformer_encoder = TransformerEncoder(
+                encoder_layers, self.model_args.NLAYERS, norm=None,
+            )
+        elif encoder_type == "spiking":
+            try:
+                from .spiking_transformer import SpikingTransformerEncoder
+                from .spiking_transformer import SpikingTransformerEncoderLayerResidual
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "MODEL.ENCODER_TYPE='spiking' requires spikingjelly to be installed."
+                ) from exc
 
-        self.transformer_encoder = TransformerEncoder(
-            encoder_layers, self.model_args.NLAYERS, norm=None,
-        )
+            spike_args = cfg.MODEL.SPIKE
+            encoder_layers = SpikingTransformerEncoderLayerResidual(
+                cfg.MODEL.LIMB_EMBED_SIZE,
+                self.model_args.NHEAD,
+                self.model_args.DIM_FEEDFORWARD,
+                self.model_args.DROPOUT,
+                spike_t=spike_args.T,
+                spike_neuron=spike_args.NEURON,
+                spike_tau=spike_args.TAU,
+                detach_reset=spike_args.DETACH_RESET,
+                backend=spike_args.BACKEND,
+            )
+            self.transformer_encoder = SpikingTransformerEncoder(
+                encoder_layers, self.model_args.NLAYERS, norm=None,
+            )
+        else:
+            raise ValueError(
+                "Unsupported MODEL.ENCODER_TYPE: {}".format(cfg.MODEL.ENCODER_TYPE)
+            )
 
         # Map encoded observations to per node action mu or critic value
         decoder_input_dim = self.d_model

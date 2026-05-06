@@ -1,0 +1,2 @@
+我注意到snn原论文里是先做k和v的乘法（在model/spikformer中有所体现），作者说这样具有一定优势。
+请你把spiking_transformer中_forward_impl里的处理也改成类似model/spikformer中的那样先做k和v的乘法。
