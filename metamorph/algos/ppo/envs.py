@@ -57,6 +57,7 @@ def make_vec_envs(
 
     if seed is None:
         seed = cfg.RNG_SEED
+    seed += cfg.RANK * num_env
 
     if len(cfg.ENV.WALKERS) <= 1 or render_policy or save_video:
         if len(cfg.ENV.WALKERS) == 1:
@@ -93,6 +94,7 @@ def make_vec_envs(
 def make_vec_envs_zs():
     device = torch.device(cfg.DEVICE)
     seed = cfg.RNG_SEED
+    seed += cfg.RANK * cfg.PPO.NUM_ENVS
     norm_rew = False
     training = False
 

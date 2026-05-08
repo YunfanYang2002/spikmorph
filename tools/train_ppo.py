@@ -7,6 +7,7 @@ import torch
 from metamorph.algos.ppo.ppo import PPO
 from metamorph.config import cfg
 from metamorph.config import dump_cfg
+from metamorph.utils import distributed as du
 from metamorph.utils import file as fu
 from metamorph.utils import sample as su
 from metamorph.utils import sweep as swu
@@ -42,11 +43,14 @@ def calculate_max_limbs_joints():
 
 def calculate_max_iters():
     # Iter here refers to 1 cycle of experience collection and policy update.
+    total_num_envs = cfg.PPO.NUM_ENVS * cfg.WORLD_SIZE
     cfg.PPO.MAX_ITERS = (
-        int(cfg.PPO.MAX_STATE_ACTION_PAIRS) // cfg.PPO.TIMESTEPS // cfg.PPO.NUM_ENVS
+        int(cfg.PPO.MAX_STATE_ACTION_PAIRS) // cfg.PPO.TIMESTEPS // total_num_envs
     )
     cfg.PPO.EARLY_EXIT_MAX_ITERS = (
-        int(cfg.PPO.EARLY_EXIT_STATE_ACTION_PAIRS) // cfg.PPO.TIMESTEPS // cfg.PPO.NUM_ENVS
+        int(cfg.PPO.EARLY_EXIT_STATE_ACTION_PAIRS)
+        // cfg.PPO.TIMESTEPS
+        // total_num_envs
     )
 
 
@@ -122,7 +126,7 @@ def parse_args():
 
 
 def ppo_train():
-    su.set_seed(cfg.RNG_SEED)
+    su.set_seed(cfg.RNG_SEED, idx=cfg.RANK)
     # Configure the CUDNN backend
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = cfg.CUDNN.BENCHMARK
@@ -144,13 +148,18 @@ def main():
     # Load config options
     cfg.merge_from_file(args.cfg_file)
     cfg.merge_from_list(args.opts)
+    du.init_distributed_mode()
     # Set cfg options which are inferred
     set_cfg_options()
-    os.makedirs(cfg.OUT_DIR, exist_ok=True)
+    if du.is_main_process():
+        os.makedirs(cfg.OUT_DIR, exist_ok=True)
+        dump_cfg()
+    du.synchronize()
 
-    # Save the config
-    dump_cfg()
-    ppo_train()
+    try:
+        ppo_train()
+    finally:
+        du.destroy_process_group()
 
 
 if __name__ == "__main__":

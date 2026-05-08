@@ -492,6 +492,12 @@ _C.NODE_ID = -1
 # Number of nodes
 _C.NUM_NODES = 1
 
+# Runtime distributed process info. These are inferred at launch time.
+_C.RANK = 0
+_C.LOCAL_RANK = 0
+_C.WORLD_SIZE = 1
+_C.DISTRIBUTED = False
+
 # Unimal template path relative to the basedir
 _C.UNIMAL_TEMPLATE = "./metamorph/envs/assets/unimal.xml"
 
