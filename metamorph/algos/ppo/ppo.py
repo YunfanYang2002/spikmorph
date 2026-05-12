@@ -324,7 +324,7 @@ class PPO:
             else:
                 if cfg.TASK_SAMPLING.AVG_TYPE == "ema":
                     ep_lens = [
-                        np.mean(self.train_meter.agent_meters[agent].ep_len_ema)
+                        self.train_meter.agent_meters[agent].ep_len_ema
                         for agent in cfg.ENV.WALKERS
                     ]
                 elif cfg.TASK_SAMPLING.AVG_TYPE == "moving_window":
@@ -332,10 +332,21 @@ class PPO:
                         np.mean(self.train_meter.agent_meters[agent].ep_len)
                         for agent in cfg.ENV.WALKERS
                     ]
+        else:
+            ep_lens = [1000] * num_agents
 
-        probs = [1000.0 / l for l in ep_lens]
-        probs = np.power(probs, cfg.TASK_SAMPLING.PROB_ALPHA)
-        probs = [p / sum(probs) for p in probs]
+        # Robustify against invalid EMA values (-1), NaN and non-positive lens.
+        ep_lens = np.asarray(ep_lens, dtype=np.float64)
+        invalid_mask = ~np.isfinite(ep_lens) | (ep_lens <= 0.0)
+        ep_lens[invalid_mask] = 1000.0
+
+        probs = 1000.0 / ep_lens
+        probs = np.power(np.maximum(probs, 0.0), cfg.TASK_SAMPLING.PROB_ALPHA)
+        probs_sum = probs.sum()
+        if not np.isfinite(probs_sum) or probs_sum <= 0:
+            probs = np.ones(num_agents, dtype=np.float64) / num_agents
+        else:
+            probs = probs / probs_sum
 
         # Estimate approx number of episodes each subproc env can rollout
         avg_ep_len = np.mean([
