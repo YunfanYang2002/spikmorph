@@ -138,7 +138,8 @@ def ppo_train():
     hparams = get_hparams()
     PPOTrainer.save_rewards(hparams=hparams)
     PPOTrainer.save_model()
-    cleanup_tensorboard()
+    if du.is_main_process():
+        cleanup_tensorboard()
 
 
 def main():
