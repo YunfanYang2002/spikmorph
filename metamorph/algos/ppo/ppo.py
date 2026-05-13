@@ -48,6 +48,7 @@ class PPO:
         if print_model and du.is_main_process():
             print(self.actor_critic_model)
             print("Num params: {}".format(mu.num_params(self.actor_critic_model)))
+            self._print_controller_param_stats()
 
         self.actor_critic_model.to(self.device)
         if du.is_distributed():
@@ -81,6 +82,29 @@ class PPO:
         #     print(name, weight.requires_grad)
 
         self.fps = 0
+
+    def _print_controller_param_stats(self):
+        if not hasattr(self.actor_critic_model, "v_net") or not hasattr(
+            self.actor_critic_model, "mu_net"
+        ):
+            return
+
+        v_net = self.actor_critic_model.v_net
+        mu_net = self.actor_critic_model.mu_net
+        v_params = mu.num_params(v_net)
+        mu_params = mu.num_params(mu_net)
+        ctrl_total = v_params + mu_params
+
+        print("Controller params (v_net): {}".format(v_params))
+        print("Controller params (mu_net): {}".format(mu_params))
+        print("Controller params (v_net + mu_net): {}".format(ctrl_total))
+
+        if hasattr(v_net, "transformer_encoder") and hasattr(mu_net, "transformer_encoder"):
+            v_enc = mu.num_params(v_net.transformer_encoder)
+            mu_enc = mu.num_params(mu_net.transformer_encoder)
+            print("Controller encoder params (v_net): {}".format(v_enc))
+            print("Controller encoder params (mu_net): {}".format(mu_enc))
+            print("Controller encoder params (v_net + mu_net): {}".format(v_enc + mu_enc))
 
     def train(self):
         self.save_sampled_agent_seq(0)
