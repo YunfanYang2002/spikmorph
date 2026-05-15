@@ -3,14 +3,22 @@ try:
 except ImportError:
     from gymnasium.envs.registration import register
 
-register(
+def _safe_register(**kwargs):
+    try:
+        register(**kwargs)
+    except TypeError:
+        kwargs.pop("disable_env_checker", None)
+        register(**kwargs)
+
+
+_safe_register(
     id="Unimal-v0",
     entry_point="metamorph.envs.tasks.task:make_env",
     max_episode_steps=1000,
     disable_env_checker=True,
 )
 
-register(
+_safe_register(
     id="GeneralWalker2D-v0",
     entry_point="metamorph.envs.tasks.gen_walker_2d:make_env",
     max_episode_steps=1000,
