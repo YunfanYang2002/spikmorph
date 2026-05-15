@@ -1,6 +1,9 @@
 import os
 
-from gym.wrappers.monitoring import video_recorder
+try:
+    from gym.wrappers.monitoring import video_recorder
+except ImportError:
+    from gymnasium.wrappers.monitoring import video_recorder
 
 from .vec_env import VecEnvWrapper
 

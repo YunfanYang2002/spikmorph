@@ -13,14 +13,21 @@ from metamorph.envs.vec_env.pytorch_vec_env import VecPyTorch
 from metamorph.envs.vec_env.subproc_vec_env import SubprocVecEnv
 from metamorph.envs.vec_env.vec_normalize import VecNormalize
 from metamorph.envs.wrappers.multi_env_wrapper import MultiEnvWrapper
+from metamorph.utils import gym_compat as gu
 
 
 def make_env(env_id, seed, rank, xml_file=None):
     def _thunk():
+        make_kwargs = {"disable_env_checker": True}
         if env_id in CUSTOM_ENVS:
-            env = gym.make(env_id, agent_name=xml_file)
+            make_kwargs["agent_name"] = xml_file
         else:
-            env = gym.make(env_id)
+            make_kwargs = {"disable_env_checker": True}
+        try:
+            env = gym.make(env_id, **make_kwargs)
+        except TypeError:
+            make_kwargs.pop("disable_env_checker", None)
+            env = gym.make(env_id, **make_kwargs)
         # Note this does not change the global seeds. It creates a numpy
         # rng gen for env.
         env.seed(seed + rank)
@@ -161,14 +168,14 @@ def set_ob_rms(venv, ob_rms):
 # Checks whether done was caused my timit limits or not
 class TimeLimitMask(gym.Wrapper):
     def step(self, action):
-        obs, rew, done, info = self.env.step(action)
+        obs, rew, done, info = gu.normalize_step(self.env.step(action))
         if done and self.env._max_episode_steps == self.env._elapsed_steps:
             info["timeout"] = True
 
         return obs, rew, done, info
 
     def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
+        return gu.normalize_reset(self.env.reset(**kwargs))
 
 
 class RecordEpisodeStatistics(gym.Wrapper):
@@ -186,15 +193,17 @@ class RecordEpisodeStatistics(gym.Wrapper):
         self.length_queue = deque(maxlen=deque_size)
 
     def reset(self, **kwargs):
-        observation = super(RecordEpisodeStatistics, self).reset(**kwargs)
+        observation = gu.normalize_reset(
+            super(RecordEpisodeStatistics, self).reset(**kwargs)
+        )
         self.episode_return = 0.0
         self.episode_length = 0
         return observation
 
     def step(self, action):
-        observation, reward, done, info = super(
-            RecordEpisodeStatistics, self
-        ).step(action)
+        observation, reward, done, info = gu.normalize_step(
+            super(RecordEpisodeStatistics, self).step(action)
+        )
         self.episode_return += reward
         self.episode_length += 1
         for key, value in info.items():

@@ -1,8 +1,8 @@
 import itertools
 
 from lxml import etree
-from mujoco_py import MjSim
-from mujoco_py import load_model_from_xml
+
+from metamorph.utils import mujoco_compat as mujoco_api
 
 
 def mj_name2id(sim, type_, name):
@@ -35,13 +35,13 @@ def mj_id2name(sim, type_, id_):
 
 def mjsim_from_etree(root):
     """Return MjSim from etree root."""
-    return MjSim(mjmodel_from_etree(root))
+    return mujoco_api.make_sim(mjmodel_from_etree(root))
 
 
 def mjmodel_from_etree(root):
     """Return MjModel from etree root."""
     model_string = etree.tostring(root, encoding="unicode", pretty_print=True)
-    return load_model_from_xml(model_string)
+    return mujoco_api.load_model_from_xml(model_string)
 
 
 def joint_qpos_idxs(sim, joint_name):

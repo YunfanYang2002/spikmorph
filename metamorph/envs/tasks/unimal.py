@@ -2,7 +2,6 @@ import os
 from collections import OrderedDict
 
 import gym
-import mujoco_py
 import numpy as np
 from gym import spaces
 from gym.utils import seeding
@@ -10,6 +9,7 @@ from gym.utils import seeding
 from metamorph.config import cfg
 from metamorph.utils import exception as exu
 from metamorph.utils import file as fu
+from metamorph.utils import mujoco_compat as mujoco_api
 from metamorph.utils import spaces as spu
 from metamorph.utils import sample as su
 from metamorph.utils import xml as xu
@@ -91,8 +91,8 @@ class UnimalEnv(gym.Env):
             module.modify_xml_step(self, root, tree)
 
         xml_str = xu.etree_to_str(root)
-        model = mujoco_py.load_model_from_xml(xml_str)
-        sim = mujoco_py.MjSim(model)
+        model = mujoco_api.load_model_from_xml(xml_str)
+        sim = mujoco_api.make_sim(model)
         # Update module fields which require sim
         for _, module in self.modules.items():
             module.modify_sim_step(self, sim)
@@ -188,7 +188,8 @@ class UnimalEnv(gym.Env):
             self.sim.model.nv,
         )
         old_state = self.sim.get_state()
-        new_state = mujoco_py.MjSimState(
+        new_state = mujoco_api.make_sim_state(
+            self.sim,
             old_state.time, qpos, qvel, old_state.act, old_state.udd_state
         )
         self.sim.set_state(new_state)
@@ -237,11 +238,11 @@ class UnimalEnv(gym.Env):
             if no_camera_specified:
                 camera_name = "side"
 
-            if (
-                camera_id is None
-                and camera_name in self.sim.model._camera_name2id
-            ):
-                camera_id = self.sim.model.camera_name2id(camera_name)
+            if camera_id is None:
+                try:
+                    camera_id = self.sim.model.camera_name2id(camera_name)
+                except Exception:
+                    camera_id = None
 
             self._get_viewer(mode).render(width, height, camera_id=camera_id)
             # window size used for old mujoco-py:
@@ -264,9 +265,9 @@ class UnimalEnv(gym.Env):
         self.viewer = self._viewers.get(mode)
         if self.viewer is None:
             if mode == "human":
-                self.viewer = mujoco_py.MjViewer(self.sim)
+                self.viewer = mujoco_api.make_human_viewer(self.sim)
             elif mode == "rgb_array" or mode == "depth_array":
-                self.viewer = mujoco_py.MjRenderContextOffscreen(self.sim, -1)
+                self.viewer = mujoco_api.make_offscreen_viewer(self.sim)
 
             self.viewer_setup()
             self._viewers[mode] = self.viewer

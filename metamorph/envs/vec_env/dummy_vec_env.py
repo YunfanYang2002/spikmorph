@@ -1,5 +1,7 @@
 import numpy as np
 
+from metamorph.utils import gym_compat as gu
+
 from .utils import copy_obs_dict
 from .utils import dict_to_obs
 from .utils import obs_space_info
@@ -67,9 +69,9 @@ class DummyVecEnv(VecEnv):
                 self.buf_rews[e],
                 self.buf_dones[e],
                 self.buf_infos[e],
-            ) = self.envs[e].step(action)
+            ) = gu.normalize_step(self.envs[e].step(action))
             if self.buf_dones[e]:
-                obs = self.envs[e].reset()
+                obs = gu.normalize_reset(self.envs[e].reset())
             self._save_obs(e, obs)
         return (
             self._obs_from_buf(),
@@ -80,7 +82,7 @@ class DummyVecEnv(VecEnv):
 
     def reset(self):
         for e in range(self.num_envs):
-            obs = self.envs[e].reset()
+            obs = gu.normalize_reset(self.envs[e].reset())
             self._save_obs(e, obs)
         return self._obs_from_buf()
 
