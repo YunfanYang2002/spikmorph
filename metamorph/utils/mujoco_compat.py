@@ -65,7 +65,15 @@ def _obj_type(type_):
 
 def _all_names(model, type_):
     obj_type = _obj_type(type_)
-    num = getattr(model, "n{}".format(type_))
+    count_attr = {
+        "site": "nsite",
+        "geom": "ngeom",
+        "body": "nbody",
+        "sensor": "nsensor",
+        "joint": "njnt",
+        "camera": "ncam",
+    }[type_]
+    num = getattr(model, count_attr)
     names = []
     for idx in range(num):
         name = mujoco.mj_id2name(model, obj_type, idx)
@@ -78,6 +86,16 @@ class ModelAdapter:
         self._model = model
 
     def __getattr__(self, name):
+        if name == "body_names":
+            return self.body_names
+        if name == "geom_names":
+            return self.geom_names
+        if name == "site_names":
+            return self.site_names
+        if name == "joint_names":
+            return self.joint_names
+        if name == "sensor_names":
+            return self.sensor_names
         return getattr(self._model, name)
 
     @property

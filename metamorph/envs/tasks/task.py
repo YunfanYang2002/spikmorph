@@ -8,7 +8,7 @@ from metamorph.envs.wrappers.select_keys import SelectKeysWrapper
 from metamorph.utils import file as fu
 
 
-def make_env(agent_name):
+def make_env(agent_name, **_kwargs):
     xml_path = os.path.join(
         cfg.ENV.WALKER_DIR, "xml", "{}.xml".format(agent_name)
     )
