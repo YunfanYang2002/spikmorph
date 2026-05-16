@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -71,7 +72,17 @@ class PPO:
         self.train_meter = TrainMeter()
         self.writer = None
         if du.is_main_process():
-            self.writer = SummaryWriter(log_dir=os.path.join(cfg.OUT_DIR, "tensorboard"))
+            tb_root = os.path.join(cfg.OUT_DIR, "tensorboard")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_name = "run_lr{}_gamma{}_enc{}_ac{}_{}".format(
+                cfg.PPO.BASE_LR,
+                cfg.PPO.GAMMA,
+                cfg.MODEL.ENCODER_TYPE,
+                cfg.MODEL.ACTOR_CRITIC,
+                timestamp,
+            )
+            log_dir = os.path.join(tb_root, run_name)
+            self.writer = SummaryWriter(log_dir=log_dir)
         # Get the param name for log_std term, can vary depending on arch
         for name, param in self.actor_critic.state_dict().items():
             if "log_std" in name:
