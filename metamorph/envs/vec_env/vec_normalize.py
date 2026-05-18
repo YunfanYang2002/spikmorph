@@ -79,6 +79,7 @@ class VecNormalize(VecEnvWrapper):
         else:
             obs_p = obs
 
+        obs_p = np.nan_to_num(obs_p, nan=0.0, posinf=0.0, neginf=0.0)
         if self.training and update:
             self.ob_rms[obs_type].update(obs_p)
 
@@ -88,6 +89,7 @@ class VecNormalize(VecEnvWrapper):
             -self.clipob,
             self.clipob,
         )
+        obs_p = np.nan_to_num(obs_p, nan=0.0, posinf=0.0, neginf=0.0)
         if isinstance(obs, dict):
             obs[obs_type] = obs_p
         else:

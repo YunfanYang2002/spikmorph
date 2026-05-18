@@ -410,8 +410,21 @@ class PPO:
 
     def _sync_running_mean_std(self, rms):
         gathered = du.all_gather_object((rms.mean, rms.var, rms.count))
-        mean, var, count = gathered[0]
-        for batch_mean, batch_var, batch_count in gathered[1:]:
+        valid_stats = []
+        for batch_mean, batch_var, batch_count in gathered:
+            if batch_count is None or batch_count <= 0 or not np.isfinite(batch_count):
+                continue
+            batch_mean = np.asarray(batch_mean, dtype=np.float64)
+            batch_var = np.asarray(batch_var, dtype=np.float64)
+            if not np.all(np.isfinite(batch_mean)) or not np.all(np.isfinite(batch_var)):
+                continue
+            valid_stats.append((batch_mean, batch_var, float(batch_count)))
+
+        if not valid_stats:
+            return
+
+        mean, var, count = valid_stats[0]
+        for batch_mean, batch_var, batch_count in valid_stats[1:]:
             mean, var, count = update_mean_var_count_from_moments(
                 mean, var, count, batch_mean, batch_var, batch_count
             )
