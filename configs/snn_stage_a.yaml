@@ -1,0 +1,11 @@
+RNG_SEED: 1409
+DESC: "Stage A: compact spiking transformer (3 layers, FFN 256)"
+ENV:
+  MODULES: ["Agent", "Floor"]
+MODEL:
+  ENCODER_TYPE: "spiking"
+  TRANSFORMER:
+    DIM_FEEDFORWARD: 256
+    NLAYERS: 3
+TERRAIN:
+  SIZE: [100, 100, 1]
