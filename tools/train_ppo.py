@@ -45,10 +45,10 @@ def calculate_max_iters():
     # Iter here refers to 1 cycle of experience collection and policy update.
     total_num_envs = cfg.PPO.NUM_ENVS * cfg.WORLD_SIZE
     cfg.PPO.MAX_ITERS = (
-        int(cfg.PPO.MAX_STATE_ACTION_PAIRS) // cfg.PPO.TIMESTEPS // total_num_envs
+        cfg.PPO.MAX_STATE_ACTION_PAIRS // cfg.PPO.TIMESTEPS // total_num_envs
     )
     cfg.PPO.EARLY_EXIT_MAX_ITERS = (
-        int(cfg.PPO.EARLY_EXIT_STATE_ACTION_PAIRS)
+        cfg.PPO.EARLY_EXIT_STATE_ACTION_PAIRS
         // cfg.PPO.TIMESTEPS
         // total_num_envs
     )
@@ -133,13 +133,18 @@ def ppo_train():
         torch.backends.cudnn.deterministic = cfg.CUDNN.DETERMINISTIC
 
     torch.set_num_threads(1)
-    PPOTrainer = PPO()
-    PPOTrainer.train()
-    hparams = get_hparams()
-    PPOTrainer.save_rewards(hparams=hparams)
-    PPOTrainer.save_model()
-    if du.is_main_process():
-        cleanup_tensorboard()
+    ppo_trainer = None
+    try:
+        ppo_trainer = PPO()
+        ppo_trainer.train()
+        hparams = get_hparams()
+        ppo_trainer.save_rewards(hparams=hparams)
+        ppo_trainer.save_model()
+        if du.is_main_process():
+            cleanup_tensorboard()
+    finally:
+        if ppo_trainer is not None:
+            ppo_trainer.close()
 
 
 def main():

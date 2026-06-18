@@ -19,6 +19,7 @@ from metamorph.utils.meter import TrainMeter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import tensorboard
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
 from .buffer import Buffer
 from .envs import get_ob_rms
@@ -124,10 +125,18 @@ class PPO:
         self.buffer.to(self.device)
         self.start = time.time()
 
-        for cur_iter in range(cfg.PPO.MAX_ITERS):
+        num_iters = cfg.PPO.MAX_ITERS
+        if cfg.PPO.EARLY_EXIT:
+            num_iters = min(num_iters, cfg.PPO.EARLY_EXIT_MAX_ITERS)
+        progress = tqdm(
+            range(num_iters),
+            desc="PPO training",
+            unit="update",
+            dynamic_ncols=True,
+            disable=not du.is_main_process(),
+        )
 
-            if cfg.PPO.EARLY_EXIT and cur_iter >= cfg.PPO.EARLY_EXIT_MAX_ITERS:
-                break
+        for cur_iter in progress:
 
             lr = ou.get_iter_lr(cur_iter)
             ou.set_lr(self.optimizer, lr)
@@ -167,6 +176,17 @@ class PPO:
                 self.writer.add_scalar(
                     'Reward', cur_rew, self.env_steps_done(cur_iter)
                 )
+            if du.is_main_process():
+                elapsed = max(time.time() - self.start, 1e-6)
+                postfix = {
+                    "steps": self.env_steps_done(cur_iter),
+                    "fps": int(self.env_steps_done(cur_iter) / elapsed),
+                }
+                if len(self.train_meter.mean_ep_rews["reward"]):
+                    postfix["reward"] = "{:.3f}".format(
+                        self.train_meter.mean_ep_rews["reward"][-1]
+                    )
+                progress.set_postfix(postfix, refresh=False)
             if (
                 cur_iter > 0
                 and cur_iter % cfg.LOG_PERIOD == 0
@@ -178,6 +198,15 @@ class PPO:
 
         if du.is_main_process():
             print("Finished Training: {}".format(self.file_prefix))
+
+    def close(self):
+        """Release logging and environment resources deterministically."""
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+        if self.envs is not None:
+            self.envs.close()
+            self.envs = None
 
     def train_on_batch(self, cur_iter):
         adv = self.buffer.ret - self.buffer.val
@@ -384,13 +413,13 @@ class PPO:
             probs = probs / probs_sum
 
         # Estimate approx number of episodes each subproc env can rollout
-        avg_ep_len = np.mean([
-            np.mean(self.train_meter.agent_meters[agent].ep_len)
+        observed_ep_lens = [
+            ep_len
             for agent in cfg.ENV.WALKERS
-        ])
-        # In the start the arrays will be empty
-        if np.isnan(avg_ep_len):
-            avg_ep_len = 100
+            for ep_len in self.train_meter.agent_meters[agent].ep_len
+        ]
+        # Short smoke runs may finish before any complete episode is observed.
+        avg_ep_len = np.mean(observed_ep_lens) if observed_ep_lens else 100.0
         ep_per_env = cfg.PPO.TIMESTEPS / avg_ep_len
         # Task list size (multiply by 8 as padding)
         size = int(ep_per_env * cfg.PPO.NUM_ENVS * 50)

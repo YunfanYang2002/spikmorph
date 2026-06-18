@@ -292,7 +292,7 @@ _C.PPO.MAX_GRAD_NORM = 0.5
 
 # Total number of env.step() across all processes and all rollouts over the
 # course of training
-_C.PPO.MAX_STATE_ACTION_PAIRS = 1e8
+_C.PPO.MAX_STATE_ACTION_PAIRS = 100_000_000
 
 # Iter here refers to 1 cycle of experience collection and policy update.
 # Refer PPO paper. This is field is inferred see: calculate_max_iters()
@@ -308,7 +308,7 @@ _C.PPO.CHECKPOINT_PATH = ""
 
 _C.PPO.EARLY_EXIT = False
 
-_C.PPO.EARLY_EXIT_STATE_ACTION_PAIRS = 1e8
+_C.PPO.EARLY_EXIT_STATE_ACTION_PAIRS = 100_000_000
 
 _C.PPO.EARLY_EXIT_MAX_ITERS = -1
 

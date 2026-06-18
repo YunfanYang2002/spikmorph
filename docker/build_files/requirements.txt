@@ -6,3 +6,4 @@ networkx
 mujoco>=3.1
 tensorboard
 spikingjelly==0.0.0.0.12
+tqdm
