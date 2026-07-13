@@ -59,6 +59,11 @@ METADATA_GATE0_FIELDS = (
     "dof_armature",
     "actuator_gear",
     "gravity",
+    "canonical_qpos_mode",
+    "canonical_joint_qpos",
+    "model_default_joint_qpos",
+    "root_qpos_source",
+    "joint_qpos_source",
     "canonical_initial_state_spec",
     "policy_action_semantics",
     "native_action_or_ctrl_semantics",
@@ -161,6 +166,11 @@ def parse_args(argv=None):
         help="Optional Gate 0 hash; mismatch aborts before environment creation.",
     )
     parser.add_argument("--root-z", required=True, type=float)
+    parser.add_argument(
+        "--canonical-qpos-mode",
+        choices=("midpoint", "model-default"),
+        default="midpoint",
+    )
     parser.add_argument("--steps", default=10, type=int)
     parser.add_argument("--joint-name", default="limbx/0")
     parser.add_argument("--action-magnitude", default=0.25, type=float)
@@ -254,6 +264,21 @@ def validate_metadata_gate0(metadata) -> None:
         raise ValueError("unexpected policy_action_semantics")
     if metadata["native_action_or_ctrl_semantics"] != "mujoco_actuator_order_ctrl":
         raise ValueError("unexpected native_action_or_ctrl_semantics")
+    if metadata["canonical_qpos_mode"] not in ("midpoint", "model-default"):
+        raise ValueError("unexpected canonical_qpos_mode")
+    expected_joint_source = (
+        "compiled_model_qpos0"
+        if metadata["canonical_qpos_mode"] == "model-default"
+        else "compiled_joint_range_midpoint"
+    )
+    if metadata["root_qpos_source"] != "explicit":
+        raise ValueError("unexpected root_qpos_source")
+    if metadata["joint_qpos_source"] != expected_joint_source:
+        raise ValueError("unexpected joint_qpos_source")
+    joint_count = len(metadata["joint_names"])
+    for field in ("canonical_joint_qpos", "model_default_joint_qpos"):
+        if len(metadata[field]) != joint_count:
+            raise ValueError("{} length does not match joint_names".format(field))
     expected_control_timestep = (
         float(metadata["physics_timestep_actual"]) * int(metadata["frame_skip"])
     )
@@ -298,7 +323,9 @@ def joint_widths(model, joint_id: int) -> tuple[int, int]:
     return qpos_end - qpos_start, dof_end - dof_start
 
 
-def build_canonical_state(model, root_z: float, joint_names, np):
+def build_canonical_state(model, root_z: float, joint_names, qpos_mode: str, np):
+    if qpos_mode not in ("midpoint", "model-default"):
+        raise ValueError("unsupported canonical qpos mode: {}".format(qpos_mode))
     reference_qpos = np.asarray(model.qpos0, dtype=np.float64).reshape(-1).copy()
     if reference_qpos.shape != (int(model.nq),):
         raise ValueError("model qpos0 length does not match model.nq")
@@ -337,20 +364,21 @@ def build_canonical_state(model, root_z: float, joint_names, np):
         joint_type = int(model.jnt_type[joint_id])
         if joint_type == 3:
             policy_joint_ids.append(joint_id)
-        limited = bool(model.jnt_limited[joint_id])
-        limits = np.asarray(model.jnt_range[joint_id], dtype=np.float64)
-        if joint_type == 3 and limited and np.all(np.isfinite(limits)):
-            qpos[qpos_adr] = float((limits[0] + limits[1]) / 2.0)
-        else:
-            qpos[qpos_adr] = reference_qpos[qpos_adr]
-            fallback_joints.append(
-                {
-                    "joint_id": joint_id,
-                    "joint_name": joint_names[joint_id],
-                    "reason": "unlimited_hinge" if joint_type == 3 and not limited else "non_hinge_or_non_finite_range",
-                    "reference_qpos": float(reference_qpos[qpos_adr]),
-                }
-            )
+        if qpos_mode == "midpoint":
+            limited = bool(model.jnt_limited[joint_id])
+            limits = np.asarray(model.jnt_range[joint_id], dtype=np.float64)
+            if joint_type == 3 and limited and np.all(np.isfinite(limits)):
+                qpos[qpos_adr] = float((limits[0] + limits[1]) / 2.0)
+            else:
+                qpos[qpos_adr] = reference_qpos[qpos_adr]
+                fallback_joints.append(
+                    {
+                        "joint_id": joint_id,
+                        "joint_name": joint_names[joint_id],
+                        "reason": "unlimited_hinge" if joint_type == 3 and not limited else "non_hinge_or_non_finite_range",
+                        "reference_qpos": float(reference_qpos[qpos_adr]),
+                    }
+                )
     if qpos.shape != (int(model.nq),) or qvel.shape != (int(model.nv),):
         raise ValueError("canonical qpos/qvel length does not match compiled model")
     return {
@@ -362,7 +390,20 @@ def build_canonical_state(model, root_z: float, joint_names, np):
         "non_root_joint_ids": non_root_joint_ids,
         "policy_joint_ids": policy_joint_ids,
         "fallback_joints": fallback_joints,
+        "qpos_mode": qpos_mode,
     }
+
+
+def joint_qpos_values(qpos, model, joint_ids, np):
+    values = np.asarray(qpos, dtype=np.float64).reshape(-1)
+    result = []
+    for joint_id in joint_ids:
+        qpos_width, _ = joint_widths(model, joint_id)
+        if qpos_width != 1:
+            raise ValueError("policy joint qpos is not scalar")
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        result.append(float(values[qpos_address]))
+    return result
 
 
 def resolve_target(model, requested_name, joint_names, actuator_names, np):
@@ -441,27 +482,68 @@ def requested_generalized_torque(model, ctrl, non_root_ids, np):
     return torque[dof_indices]
 
 
+def _name_has_prefix(name, prefix):
+    return name == prefix or name.startswith(prefix + "/")
+
+
+def classify_contact_pair(pair):
+    ground = any(
+        _name_has_prefix(pair[field], "floor")
+        for field in ("geom1", "geom2", "body1", "body2")
+    )
+    morphology1 = any(
+        _name_has_prefix(pair["body1"], prefix) for prefix in ("torso", "limb")
+    )
+    morphology2 = any(
+        _name_has_prefix(pair["body2"], prefix) for prefix in ("torso", "limb")
+    )
+    if ground:
+        return "ground"
+    if morphology1 and morphology2:
+        return "self"
+    return "unclassified"
+
+
 def contact_details(sim, geom_names, body_names):
     model, data = sim.model, sim.data
     count = int(data.ncon)
     details = []
+    ground_count = 0
+    self_count = 0
     try:
         geom_bodyid = model.geom_bodyid
         for index in range(count):
             contact = data.contact[index]
             geom1, geom2 = int(contact.geom1), int(contact.geom2)
             body1, body2 = int(geom_bodyid[geom1]), int(geom_bodyid[geom2])
-            details.append(
-                {
-                    "geom1": geom_names[geom1],
-                    "geom2": geom_names[geom2],
-                    "body1": body_names[body1],
-                    "body2": body_names[body2],
-                }
-            )
+            pair = {
+                "geom1": geom_names[geom1],
+                "geom2": geom_names[geom2],
+                "body1": body_names[body1],
+                "body2": body_names[body2],
+            }
+            pair["classification"] = classify_contact_pair(pair)
+            if pair["classification"] == "ground":
+                ground_count += 1
+            elif pair["classification"] == "self":
+                self_count += 1
+            details.append(pair)
     except (AttributeError, IndexError, TypeError):
-        return count, NOT_AVAILABLE
-    return count, details
+        return count, NOT_AVAILABLE, NOT_AVAILABLE, NOT_AVAILABLE
+    return count, ground_count, self_count, details
+
+
+def max_contact_count(current, value):
+    if current == NOT_AVAILABLE or value == NOT_AVAILABLE:
+        return NOT_AVAILABLE
+    return max(int(current), int(value))
+
+
+def contact_free_from_summary(summary, field):
+    values = [item[field] for item in summary.values()]
+    if any(value == NOT_AVAILABLE for value in values):
+        return NOT_AVAILABLE
+    return all(int(value) == 0 for value in values)
 
 
 def force_slice(data, name, dof_indices, np):
@@ -479,7 +561,9 @@ def transition_record(base_env, morphology, case, step, ctrl, canonical, names, 
     joint_ids = canonical["policy_joint_ids"]
     qpos_indices = [int(model.jnt_qposadr[joint_id]) for joint_id in joint_ids]
     dof_indices = non_root_dof_indices(model, joint_ids)
-    contact_count, contacts = contact_details(sim, names["geom"], names["body"])
+    contact_count, ground_count, self_count, contacts = contact_details(
+        sim, names["geom"], names["body"]
+    )
     try:
         actuator_force = np.asarray(data.actuator_force, dtype=np.float64).reshape(-1).copy()
     except (AttributeError, TypeError, ValueError):
@@ -507,6 +591,9 @@ def transition_record(base_env, morphology, case, step, ctrl, canonical, names, 
         "joint_qpos": np.asarray(data.qpos, dtype=np.float64)[qpos_indices].copy(),
         "joint_qvel": np.asarray(data.qvel, dtype=np.float64)[dof_indices].copy(),
         "contact_count_if_available": contact_count,
+        "ground_contact_count_if_available": ground_count,
+        "self_contact_count_if_available": self_count,
+        "contact_pairs_if_available": contacts,
         "contacts_if_available": contacts,
         "done": False,
     }
@@ -585,7 +672,13 @@ def run(args) -> None:
         )
         if target["ctrl_index"] >= np.asarray(sim.data.ctrl).size:
             raise ValueError("target ctrl index is outside sim.data.ctrl")
-        canonical = build_canonical_state(model, args.root_z, names["joint"], np)
+        canonical = build_canonical_state(
+            model,
+            args.root_z,
+            names["joint"],
+            args.canonical_qpos_mode,
+            np,
+        )
         records = []
         contact_summary = {}
         for case in args.cases:
@@ -599,6 +692,8 @@ def run(args) -> None:
             record = transition_record(base, args.morphology, case, 0, ctrl, canonical, names, np)
             records.append(record)
             max_contacts = int(record["contact_count_if_available"])
+            max_ground_contacts = record["ground_contact_count_if_available"]
+            max_self_contacts = record["self_contact_count_if_available"]
             for step in range(1, args.steps + 1):
                 if base.do_simulation(ctrl):
                     raise RuntimeError(
@@ -611,7 +706,19 @@ def run(args) -> None:
                 max_contacts = max(
                     max_contacts, int(record["contact_count_if_available"])
                 )
-            contact_summary[case] = {"max_contact_count": max_contacts}
+                max_ground_contacts = max_contact_count(
+                    max_ground_contacts,
+                    record["ground_contact_count_if_available"],
+                )
+                max_self_contacts = max_contact_count(
+                    max_self_contacts,
+                    record["self_contact_count_if_available"],
+                )
+            contact_summary[case] = {
+                "max_contact_count": max_contacts,
+                "max_ground_contact_count": max_ground_contacts,
+                "max_self_contact_count": max_self_contacts,
+            }
 
         validate_canonical_step0(records, args.cases)
 
@@ -621,6 +728,29 @@ def run(args) -> None:
         policy_joint_ids = canonical["policy_joint_ids"]
         policy_dof_indices = non_root_dof_indices(model, policy_joint_ids)
         policy_joint_names = [names["joint"][joint_id] for joint_id in policy_joint_ids]
+        canonical_joint_qpos = joint_qpos_values(
+            canonical["qpos"], model, policy_joint_ids, np
+        )
+        model_default_joint_qpos = joint_qpos_values(
+            model.qpos0, model, policy_joint_ids, np
+        )
+        joint_qpos_source = (
+            "compiled_model_qpos0"
+            if args.canonical_qpos_mode == "model-default"
+            else "compiled_joint_range_midpoint"
+        )
+        ground_contact_free_valid = contact_free_from_summary(
+            contact_summary, "max_ground_contact_count"
+        )
+        self_contact_free_valid = contact_free_from_summary(
+            contact_summary, "max_self_contact_count"
+        )
+        classified_contact_free_valid = (
+            ground_contact_free_valid and self_contact_free_valid
+            if isinstance(ground_contact_free_valid, bool)
+            and isinstance(self_contact_free_valid, bool)
+            else NOT_AVAILABLE
+        )
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "backend": BACKEND,
@@ -677,12 +807,22 @@ def run(args) -> None:
             "body_inertia": optional_array(model, "body_inertia"),
             "body_ipos": optional_array(model, "body_ipos"),
             "body_iquat": optional_array(model, "body_iquat"),
+            "canonical_qpos_mode": args.canonical_qpos_mode,
+            "canonical_joint_qpos": canonical_joint_qpos,
+            "model_default_joint_qpos": model_default_joint_qpos,
+            "root_qpos_source": "explicit",
+            "joint_qpos_source": joint_qpos_source,
             "canonical_initial_state_spec": {
                 "root_position": [0.0, 0.0, args.root_z],
                 "root_quaternion": [1.0, 0.0, 0.0, 0.0],
                 "root_linear_velocity": [0.0, 0.0, 0.0],
                 "root_angular_velocity": [0.0, 0.0, 0.0],
-                "limited_hinge_qpos": "compiled jnt_range midpoint",
+                "canonical_qpos_mode": args.canonical_qpos_mode,
+                "limited_hinge_qpos": (
+                    "compiled model qpos0 reference"
+                    if args.canonical_qpos_mode == "model-default"
+                    else "compiled jnt_range midpoint"
+                ),
                 "unlimited_or_non_hinge_qpos": "compiled model qpos0 reference",
                 "joint_qvel": "all zero",
                 "fallback_joints": canonical["fallback_joints"],
@@ -703,9 +843,9 @@ def run(args) -> None:
             "steps": args.steps,
             "action_magnitude": args.action_magnitude,
             "contact_summary": contact_summary,
-            "contact_free_valid": all(
-                item["max_contact_count"] == 0 for item in contact_summary.values()
-            ),
+            "ground_contact_free_valid": ground_contact_free_valid,
+            "self_contact_free_valid": self_contact_free_valid,
+            "contact_free_valid": classified_contact_free_valid,
         }
         validate_metadata_gate0(metadata)
         metadata_path_out = output_dir / "metadata.json"

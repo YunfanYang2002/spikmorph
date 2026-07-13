@@ -1,8 +1,10 @@
 """Pure-Python tests for dump_mujoco_transition helpers."""
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -19,6 +21,39 @@ SPEC.loader.exec_module(DUMP)
 
 
 class DumpMujocoTransitionHelpersTest(unittest.TestCase):
+    def cli_args(self, *extra):
+        return [
+            "--cfg", "config.yaml",
+            "--walker-dir", "walkers",
+            "--source-xml", "walker.xml",
+            "--root-z", "2.20",
+            "--output", "dump",
+            *extra,
+        ]
+
+    def test_canonical_qpos_mode_cli(self):
+        self.assertEqual(
+            DUMP.parse_args(self.cli_args()).canonical_qpos_mode,
+            "midpoint",
+        )
+        self.assertEqual(
+            DUMP.parse_args(
+                self.cli_args("--canonical-qpos-mode", "midpoint")
+            ).canonical_qpos_mode,
+            "midpoint",
+        )
+        self.assertEqual(
+            DUMP.parse_args(
+                self.cli_args("--canonical-qpos-mode", "model-default")
+            ).canonical_qpos_mode,
+            "model-default",
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                DUMP.parse_args(
+                    self.cli_args("--canonical-qpos-mode", "invalid")
+                )
+
     def test_sha256_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "payload.bin"
@@ -104,6 +139,12 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                 "physics_timestep_actual": 0.005,
                 "frame_skip": 4,
                 "control_timestep": 0.02,
+                "joint_names": ["limbx/0"],
+                "canonical_qpos_mode": "model-default",
+                "canonical_joint_qpos": [0.25],
+                "model_default_joint_qpos": [0.25],
+                "root_qpos_source": "explicit",
+                "joint_qpos_source": "compiled_model_qpos0",
             }
         )
         DUMP.validate_metadata_gate0(metadata)
@@ -143,6 +184,73 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
         np.testing.assert_allclose(
             DUMP.force_slice(data, "qfrc_actuator", dof_indices, np),
             [49.5, 0.1],
+        )
+
+    def test_model_default_preserves_compiled_joint_qpos(self):
+        model = SimpleNamespace(
+            nq=9,
+            nv=8,
+            njnt=3,
+            qpos0=np.array([9.0, 8.0, 7.0, 0.5, 0.5, 0.5, 0.5, 0.33, -0.44]),
+            jnt_type=np.array([0, 3, 3]),
+            jnt_qposadr=np.array([0, 7, 8]),
+            jnt_dofadr=np.array([0, 6, 7]),
+            jnt_limited=np.array([0, 1, 1]),
+            jnt_range=np.array([[0.0, 0.0], [-2.0, 4.0], [-1.0, 1.0]]),
+        )
+        original_qpos0 = model.qpos0.copy()
+        state = DUMP.build_canonical_state(
+            model, 2.20, ["root", "limbx/0", "limby/0"], "model-default", np
+        )
+        np.testing.assert_allclose(
+            state["qpos"], [0.0, 0.0, 2.20, 1.0, 0.0, 0.0, 0.0, 0.33, -0.44]
+        )
+        np.testing.assert_allclose(state["qvel"], np.zeros(8))
+        np.testing.assert_allclose(model.qpos0, original_qpos0)
+        state["qpos"][7] = 123.0
+        repeated = DUMP.build_canonical_state(
+            model, 2.20, ["root", "limbx/0", "limby/0"], "model-default", np
+        )
+        np.testing.assert_allclose(repeated["qpos"][7:], [0.33, -0.44])
+
+        midpoint = DUMP.build_canonical_state(
+            model, 2.20, ["root", "limbx/0", "limby/0"], "midpoint", np
+        )
+        np.testing.assert_allclose(midpoint["qpos"][7:], [1.0, 0.0])
+
+    def test_contact_pair_classification_is_conservative(self):
+        self.assertEqual(
+            DUMP.classify_contact_pair(
+                {
+                    "geom1": "floor/0",
+                    "geom2": "limb/5",
+                    "body1": "world",
+                    "body2": "limb/5",
+                }
+            ),
+            "ground",
+        )
+        self.assertEqual(
+            DUMP.classify_contact_pair(
+                {
+                    "geom1": "limb/5",
+                    "geom2": "limb/6",
+                    "body1": "limb/5",
+                    "body2": "limb/6",
+                }
+            ),
+            "self",
+        )
+        self.assertEqual(
+            DUMP.classify_contact_pair(
+                {
+                    "geom1": "object/0",
+                    "geom2": "limb/6",
+                    "body1": "object/0",
+                    "body2": "limb/6",
+                }
+            ),
+            "unclassified",
         )
 
 
