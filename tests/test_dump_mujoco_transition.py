@@ -54,6 +54,23 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                     self.cli_args("--canonical-qpos-mode", "invalid")
                 )
 
+    def test_target_joint_initial_position_cli(self):
+        self.assertEqual(
+            DUMP.parse_args(self.cli_args()).target_joint_initial_position,
+            "default",
+        )
+        self.assertEqual(
+            DUMP.parse_args(
+                self.cli_args("--target-joint-initial-position", "midpoint")
+            ).target_joint_initial_position,
+            "midpoint",
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                DUMP.parse_args(
+                    self.cli_args("--target-joint-initial-position", "invalid")
+                )
+
     def test_sha256_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "payload.bin"
@@ -123,6 +140,16 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                 }
             )
         DUMP.validate_canonical_step0(records, ["zero", "positive", "negative"])
+        self.assertEqual(
+            DUMP.validate_step0_joint_qpos(
+                records,
+                ["zero", "positive", "negative"],
+                ["limbx/0", "limby/0"],
+                [0.1, -0.2],
+                "limbx/0",
+            ),
+            0.1,
+        )
         records[-1]["joint_qpos"][0] = 0.2
         with self.assertRaises(ValueError):
             DUMP.validate_canonical_step0(
@@ -140,9 +167,14 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                 "frame_skip": 4,
                 "control_timestep": 0.02,
                 "joint_names": ["limbx/0"],
+                "requested_joint_name": "limbx/0",
                 "canonical_qpos_mode": "model-default",
                 "canonical_joint_qpos": [0.25],
                 "model_default_joint_qpos": [0.25],
+                "target_joint_initial_position_mode": "default",
+                "target_joint_initial_qpos_requested": 0.25,
+                "target_joint_initial_qpos_readback": 0.25,
+                "target_joint_range": [0.0, 1.0],
                 "root_qpos_source": "explicit",
                 "joint_qpos_source": "compiled_model_qpos0",
             }
@@ -196,11 +228,18 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
             jnt_qposadr=np.array([0, 7, 8]),
             jnt_dofadr=np.array([0, 6, 7]),
             jnt_limited=np.array([0, 1, 1]),
-            jnt_range=np.array([[0.0, 0.0], [-2.0, 4.0], [-1.0, 1.0]]),
+            jnt_range=np.array(
+                [[0.0, 0.0], [0.0, 1.04719755], [-1.0, 1.0]]
+            ),
         )
         original_qpos0 = model.qpos0.copy()
         state = DUMP.build_canonical_state(
-            model, 2.20, ["root", "limbx/0", "limby/0"], "model-default", np
+            model,
+            2.20,
+            ["root", "limbx/0", "limby/0"],
+            "model-default",
+            np,
+            target_joint_id=1,
         )
         np.testing.assert_allclose(
             state["qpos"], [0.0, 0.0, 2.20, 1.0, 0.0, 0.0, 0.0, 0.33, -0.44]
@@ -209,14 +248,67 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
         np.testing.assert_allclose(model.qpos0, original_qpos0)
         state["qpos"][7] = 123.0
         repeated = DUMP.build_canonical_state(
-            model, 2.20, ["root", "limbx/0", "limby/0"], "model-default", np
+            model,
+            2.20,
+            ["root", "limbx/0", "limby/0"],
+            "model-default",
+            np,
+            target_joint_id=1,
         )
         np.testing.assert_allclose(repeated["qpos"][7:], [0.33, -0.44])
 
         midpoint = DUMP.build_canonical_state(
-            model, 2.20, ["root", "limbx/0", "limby/0"], "midpoint", np
+            model,
+            2.20,
+            ["root", "limbx/0", "limby/0"],
+            "midpoint",
+            np,
+            target_joint_id=1,
         )
-        np.testing.assert_allclose(midpoint["qpos"][7:], [1.0, 0.0])
+        expected_target_midpoint = (0.0 + 1.04719755) / 2.0
+        np.testing.assert_allclose(
+            midpoint["qpos"][7:], [expected_target_midpoint, 0.0]
+        )
+
+        target_midpoint = DUMP.build_canonical_state(
+            model,
+            2.20,
+            ["root", "limbx/0", "limby/0"],
+            "model-default",
+            np,
+            target_joint_id=1,
+            target_joint_initial_position="midpoint",
+        )
+        np.testing.assert_allclose(
+            target_midpoint["qpos"][7:], [expected_target_midpoint, -0.44]
+        )
+        self.assertEqual(
+            target_midpoint["target_joint_initial_qpos_requested"],
+            expected_target_midpoint,
+        )
+
+    def test_target_midpoint_rejects_unlimited_joint(self):
+        model = SimpleNamespace(
+            nq=8,
+            nv=7,
+            njnt=2,
+            qpos0=np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.25]),
+            jnt_type=np.array([0, 3]),
+            jnt_qposadr=np.array([0, 7]),
+            jnt_dofadr=np.array([0, 6]),
+            jnt_limited=np.array([0, 0]),
+            jnt_range=np.array([[0.0, 0.0], [0.0, 1.0]]),
+        )
+        with self.assertRaisesRegex(ValueError, "not limited"):
+            DUMP.build_canonical_state(
+                model,
+                2.20,
+                ["root", "limbx/0"],
+                "model-default",
+                np,
+                target_joint_id=1,
+                target_joint_initial_position="midpoint",
+            )
 
     def test_contact_pair_classification_is_conservative(self):
         self.assertEqual(

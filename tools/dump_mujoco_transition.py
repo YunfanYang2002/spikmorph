@@ -62,6 +62,10 @@ METADATA_GATE0_FIELDS = (
     "canonical_qpos_mode",
     "canonical_joint_qpos",
     "model_default_joint_qpos",
+    "target_joint_initial_position_mode",
+    "target_joint_initial_qpos_requested",
+    "target_joint_initial_qpos_readback",
+    "target_joint_range",
     "root_qpos_source",
     "joint_qpos_source",
     "canonical_initial_state_spec",
@@ -171,6 +175,11 @@ def parse_args(argv=None):
         choices=("midpoint", "model-default"),
         default="midpoint",
     )
+    parser.add_argument(
+        "--target-joint-initial-position",
+        choices=("default", "midpoint"),
+        default="default",
+    )
     parser.add_argument("--steps", default=10, type=int)
     parser.add_argument("--joint-name", default="limbx/0")
     parser.add_argument("--action-magnitude", default=0.25, type=float)
@@ -254,6 +263,38 @@ def validate_canonical_step0(records, cases) -> None:
         raise ValueError("canonical step 0 state differs between action cases")
 
 
+def validate_step0_joint_qpos(
+    records, cases, joint_names, canonical_joint_qpos, target_joint_name
+):
+    target_index = joint_names.index(target_joint_name)
+    readbacks = []
+    for case in cases:
+        record = next(
+            record
+            for record in records
+            if record.get("case") == case and record.get("step") == 0
+        )
+        readback = jsonable(record["joint_qpos"])
+        if len(readback) != len(canonical_joint_qpos) or any(
+            not math.isclose(
+                float(actual), float(expected), rel_tol=0.0, abs_tol=1e-12
+            )
+            for actual, expected in zip(readback, canonical_joint_qpos)
+        ):
+            raise ValueError(
+                "case {!r} step 0 joint_qpos does not match canonical_joint_qpos".format(
+                    case
+                )
+            )
+        readbacks.append(float(readback[target_index]))
+    if any(
+        not math.isclose(value, readbacks[0], rel_tol=0.0, abs_tol=1e-12)
+        for value in readbacks[1:]
+    ):
+        raise ValueError("target joint step 0 readback differs between cases")
+    return readbacks[0]
+
+
 def validate_metadata_gate0(metadata) -> None:
     missing = [field for field in METADATA_GATE0_FIELDS if field not in metadata]
     if missing:
@@ -267,9 +308,14 @@ def validate_metadata_gate0(metadata) -> None:
     if metadata["canonical_qpos_mode"] not in ("midpoint", "model-default"):
         raise ValueError("unexpected canonical_qpos_mode")
     expected_joint_source = (
-        "compiled_model_qpos0"
+        "compiled_model_qpos0_with_target_joint_midpoint_override"
         if metadata["canonical_qpos_mode"] == "model-default"
-        else "compiled_joint_range_midpoint"
+        and metadata["target_joint_initial_position_mode"] == "midpoint"
+        else (
+            "compiled_model_qpos0"
+            if metadata["canonical_qpos_mode"] == "model-default"
+            else "compiled_joint_range_midpoint"
+        )
     )
     if metadata["root_qpos_source"] != "explicit":
         raise ValueError("unexpected root_qpos_source")
@@ -279,6 +325,23 @@ def validate_metadata_gate0(metadata) -> None:
     for field in ("canonical_joint_qpos", "model_default_joint_qpos"):
         if len(metadata[field]) != joint_count:
             raise ValueError("{} length does not match joint_names".format(field))
+    if metadata["target_joint_initial_position_mode"] not in ("default", "midpoint"):
+        raise ValueError("unexpected target_joint_initial_position_mode")
+    if len(metadata["target_joint_range"]) != 2:
+        raise ValueError("target_joint_range must contain lower and upper limits")
+    target_index = metadata["joint_names"].index(metadata["requested_joint_name"])
+    canonical_target_qpos = float(metadata["canonical_joint_qpos"][target_index])
+    for field in (
+        "target_joint_initial_qpos_requested",
+        "target_joint_initial_qpos_readback",
+    ):
+        if not math.isclose(
+            float(metadata[field]),
+            canonical_target_qpos,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("{} does not match canonical_joint_qpos".format(field))
     expected_control_timestep = (
         float(metadata["physics_timestep_actual"]) * int(metadata["frame_skip"])
     )
@@ -323,9 +386,43 @@ def joint_widths(model, joint_id: int) -> tuple[int, int]:
     return qpos_end - qpos_start, dof_end - dof_start
 
 
-def build_canonical_state(model, root_z: float, joint_names, qpos_mode: str, np):
+def limited_scalar_joint_midpoint(model, joint_id, joint_names, np):
+    if not 0 <= joint_id < int(model.njnt):
+        raise ValueError("target joint id is outside model.njnt")
+    joint_type = int(model.jnt_type[joint_id])
+    if joint_type not in (2, 3) or joint_widths(model, joint_id) != (1, 1):
+        raise ValueError(
+            "target joint {!r} is not a scalar hinge/slide joint".format(
+                joint_names[joint_id]
+            )
+        )
+    if not bool(model.jnt_limited[joint_id]):
+        raise ValueError("target joint {!r} is not limited".format(joint_names[joint_id]))
+    limits = np.asarray(model.jnt_range[joint_id], dtype=np.float64).reshape(-1)
+    if limits.shape != (2,) or not np.all(np.isfinite(limits)):
+        raise ValueError("target joint {!r} has a non-finite range".format(joint_names[joint_id]))
+    return float((limits[0] + limits[1]) / 2.0), limits.copy()
+
+
+def build_canonical_state(
+    model,
+    root_z: float,
+    joint_names,
+    qpos_mode: str,
+    np,
+    target_joint_id=None,
+    target_joint_initial_position: str = "default",
+):
     if qpos_mode not in ("midpoint", "model-default"):
         raise ValueError("unsupported canonical qpos mode: {}".format(qpos_mode))
+    if target_joint_initial_position not in ("default", "midpoint"):
+        raise ValueError(
+            "unsupported target joint initial position: {}".format(
+                target_joint_initial_position
+            )
+        )
+    if target_joint_id is None:
+        raise ValueError("target_joint_id is required")
     reference_qpos = np.asarray(model.qpos0, dtype=np.float64).reshape(-1).copy()
     if reference_qpos.shape != (int(model.nq),):
         raise ValueError("model qpos0 length does not match model.nq")
@@ -362,7 +459,7 @@ def build_canonical_state(model, root_z: float, joint_names, qpos_mode: str, np)
         non_root_joint_ids.append(joint_id)
         qpos_adr = int(model.jnt_qposadr[joint_id])
         joint_type = int(model.jnt_type[joint_id])
-        if joint_type == 3:
+        if joint_type in (2, 3):
             policy_joint_ids.append(joint_id)
         if qpos_mode == "midpoint":
             limited = bool(model.jnt_limited[joint_id])
@@ -379,6 +476,16 @@ def build_canonical_state(model, root_z: float, joint_names, qpos_mode: str, np)
                         "reference_qpos": float(reference_qpos[qpos_adr]),
                     }
                 )
+    target_qpos_address = int(model.jnt_qposadr[target_joint_id])
+    target_joint_range = np.asarray(
+        model.jnt_range[target_joint_id], dtype=np.float64
+    ).reshape(-1).copy()
+    if target_joint_initial_position == "midpoint":
+        target_midpoint, target_joint_range = limited_scalar_joint_midpoint(
+            model, target_joint_id, joint_names, np
+        )
+        qpos[target_qpos_address] = target_midpoint
+    target_joint_initial_qpos_requested = float(qpos[target_qpos_address])
     if qpos.shape != (int(model.nq),) or qvel.shape != (int(model.nv),):
         raise ValueError("canonical qpos/qvel length does not match compiled model")
     return {
@@ -391,6 +498,9 @@ def build_canonical_state(model, root_z: float, joint_names, qpos_mode: str, np)
         "policy_joint_ids": policy_joint_ids,
         "fallback_joints": fallback_joints,
         "qpos_mode": qpos_mode,
+        "target_joint_initial_position_mode": target_joint_initial_position,
+        "target_joint_initial_qpos_requested": target_joint_initial_qpos_requested,
+        "target_joint_range": target_joint_range,
     }
 
 
@@ -415,8 +525,10 @@ def resolve_target(model, requested_name, joint_names, actuator_names, np):
             )
         )
     joint_id = matches[0]
-    if int(model.jnt_type[joint_id]) != 3 or joint_widths(model, joint_id) != (1, 1):
-        raise ValueError("target joint {!r} is not a scalar hinge joint".format(requested_name))
+    if int(model.jnt_type[joint_id]) not in (2, 3) or joint_widths(model, joint_id) != (1, 1):
+        raise ValueError(
+            "target joint {!r} is not a scalar hinge/slide joint".format(requested_name)
+        )
     trnid = np.asarray(model.actuator_trnid, dtype=np.int64)
     try:
         trntype = np.asarray(model.actuator_trntype, dtype=np.int64).reshape(-1)
@@ -678,6 +790,8 @@ def run(args) -> None:
             names["joint"],
             args.canonical_qpos_mode,
             np,
+            target_joint_id=target["joint_id"],
+            target_joint_initial_position=args.target_joint_initial_position,
         )
         records = []
         contact_summary = {}
@@ -735,9 +849,21 @@ def run(args) -> None:
             model.qpos0, model, policy_joint_ids, np
         )
         joint_qpos_source = (
-            "compiled_model_qpos0"
+            "compiled_model_qpos0_with_target_joint_midpoint_override"
             if args.canonical_qpos_mode == "model-default"
-            else "compiled_joint_range_midpoint"
+            and args.target_joint_initial_position == "midpoint"
+            else (
+                "compiled_model_qpos0"
+                if args.canonical_qpos_mode == "model-default"
+                else "compiled_joint_range_midpoint"
+            )
+        )
+        target_joint_initial_qpos_readback = validate_step0_joint_qpos(
+            records,
+            args.cases,
+            policy_joint_names,
+            canonical_joint_qpos,
+            target["runtime_name"],
         )
         ground_contact_free_valid = contact_free_from_summary(
             contact_summary, "max_ground_contact_count"
@@ -810,6 +936,12 @@ def run(args) -> None:
             "canonical_qpos_mode": args.canonical_qpos_mode,
             "canonical_joint_qpos": canonical_joint_qpos,
             "model_default_joint_qpos": model_default_joint_qpos,
+            "target_joint_initial_position_mode": args.target_joint_initial_position,
+            "target_joint_initial_qpos_requested": canonical[
+                "target_joint_initial_qpos_requested"
+            ],
+            "target_joint_initial_qpos_readback": target_joint_initial_qpos_readback,
+            "target_joint_range": canonical["target_joint_range"],
             "root_qpos_source": "explicit",
             "joint_qpos_source": joint_qpos_source,
             "canonical_initial_state_spec": {
@@ -818,6 +950,7 @@ def run(args) -> None:
                 "root_linear_velocity": [0.0, 0.0, 0.0],
                 "root_angular_velocity": [0.0, 0.0, 0.0],
                 "canonical_qpos_mode": args.canonical_qpos_mode,
+                "target_joint_initial_position_mode": args.target_joint_initial_position,
                 "limited_hinge_qpos": (
                     "compiled model qpos0 reference"
                     if args.canonical_qpos_mode == "model-default"
