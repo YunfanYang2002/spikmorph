@@ -205,6 +205,13 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
             }
         )
         DUMP.validate_transition_schema(record)
+        for metadata_only_field in (
+            "runtime_dynamics_schema_version",
+            "runtime_joint_dynamics",
+            "runtime_actuators",
+            "runtime_body_dynamics",
+        ):
+            self.assertNotIn(metadata_only_field, DUMP.TRANSITION_CORE_FIELDS)
         record["requested_torque"] = [50.0]
         with self.assertRaises(ValueError):
             DUMP.validate_transition_schema(record)
@@ -301,6 +308,84 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
         np.testing.assert_allclose(
             DUMP.force_slice(data, "qfrc_actuator", dof_indices, np),
             [49.5, 0.1],
+        )
+
+    def test_runtime_joint_actuator_and_body_dynamics_metadata(self):
+        model = SimpleNamespace(
+            njnt=3,
+            nq=9,
+            nv=8,
+            nu=2,
+            nbody=3,
+            jnt_type=np.array([0, 3, 3]),
+            jnt_qposadr=np.array([0, 7, 8]),
+            jnt_dofadr=np.array([0, 6, 7]),
+            jnt_axis=np.array([[0, 0, 0], [0, 1, 0], [1, 0, 0]], dtype=float),
+            jnt_range=np.array([[0, 0], [0, 1], [-1, 1]], dtype=float),
+            jnt_limited=np.array([0, 1, 1]),
+            dof_damping=np.array([0, 0, 0, 0, 0, 0, 6.0, 7.0]),
+            dof_armature=np.array([0, 0, 0, 0, 0, 0, 0.6, 0.7]),
+            dof_frictionloss=np.array([0, 0, 0, 0, 0, 0, 0.06, 0.07]),
+            jnt_stiffness=np.array([0.0, np.nan, 2.0]),
+            actuator_trnid=np.array([[2, -1], [1, -1]]),
+            actuator_trntype=np.array([0, 0]),
+            actuator_gear=np.array([[150, 0, 0, 0, 0, 0], [200, 0, 0, 0, 0, 0]]),
+            actuator_ctrlrange=np.array([[-1, 1], [-1, 1]], dtype=float),
+            actuator_ctrllimited=np.array([1, 1]),
+            actuator_forcerange=np.array([[-3, 3], [-4, 4]], dtype=float),
+            actuator_forcelimited=np.array([0, 1]),
+            actuator_dyntype=np.array([0, 0]),
+            actuator_gaintype=np.array([0, 0]),
+            body_parentid=np.array([0, 0, 1]),
+            body_mass=np.array([0.0, 5.0, 2.0]),
+            body_ipos=np.array([[0, 0, 0], [0.1, 0.2, 0.3], [0, 0, 0.4]]),
+            body_inertia=np.array([[0, 0, 0], [1, 2, 3], [0.4, 0.5, 0.6]]),
+            body_iquat=np.array([[1, 0, 0, 0], [1, 0, 0, 0], [0.9, 0.1, 0, 0]]),
+            opt=SimpleNamespace(integrator=0, solver=2, iterations=100),
+        )
+        joint_names = ["root", "limbx/0", "limby/9"]
+        actuator_names = ["limby/9", "limbx/0"]
+        body_names = ["world", "torso/0", "limb/5"]
+
+        joints = DUMP.build_runtime_joint_dynamics(model, joint_names, np)
+        self.assertEqual(joints[0]["joint_id"], 1)
+        self.assertEqual(joints[0]["dof_address"], 6)
+        self.assertEqual(joints[0]["qpos_address"], 7)
+        self.assertEqual(joints[0]["damping"], 6.0)
+        self.assertEqual(joints[0]["stiffness"], DUMP.NOT_AVAILABLE)
+        self.assertEqual(joints[0]["spring_reference"], DUMP.NOT_AVAILABLE)
+
+        actuators = DUMP.build_runtime_actuators(
+            model, actuator_names, joint_names, np
+        )
+        self.assertEqual(actuators[0]["target_joint_id"], 2)
+        self.assertEqual(actuators[0]["target_joint_name"], "limby/9")
+        self.assertTrue(actuators[1]["ctrllimited"])
+        self.assertEqual(actuators[0]["biastype"], DUMP.NOT_AVAILABLE)
+
+        bodies = DUMP.build_runtime_body_dynamics(model, body_names, np)
+        self.assertEqual(bodies[0]["parent_body_name"], DUMP.NOT_AVAILABLE)
+        self.assertEqual(bodies[1]["parent_body_name"], "world")
+        self.assertEqual(bodies[2]["parent_body_name"], "torso/0")
+        self.assertEqual(bodies[2]["mass"], 2.0)
+
+        solver = DUMP.build_runtime_solver_metadata(model, np)
+        self.assertEqual(solver["integrator"], "Euler")
+        self.assertEqual(solver["solver"], "Newton")
+        self.assertEqual(solver["iterations"], 100)
+        self.assertEqual(solver["tolerance"], DUMP.NOT_AVAILABLE)
+
+        json.dumps(
+            DUMP.jsonable(
+                {
+                    "runtime_dynamics_schema_version": DUMP.RUNTIME_DYNAMICS_SCHEMA_VERSION,
+                    "runtime_joint_dynamics": joints,
+                    "runtime_actuators": actuators,
+                    "runtime_body_dynamics": bodies,
+                    "runtime_solver_settings": solver,
+                }
+            ),
+            allow_nan=False,
         )
 
     def test_model_default_preserves_compiled_joint_qpos(self):

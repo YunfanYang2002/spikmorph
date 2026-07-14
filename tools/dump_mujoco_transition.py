@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "metamorph-transition-v1"
+RUNTIME_DYNAMICS_SCHEMA_VERSION = "metamorph-runtime-dynamics-v1"
 BACKEND = "mujoco"
 DEFAULT_MORPHOLOGY = "floor-1409-0-3-01-15-56-55"
 VALID_CASES = ("zero", "positive", "negative")
@@ -222,6 +223,230 @@ def selected_array(owner, name, indices, np):
         return jsonable(values[list(indices)])
     except (AttributeError, IndexError, TypeError, ValueError):
         return NOT_AVAILABLE
+
+
+JOINT_TYPE_NAMES = {
+    0: "free",
+    1: "ball",
+    2: "slide",
+    3: "hinge",
+}
+ACTUATOR_DYN_TYPE_NAMES = {
+    0: "none",
+    1: "integrator",
+    2: "filter",
+    3: "filterexact",
+    4: "muscle",
+    5: "user",
+}
+ACTUATOR_GAIN_TYPE_NAMES = {
+    0: "fixed",
+    1: "affine",
+    2: "muscle",
+    3: "user",
+}
+ACTUATOR_BIAS_TYPE_NAMES = {
+    0: "none",
+    1: "affine",
+    2: "muscle",
+    3: "user",
+}
+INTEGRATOR_NAMES = {
+    0: "Euler",
+    1: "RK4",
+    2: "implicit",
+    3: "implicitfast",
+}
+SOLVER_NAMES = {
+    0: "PGS",
+    1: "CG",
+    2: "Newton",
+}
+
+
+def runtime_value(owner, name, np, index=None):
+    try:
+        value = getattr(owner, name)
+        if index is not None:
+            value = value[index]
+        return jsonable(value)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return NOT_AVAILABLE
+
+
+def runtime_enum(owner, name, names, np, index=None):
+    value = runtime_value(owner, name, np, index=index)
+    if value == NOT_AVAILABLE:
+        return NOT_AVAILABLE
+    try:
+        enum_value = int(value)
+    except (TypeError, ValueError):
+        return NOT_AVAILABLE
+    return names.get(enum_value, "unknown_{}".format(enum_value))
+
+
+def runtime_bool(owner, name, np, index=None):
+    value = runtime_value(owner, name, np, index=index)
+    if value == NOT_AVAILABLE:
+        return NOT_AVAILABLE
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return NOT_AVAILABLE
+
+
+def scalar_dof_value(model, name, dof_address, dof_width, np):
+    if dof_width != 1:
+        return NOT_AVAILABLE
+    return runtime_value(model, name, np, index=dof_address)
+
+
+def scalar_qpos_value(model, name, qpos_address, qpos_width, np):
+    if qpos_width != 1:
+        return NOT_AVAILABLE
+    return runtime_value(model, name, np, index=qpos_address)
+
+
+def build_runtime_joint_dynamics(model, joint_names, np):
+    result = []
+    for joint_id in range(int(model.njnt)):
+        if int(model.jnt_type[joint_id]) == 0:
+            continue
+        qpos_width, dof_width = joint_widths(model, joint_id)
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        dof_address = int(model.jnt_dofadr[joint_id])
+        result.append(
+            {
+                "joint_name": joint_names[joint_id],
+                "joint_id": joint_id,
+                "joint_type": JOINT_TYPE_NAMES.get(
+                    int(model.jnt_type[joint_id]),
+                    "unknown_{}".format(int(model.jnt_type[joint_id])),
+                ),
+                "qpos_address": qpos_address,
+                "dof_address": dof_address,
+                "axis": runtime_value(model, "jnt_axis", np, index=joint_id),
+                "range": runtime_value(model, "jnt_range", np, index=joint_id),
+                "limited": runtime_bool(model, "jnt_limited", np, index=joint_id),
+                "damping": scalar_dof_value(
+                    model, "dof_damping", dof_address, dof_width, np
+                ),
+                "armature": scalar_dof_value(
+                    model, "dof_armature", dof_address, dof_width, np
+                ),
+                "stiffness": runtime_value(
+                    model, "jnt_stiffness", np, index=joint_id
+                ),
+                "frictionloss": scalar_dof_value(
+                    model, "dof_frictionloss", dof_address, dof_width, np
+                ),
+                "spring_reference": scalar_qpos_value(
+                    model, "qpos_spring", qpos_address, qpos_width, np
+                ),
+            }
+        )
+    return result
+
+
+def build_runtime_actuators(model, actuator_names, joint_names, np):
+    result = []
+    trnid = runtime_value(model, "actuator_trnid", np)
+    trntype = runtime_value(model, "actuator_trntype", np)
+    for actuator_id in range(int(model.nu)):
+        target_joint_id = NOT_AVAILABLE
+        target_joint_name = NOT_AVAILABLE
+        if trnid != NOT_AVAILABLE and trntype != NOT_AVAILABLE:
+            candidate_id = int(trnid[actuator_id][0])
+            transmission_type = int(trntype[actuator_id])
+            if transmission_type in (0, 1) and 0 <= candidate_id < int(model.njnt):
+                target_joint_id = candidate_id
+                target_joint_name = joint_names[candidate_id]
+        result.append(
+            {
+                "actuator_name": actuator_names[actuator_id],
+                "actuator_id": actuator_id,
+                "target_joint_name": target_joint_name,
+                "target_joint_id": target_joint_id,
+                "gear": runtime_value(model, "actuator_gear", np, index=actuator_id),
+                "ctrlrange": runtime_value(
+                    model, "actuator_ctrlrange", np, index=actuator_id
+                ),
+                "ctrllimited": runtime_bool(
+                    model, "actuator_ctrllimited", np, index=actuator_id
+                ),
+                "forcerange": runtime_value(
+                    model, "actuator_forcerange", np, index=actuator_id
+                ),
+                "forcelimited": runtime_bool(
+                    model, "actuator_forcelimited", np, index=actuator_id
+                ),
+                "dyntype": runtime_enum(
+                    model,
+                    "actuator_dyntype",
+                    ACTUATOR_DYN_TYPE_NAMES,
+                    np,
+                    index=actuator_id,
+                ),
+                "gaintype": runtime_enum(
+                    model,
+                    "actuator_gaintype",
+                    ACTUATOR_GAIN_TYPE_NAMES,
+                    np,
+                    index=actuator_id,
+                ),
+                "biastype": runtime_enum(
+                    model,
+                    "actuator_biastype",
+                    ACTUATOR_BIAS_TYPE_NAMES,
+                    np,
+                    index=actuator_id,
+                ),
+            }
+        )
+    return result
+
+
+def build_runtime_body_dynamics(model, body_names, np):
+    result = []
+    for body_id in range(int(model.nbody)):
+        parent_id = runtime_value(model, "body_parentid", np, index=body_id)
+        parent_name = NOT_AVAILABLE
+        if parent_id != NOT_AVAILABLE:
+            parent_id = int(parent_id)
+            if body_id != 0 and 0 <= parent_id < len(body_names):
+                parent_name = body_names[parent_id]
+        result.append(
+            {
+                "body_name": body_names[body_id],
+                "body_id": body_id,
+                "parent_body_name": parent_name,
+                "mass": runtime_value(model, "body_mass", np, index=body_id),
+                "center_of_mass_position": runtime_value(
+                    model, "body_ipos", np, index=body_id
+                ),
+                "inertia_diagonal": runtime_value(
+                    model, "body_inertia", np, index=body_id
+                ),
+                "inertia_frame_quaternion": runtime_value(
+                    model, "body_iquat", np, index=body_id
+                ),
+            }
+        )
+    return result
+
+
+def build_runtime_solver_metadata(model, np):
+    opt = model.opt
+    return {
+        "integrator": runtime_enum(opt, "integrator", INTEGRATOR_NAMES, np),
+        "solver": runtime_enum(opt, "solver", SOLVER_NAMES, np),
+        "iterations": runtime_value(opt, "iterations", np),
+        "tolerance": runtime_value(opt, "tolerance", np),
+        "noslip_iterations": runtime_value(opt, "noslip_iterations", np),
+        "noslip_tolerance": runtime_value(opt, "noslip_tolerance", np),
+        "mpr_iterations": runtime_value(opt, "mpr_iterations", np),
+        "mpr_tolerance": runtime_value(opt, "mpr_tolerance", np),
+    }
 
 
 def validate_transition_schema(record) -> None:
@@ -880,6 +1105,16 @@ def run(args) -> None:
             "body": model_names(model, "body", int(model.nbody)),
             "geom": model_names(model, "geom", int(model.ngeom)),
         }
+        runtime_joint_dynamics = build_runtime_joint_dynamics(
+            model, names["joint"], np
+        )
+        runtime_actuators = build_runtime_actuators(
+            model, names["actuator"], names["joint"], np
+        )
+        runtime_body_dynamics = build_runtime_body_dynamics(
+            model, names["body"], np
+        )
+        runtime_solver_metadata = build_runtime_solver_metadata(model, np)
         target = resolve_target(
             model, args.joint_name, names["joint"], names["actuator"], np
         )
@@ -1070,6 +1305,16 @@ def run(args) -> None:
             "frame_skip": int(base.frame_skip),
             "control_timestep": control_timestep,
             "gravity": optional_array(model.opt, "gravity"),
+            "integrator": runtime_solver_metadata["integrator"],
+            "solver": runtime_solver_metadata["solver"],
+            "iterations": runtime_solver_metadata["iterations"],
+            "runtime_solver_settings": runtime_solver_metadata,
+            "runtime_dynamics_schema_version": RUNTIME_DYNAMICS_SCHEMA_VERSION,
+            "runtime_joint_dynamics": runtime_joint_dynamics,
+            "runtime_actuators": runtime_actuators,
+            "runtime_body_dynamics": runtime_body_dynamics,
+            "inertia_quaternion_order": "wxyz",
+            "center_of_mass_position_semantics": "body-local inertial-frame position",
             "joint_names": policy_joint_names,
             "compiled_joint_names": names["joint"],
             "actuator_names": names["actuator"],
