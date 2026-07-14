@@ -11,11 +11,13 @@ import hashlib
 import json
 import math
 import sys
+from collections import deque
 from pathlib import Path
 
 
 SCHEMA_VERSION = "metamorph-transition-v1"
 RUNTIME_DYNAMICS_SCHEMA_VERSION = "metamorph-runtime-dynamics-v1"
+GROUND_CONTACT_SCHEMA_VERSION = "metamorph-first-ground-contact-window-v1"
 BACKEND = "mujoco"
 DEFAULT_MORPHOLOGY = "floor-1409-0-3-01-15-56-55"
 VALID_CASES = ("zero", "positive", "negative")
@@ -183,6 +185,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--steps", default=10, type=int)
     parser.add_argument("--record-physics-substeps", action="store_true")
+    parser.add_argument("--record-first-ground-contact-window", action="store_true")
+    parser.add_argument("--contact-window-before", default=2, type=int)
+    parser.add_argument("--contact-window-after", default=3, type=int)
+    parser.add_argument("--max-physics-substeps", default=400, type=int)
     parser.add_argument("--joint-name", default="limbx/0")
     parser.add_argument("--action-magnitude", default=0.25, type=float)
     parser.add_argument("--cases", default=list(VALID_CASES), type=parse_cases)
@@ -200,6 +206,14 @@ def parse_args(argv=None):
         parser.error("--joint-name must not be empty")
     if not args.morphology.strip():
         parser.error("--morphology must not be empty")
+    if args.contact_window_before < 0:
+        parser.error("--contact-window-before must be non-negative")
+    if args.contact_window_after < 0:
+        parser.error("--contact-window-after must be non-negative")
+    if args.max_physics_substeps <= 0:
+        parser.error("--max-physics-substeps must be positive")
+    if args.record_first_ground_contact_window and args.cases != ["zero"]:
+        parser.error("first ground contact window mode requires --cases zero")
     return args
 
 
@@ -871,6 +885,154 @@ def contact_details(sim, geom_names, body_names):
     return count, ground_count, self_count, details
 
 
+def identify_unique_ground_geom(model, geom_names, body_names):
+    """Resolve the one compiled floor geom; never guess among candidates."""
+    candidates = []
+    for geom_id, geom_name in enumerate(geom_names):
+        body_id = int(model.geom_bodyid[geom_id])
+        body_name = body_names[body_id]
+        if _name_has_prefix(geom_name, "floor") or _name_has_prefix(body_name, "floor"):
+            candidates.append(
+                {
+                    "geom_id": geom_id,
+                    "geom_name": geom_name,
+                    "body_id": body_id,
+                    "body_name": body_name,
+                }
+            )
+    if len(candidates) != 1:
+        raise ValueError(
+            "expected exactly one compiled ground geom, found {}: {}".format(
+                len(candidates), candidates
+            )
+        )
+    return candidates[0]
+
+
+def robot_geom_ids(model, geom_names, body_names):
+    result = set()
+    for geom_id, geom_name in enumerate(geom_names):
+        body_name = body_names[int(model.geom_bodyid[geom_id])]
+        if any(
+            _name_has_prefix(name, prefix)
+            for name in (geom_name, body_name)
+            for prefix in ("torso", "limb")
+        ):
+            result.add(geom_id)
+    return result
+
+
+def is_robot_ground_contact(geom1_id, geom2_id, ground_geom_id, robot_geoms):
+    return (
+        geom1_id == ground_geom_id and geom2_id in robot_geoms
+    ) or (
+        geom2_id == ground_geom_id and geom1_id in robot_geoms
+    )
+
+
+def penetration_depth(distance):
+    value = float(distance)
+    if not math.isfinite(value):
+        raise ValueError("contact distance is non-finite: {}".format(value))
+    return max(0.0, -value)
+
+
+class FirstGroundContactWindow:
+    """Keep only the requested records around the first ground contact."""
+
+    def __init__(self, before, after):
+        if before < 0 or after < 0:
+            raise ValueError("contact window sizes must be non-negative")
+        self.before = int(before)
+        self.after = int(after)
+        self._before = deque(maxlen=self.before)
+        self.records = []
+        self.first_step = None
+        self._remaining_after = None
+
+    @property
+    def found(self):
+        return self.first_step is not None
+
+    @property
+    def complete(self):
+        return self.found and self._remaining_after == 0
+
+    def observe(self, record, has_ground_contact):
+        if not self.found:
+            if not has_ground_contact:
+                self._before.append(record)
+                return False
+            self.first_step = int(record["global_physics_step"])
+            self.records = list(self._before) + [record]
+            self._remaining_after = self.after
+            return self.complete
+        if self._remaining_after > 0:
+            self.records.append(record)
+            self._remaining_after -= 1
+        return self.complete
+
+    def summary(self):
+        before_available = (
+            sum(int(record["global_physics_step"]) < self.first_step for record in self.records)
+            if self.found
+            else 0
+        )
+        after_available = (
+            sum(int(record["global_physics_step"]) > self.first_step for record in self.records)
+            if self.found
+            else 0
+        )
+        return {
+            "first_ground_contact_found": self.found,
+            "first_ground_contact_step": self.first_step,
+            "requested_before": self.before,
+            "available_before": before_available,
+            "requested_after": self.after,
+            "available_after": after_available,
+            "window_complete": self.complete,
+        }
+
+
+def contact_window_exit_code(summary):
+    return 0 if (
+        summary["first_ground_contact_found"] and summary["window_complete"]
+    ) else 2
+
+
+def strict_json_value(value, field="root", global_physics_step=NOT_AVAILABLE):
+    """Convert to JSON and identify the exact non-finite field and substep."""
+    if hasattr(value, "tolist"):
+        return strict_json_value(value.tolist(), field, global_physics_step)
+    if isinstance(value, dict):
+        return {
+            str(key): strict_json_value(
+                item, "{}.{}".format(field, key), global_physics_step
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            strict_json_value(item, "{}[{}]".format(field, index), global_physics_step)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "non-finite field={} global_physics_step={} value={}".format(
+                    field, global_physics_step, value
+                )
+            )
+        return float(value)
+    if hasattr(value, "item"):
+        return strict_json_value(value.item(), field, global_physics_step)
+    raise TypeError("unsupported JSON value type at {}: {}".format(field, type(value).__name__))
+
+
 def max_contact_count(current, value):
     if current == NOT_AVAILABLE or value == NOT_AVAILABLE:
         return NOT_AVAILABLE
@@ -1061,6 +1223,353 @@ def configure_environment(args, walker_dir, metadata_path):
     return cfg
 
 
+class StepRecordingSimProxy:
+    """Delegate the simulator API and notify after each real physics step."""
+
+    def __init__(self, sim, callback):
+        self._sim = sim
+        self._callback = callback
+        self.callback_error = None
+
+    def __getattr__(self, name):
+        return getattr(self._sim, name)
+
+    def step(self):
+        result = self._sim.step()
+        if self.callback_error is None:
+            try:
+                self._callback()
+            except Exception as error:
+                # The formal do_simulation catches sim.step exceptions. Preserve
+                # the diagnostic failure and re-raise it after env.step returns.
+                self.callback_error = error
+        return result
+
+
+def wrapper_chain(env):
+    current = env
+    seen = set()
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        current = getattr(current, "env", None)
+
+
+def find_wrapper_with_method(env, method_name):
+    return next(
+        (item for item in wrapper_chain(env) if callable(getattr(item, method_name, None))),
+        None,
+    )
+
+
+def contact_force_6d(sim, contact_index, np):
+    raw_sim = getattr(sim, "_sim", sim)
+    force = np.zeros(6, dtype=np.float64)
+    try:
+        from metamorph.utils import mujoco_compat as mjc
+
+        if getattr(mjc, "BACKEND", None) == "mujoco":
+            mjc.mujoco.mj_contactForce(raw_sim._model, raw_sim._data, contact_index, force)
+        elif getattr(mjc, "BACKEND", None) == "mujoco_py":
+            mjc.mujoco_py.functions.mj_contactForce(
+                raw_sim.model, raw_sim.data, contact_index, force
+            )
+        else:
+            return NOT_AVAILABLE
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return NOT_AVAILABLE
+    return force
+
+
+def unique_named_body(body_names, requested_name):
+    matches = [index for index, name in enumerate(body_names) if name == requested_name]
+    if len(matches) != 1:
+        raise ValueError(
+            "body {!r} matched {} compiled bodies".format(requested_name, len(matches))
+        )
+    return matches[0]
+
+
+def ground_contacts_at_substep(sim, names, ground, robot_geoms, np):
+    model, data = sim.model, sim.data
+    contacts = []
+    for contact_index in range(int(data.ncon)):
+        contact = data.contact[contact_index]
+        geom1_id, geom2_id = int(contact.geom1), int(contact.geom2)
+        if not is_robot_ground_contact(
+            geom1_id, geom2_id, ground["geom_id"], robot_geoms
+        ):
+            continue
+        geom1_body_id = int(model.geom_bodyid[geom1_id])
+        geom2_body_id = int(model.geom_bodyid[geom2_id])
+        robot_geom_id = geom2_id if geom1_id == ground["geom_id"] else geom1_id
+        robot_body_id = int(model.geom_bodyid[robot_geom_id])
+        force = contact_force_6d(sim, contact_index, np)
+        normal = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)[0].copy()
+        force_available = not isinstance(force, str)
+        contacts.append(
+            {
+                "contact_index": contact_index,
+                "geom1_id": geom1_id,
+                "geom1_name": names["geom"][geom1_id],
+                "geom1_body_id": geom1_body_id,
+                "geom1_body_name": names["body"][geom1_body_id],
+                "geom2_id": geom2_id,
+                "geom2_name": names["geom"][geom2_id],
+                "geom2_body_id": geom2_body_id,
+                "geom2_body_name": names["body"][geom2_body_id],
+                "robot_body_name": names["body"][robot_body_id],
+                "ground_geom_name": ground["geom_name"],
+                "contact_position": np.asarray(contact.pos, dtype=np.float64).copy(),
+                "contact_frame": np.asarray(contact.frame, dtype=np.float64).copy(),
+                "contact_normal": normal,
+                "distance": float(contact.dist),
+                "penetration_depth": penetration_depth(contact.dist),
+                "normal_force": float(force[0]) if force_available else NOT_AVAILABLE,
+                "tangent_force_1": float(force[1]) if force_available else NOT_AVAILABLE,
+                "tangent_force_2": float(force[2]) if force_available else NOT_AVAILABLE,
+                "contact_force_6d": force,
+            }
+        )
+    return contacts
+
+
+def first_ground_contact_record(
+    base, args, canonical, names, ground, robot_geoms, torso_body_id,
+    policy_action, clipped_action, control_step, physics_substep, global_step, np,
+):
+    sim, model, data = base.sim, base.sim.model, base.sim.data
+    joint_ids = canonical["policy_joint_ids"]
+    qpos_indices = [int(model.jnt_qposadr[joint_id]) for joint_id in joint_ids]
+    dof_indices = non_root_dof_indices(model, joint_ids)
+    joint_names = [names["joint"][joint_id] for joint_id in joint_ids]
+    debug_index = joint_names.index("limby/9") if "limby/9" in joint_names else NOT_AVAILABLE
+    ground_contacts = ground_contacts_at_substep(
+        sim, names, ground, robot_geoms, np
+    )
+    root_qpos, root_dof = canonical["root_qpos_adr"], canonical["root_dof_adr"]
+    ctrl = np.asarray(data.ctrl, dtype=np.float64).reshape(-1).copy()
+    joint_qpos = np.asarray(data.qpos, dtype=np.float64)[qpos_indices].copy()
+    joint_qvel = np.asarray(data.qvel, dtype=np.float64)[dof_indices].copy()
+    requested = requested_generalized_torque(model, ctrl, joint_ids, np)
+    joint_passive = force_slice(data, "qfrc_passive", dof_indices, np)
+    joint_actuator = force_slice(data, "qfrc_actuator", dof_indices, np)
+    try:
+        actuator_force = np.asarray(data.actuator_force, dtype=np.float64).reshape(-1).copy()
+    except (AttributeError, TypeError, ValueError):
+        actuator_force = NOT_AVAILABLE
+    torso_position = np.asarray(data.body_xpos[torso_body_id], dtype=np.float64).copy()
+    record = {
+        "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
+        "backend": BACKEND,
+        "morphology_id": args.morphology,
+        "episode_index": 0,
+        "control_step": control_step,
+        "physics_substep_in_control_step": physics_substep,
+        "global_physics_step": global_step,
+        "time": float(data.time),
+        "relative_to_first_contact": NOT_AVAILABLE,
+        "is_first_ground_contact": False,
+        "root_position": np.asarray(data.qpos[root_qpos:root_qpos + 3], dtype=np.float64).copy(),
+        "root_quaternion": np.asarray(data.qpos[root_qpos + 3:root_qpos + 7], dtype=np.float64).copy(),
+        "root_linear_velocity": np.asarray(data.qvel[root_dof:root_dof + 3], dtype=np.float64).copy(),
+        "root_angular_velocity": np.asarray(data.qvel[root_dof + 3:root_dof + 6], dtype=np.float64).copy(),
+        "torso_body_name": names["body"][torso_body_id],
+        "torso_position": torso_position,
+        "torso_quaternion": np.asarray(data.body_xquat[torso_body_id], dtype=np.float64).copy(),
+        "torso_linear_velocity": np.asarray(data.body_xvelp[torso_body_id], dtype=np.float64).copy(),
+        "torso_angular_velocity": np.asarray(data.body_xvelr[torso_body_id], dtype=np.float64).copy(),
+        "torso_height": float(torso_position[2]),
+        "joint_names": joint_names,
+        "joint_qpos": joint_qpos,
+        "joint_qvel": joint_qvel,
+        "joint_passive_force": joint_passive,
+        "joint_actuator_force": joint_actuator,
+        "joint_total_generalized_force": NOT_AVAILABLE,
+        "debug_joint_name": "limby/9",
+        "debug_joint_index": debug_index,
+        "debug_joint_qpos": (
+            float(joint_qpos[debug_index]) if isinstance(debug_index, int) else NOT_AVAILABLE
+        ),
+        "debug_joint_qvel": (
+            float(joint_qvel[debug_index]) if isinstance(debug_index, int) else NOT_AVAILABLE
+        ),
+        "policy_action": policy_action,
+        "clipped_action": clipped_action,
+        "native_action_or_ctrl": ctrl,
+        "requested_torque": requested,
+        "applied_actuator_force": actuator_force,
+        "contact_count_total": int(data.ncon),
+        "ground_contact_count": len(ground_contacts),
+        "ground_contacts": ground_contacts,
+        "reward_components_if_available": NOT_AVAILABLE,
+        "reward_if_available": NOT_AVAILABLE,
+        "fallen": NOT_AVAILABLE,
+        "done": NOT_AVAILABLE,
+        "termination_reason": NOT_AVAILABLE,
+        "auto_reset_triggered": False,
+        "evaluated_at_control_boundary": False,
+    }
+    return strict_json_value(record, global_physics_step=global_step)
+
+
+def write_strict_json(path, value):
+    path.write_text(
+        json.dumps(strict_json_value(value), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_first_ground_contact_window(
+    env, base, args, canonical, names, output_dir, source_xml, source_hash,
+    walker_dir, morphology_xml, np,
+):
+    model, original_sim = base.sim.model, base.sim
+    frame_skip = int(base.frame_skip)
+    ground = identify_unique_ground_geom(model, names["geom"], names["body"])
+    robot_geoms = robot_geom_ids(model, names["geom"], names["body"])
+    torso_body_id = unique_named_body(names["body"], "torso/0")
+    policy_action = np.zeros(env.action_space.shape, dtype=np.float32)
+    clipped_action = policy_action.copy()  # No explicit clipping occurs in the formal wrapper path.
+    window = FirstGroundContactWindow(args.contact_window_before, args.contact_window_after)
+    global_step = 0
+    current_control_step = 0
+    current_substep = 0
+
+    original_sim.reset()
+    base.set_state(canonical["qpos"].copy(), canonical["qvel"].copy())
+    original_sim.data.ctrl[:] = 0.0
+    original_sim.forward()
+
+    def capture():
+        nonlocal global_step, current_substep
+        current_substep += 1
+        global_step += 1
+        if global_step > args.max_physics_substeps:
+            return
+        record = first_ground_contact_record(
+            base, args, canonical, names, ground, robot_geoms, torso_body_id,
+            policy_action, clipped_action, current_control_step, current_substep,
+            global_step, np,
+        )
+        window.observe(record, record["ground_contact_count"] > 0)
+
+    proxy = StepRecordingSimProxy(original_sim, capture)
+    base.sim = proxy
+    falling_wrapper = find_wrapper_with_method(env, "has_fallen")
+    try:
+        while global_step < args.max_physics_substeps and not window.complete:
+            current_control_step += 1
+            current_substep = 0
+            obs, reward, done, info = env.step(policy_action.copy())
+            if proxy.callback_error is not None:
+                raise RuntimeError("physics-substep record failed") from proxy.callback_error
+            if info.get("mj_step_error"):
+                raise RuntimeError("formal MuJoCo do_simulation reported a step error")
+            boundary_record = next(
+                (
+                    record for record in reversed(window.records)
+                    if global_step <= args.max_physics_substeps
+                    and record["global_physics_step"] == global_step
+                ),
+                None,
+            )
+            if boundary_record is not None:
+                reward_components = {
+                    key: value for key, value in info.items() if "__reward__" in key
+                }
+                fallen = (
+                    bool(falling_wrapper.has_fallen(obs))
+                    if falling_wrapper is not None
+                    else NOT_AVAILABLE
+                )
+                boundary_record.update(
+                    strict_json_value(
+                        {
+                            "reward_components_if_available": reward_components,
+                            "reward_if_available": float(reward),
+                            "fallen": fallen,
+                            "done": bool(done),
+                            "termination_reason": (
+                                "fallen" if fallen is True else ("other" if done else None)
+                            ),
+                            "auto_reset_triggered": False,
+                            "evaluated_at_control_boundary": True,
+                        },
+                        global_physics_step=boundary_record["global_physics_step"],
+                    )
+                )
+    finally:
+        base.sim = original_sim
+
+    summary = window.summary()
+    if window.found:
+        for record in window.records:
+            relative = int(record["global_physics_step"]) - int(window.first_step)
+            record["relative_to_first_contact"] = relative
+            record["is_first_ground_contact"] = relative == 0
+    metadata = {
+        "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
+        "backend": BACKEND,
+        "repository_path": str(REPO_ROOT),
+        "morphology_id": args.morphology,
+        "source_xml": str(source_xml),
+        "source_xml_sha256": source_hash,
+        "source_xml_role": "user_declared_source_xml",
+        "source_xml_matches_environment_entry_path": source_xml == morphology_xml,
+        "walker_dir": str(walker_dir),
+        "physics_timestep": float(model.opt.timestep),
+        "control_timestep": float(model.opt.timestep) * frame_skip,
+        "decimation": frame_skip,
+        "root_z": args.root_z,
+        "reset_qpos_mode": args.canonical_qpos_mode,
+        "action_mode": "zero",
+        "ground_geom": ground,
+        "joint_names": [names["joint"][item] for item in canonical["policy_joint_ids"]],
+        "body_names": names["body"],
+        "geom_names": names["geom"],
+        "root_quaternion_order": "wxyz",
+        "torso_quaternion_order": "wxyz",
+        "torso_height_semantics": "world-frame z coordinate from data.body_xpos[torso_body_id, 2]",
+        "contact_frame_semantics": "MuJoCo contact.frame; first row is normal from geom1 toward geom2",
+        "contact_force_convention": "mj_contactForce 6D force/torque in contact frame; force, not impulse",
+        "first_ground_contact_definition": "first physics substep with exactly one pair side equal to the unique ground geom and the other side a torso/limb robot geom",
+        "policy_action_semantics": "zero action in the outer node-centric policy action space",
+        "clipped_action_semantics": "formal environment performs no explicit clip; zero action is unchanged",
+        "native_action_or_ctrl_semantics": "actual data.ctrl in MuJoCo actuator order after the formal action wrapper",
+        "requested_torque_semantics": "joint_names order; data.ctrl times actuator gear mapped through compiled actuator_trnid and joint DOF addresses",
+        "applied_actuator_force_semantics": "data.actuator_force in actuator order",
+        "joint_passive_force_semantics": "data.qfrc_passive at compiled policy-joint DOF addresses",
+        "joint_actuator_force_semantics": "data.qfrc_actuator at compiled policy-joint DOF addresses",
+        "joint_total_generalized_force_semantics": NOT_AVAILABLE,
+        "termination_evaluation_timing": "formal wrappers evaluate reward/fallen/done only at control boundary after frame_skip physics steps",
+        "auto_reset": False,
+        "continue_after_done": True,
+        "contact_window_before": args.contact_window_before,
+        "contact_window_after": args.contact_window_after,
+        "max_physics_substeps": args.max_physics_substeps,
+    }
+    metadata.update(summary)
+    write_strict_json(output_dir / "metadata.json", metadata)
+    write_strict_json(output_dir / "summary.json", summary)
+    with (output_dir / "first_ground_contact_window.jsonl").open(
+        "w", encoding="utf-8", newline="\n"
+    ) as handle:
+        for record in window.records:
+            handle.write(
+                json.dumps(
+                    strict_json_value(
+                        record, global_physics_step=record["global_physics_step"]
+                    ),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ) + "\n"
+            )
+    print("first_ground_contact_found={}".format(summary["first_ground_contact_found"]))
+    print("first_ground_contact_step={}".format(summary["first_ground_contact_step"]))
+    return contact_window_exit_code(summary)
+
+
 def run(args) -> None:
     import numpy as np
 
@@ -1129,6 +1638,20 @@ def run(args) -> None:
             target_joint_id=target["joint_id"],
             target_joint_initial_position=args.target_joint_initial_position,
         )
+        if args.record_first_ground_contact_window:
+            return run_first_ground_contact_window(
+                env,
+                base,
+                args,
+                canonical,
+                names,
+                output_dir,
+                source_xml,
+                source_xml_sha256,
+                walker_dir,
+                morphology_xml,
+                np,
+            )
         records = []
         contact_summary = {}
         for case in args.cases:
@@ -1418,14 +1941,14 @@ def run(args) -> None:
                 )
         print("Wrote {} transitions to {}".format(len(records), output_dir))
         print("contact_free_valid={}".format(metadata["contact_free_valid"]))
+        return 0
     finally:
         env.close()
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    run(args)
-    return 0
+    return run(args)
 
 
 if __name__ == "__main__":

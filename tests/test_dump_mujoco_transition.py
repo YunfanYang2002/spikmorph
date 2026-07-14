@@ -515,6 +515,121 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
             "unclassified",
         )
 
+    def test_first_ground_contact_cli_defaults_and_validation(self):
+        args = DUMP.parse_args(
+            self.cli_args("--record-first-ground-contact-window", "--cases", "zero")
+        )
+        self.assertTrue(args.record_first_ground_contact_window)
+        self.assertEqual((args.contact_window_before, args.contact_window_after), (2, 3))
+        self.assertEqual(args.max_physics_substeps, 400)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                DUMP.parse_args(
+                    self.cli_args(
+                        "--record-first-ground-contact-window", "--cases", "positive"
+                    )
+                )
+
+    def test_unique_ground_geom_and_robot_ground_contact(self):
+        model = SimpleNamespace(geom_bodyid=np.array([0, 1, 2]))
+        geom_names = ["floor/0", "limb/5", "limb/6"]
+        body_names = ["world", "limb/5", "limb/6"]
+        ground = DUMP.identify_unique_ground_geom(model, geom_names, body_names)
+        self.assertEqual(ground["geom_id"], 0)
+        robot = DUMP.robot_geom_ids(model, geom_names, body_names)
+        self.assertTrue(DUMP.is_robot_ground_contact(0, 1, 0, robot))
+        self.assertFalse(DUMP.is_robot_ground_contact(1, 2, 0, robot))
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            DUMP.identify_unique_ground_geom(
+                SimpleNamespace(geom_bodyid=np.array([0, 0])),
+                ["floor/0", "floor/1"],
+                ["world"],
+            )
+
+    def test_first_contact_ring_buffer_triggers_once(self):
+        window = DUMP.FirstGroundContactWindow(2, 3)
+        for step, contact in ((1, False), (2, False), (3, True), (4, True), (5, False), (6, False)):
+            window.observe({"global_physics_step": step}, contact)
+        self.assertEqual(window.first_step, 3)
+        self.assertEqual(
+            [record["global_physics_step"] for record in window.records],
+            [1, 2, 3, 4, 5, 6],
+        )
+        self.assertEqual(
+            window.summary(),
+            {
+                "first_ground_contact_found": True,
+                "first_ground_contact_step": 3,
+                "requested_before": 2,
+                "available_before": 2,
+                "requested_after": 3,
+                "available_after": 3,
+                "window_complete": True,
+            },
+        )
+
+    def test_early_contact_reports_short_before_window(self):
+        window = DUMP.FirstGroundContactWindow(2, 1)
+        window.observe({"global_physics_step": 1}, True)
+        window.observe({"global_physics_step": 2}, False)
+        self.assertEqual(window.summary()["available_before"], 0)
+        self.assertTrue(window.complete)
+
+    def test_penetration_and_contact_force_serialization(self):
+        self.assertEqual(DUMP.penetration_depth(-0.012), 0.012)
+        self.assertEqual(DUMP.penetration_depth(0.004), 0.0)
+        encoded = DUMP.strict_json_value(
+            {"contact_force_6d": np.arange(6, dtype=np.float64)},
+            global_physics_step=9,
+        )
+        self.assertEqual(encoded["contact_force_6d"], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_no_contact_is_nonzero_exit(self):
+        window = DUMP.FirstGroundContactWindow(2, 3)
+        for step in range(1, 5):
+            window.observe({"global_physics_step": step}, False)
+        summary = window.summary()
+        self.assertFalse(summary["first_ground_contact_found"])
+        self.assertNotEqual(DUMP.contact_window_exit_code(summary), 0)
+
+    def test_non_finite_error_names_field_and_step(self):
+        with self.assertRaisesRegex(
+            ValueError, r"field=root\.root_position\[2\].*global_physics_step=7"
+        ):
+            DUMP.strict_json_value(
+                {"root_position": [0.0, 0.0, float("nan")]},
+                global_physics_step=7,
+            )
+
+    def test_quaternion_and_auto_reset_contract_is_serializable(self):
+        metadata = {
+            "root_quaternion_order": "wxyz",
+            "torso_quaternion_order": "wxyz",
+            "auto_reset": False,
+            "continue_after_done": True,
+        }
+        self.assertEqual(DUMP.strict_json_value(metadata), metadata)
+
+    def test_step_proxy_does_not_reset_after_done(self):
+        class FakeSim:
+            def __init__(self):
+                self.steps = 0
+                self.resets = 0
+
+            def step(self):
+                self.steps += 1
+
+            def reset(self):
+                self.resets += 1
+
+        fake = FakeSim()
+        callbacks = []
+        proxy = DUMP.StepRecordingSimProxy(fake, lambda: callbacks.append(fake.steps))
+        proxy.step()
+        proxy.step()  # Represents continuing after a boundary returned done=True.
+        self.assertEqual(callbacks, [1, 2])
+        self.assertEqual(fake.resets, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
