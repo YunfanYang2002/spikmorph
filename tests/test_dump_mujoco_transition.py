@@ -740,6 +740,74 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                 "window_complete": False,
             }), 0)
 
+    def test_runtime_torso_fields_use_body_xpos_not_root_qpos(self):
+        data = SimpleNamespace(
+            body_xpos=np.array([[0.0, 0.0, 0.0], [0.1, -0.2, 1.75]]),
+            body_xquat=np.array([[1.0, 0.0, 0.0, 0.0]] * 2),
+            body_xvelp=np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]),
+            body_xvelr=np.array([[0.0, 0.0, 0.0], [4.0, 5.0, 6.0]]),
+            qpos=np.array([0.0, 0.0, 9.0]),
+        )
+        torso = DUMP.runtime_torso_fields(data, 1, "torso/0", 7, np)
+        for field in (
+            "torso_position",
+            "torso_quaternion",
+            "torso_linear_velocity",
+            "torso_angular_velocity",
+            "torso_height",
+        ):
+            self.assertIn(field, torso)
+        self.assertEqual(torso["torso_height"], torso["torso_position"][2])
+        self.assertEqual(torso["torso_height"], 1.75)
+        self.assertNotEqual(torso["torso_height"], data.qpos[2])
+
+    def test_runtime_torso_unavailable_names_step(self):
+        with self.assertRaisesRegex(ValueError, "global_physics_step=11"):
+            DUMP.runtime_torso_fields(SimpleNamespace(), 0, "torso/0", 11, np)
+
+    def test_fallen_result_is_captured_from_formal_inner_observation(self):
+        class FallingWrapper:
+            def has_fallen(self, obs):
+                return obs["torso_height"] <= 0.5
+
+        wrapper = FallingWrapper()
+        capture = DUMP.MethodResultCapture(wrapper, "has_fallen")
+        capture.install()
+        try:
+            # This is the inner observation used by the formal wrapper.
+            self.assertTrue(wrapper.has_fallen({"torso_height": 0.4}))
+            outer_filtered_observation = {}
+            self.assertNotIn("torso_height", outer_filtered_observation)
+            # Consumer reads the captured result and never indexes outer obs.
+            self.assertTrue(capture.value)
+        finally:
+            capture.restore()
+        with self.assertRaises(KeyError):
+            wrapper.has_fallen({})
+
+    def test_torso_mapping_failure_lists_candidates_and_stage(self):
+        body_names = ["world", "limb/0"]
+        with self.assertRaisesRegex(ValueError, "available body names"):
+            DUMP.unique_named_body(body_names, "torso/0")
+        args = SimpleNamespace(
+            morphology="floor-1409-0-3-01-15-56-55",
+            root_z=1.2,
+            canonical_qpos_mode="model-default",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            error = ValueError("torso mapping failed")
+            DUMP.write_first_ground_contact_failure(
+                output,
+                args,
+                "torso_mapping",
+                error,
+                {"torso_body_candidates": body_names},
+            )
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["stage"], "torso_mapping")
+            self.assertEqual(summary["torso_body_candidates"], body_names)
+
 
 if __name__ == "__main__":
     unittest.main()

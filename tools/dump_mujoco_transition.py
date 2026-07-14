@@ -1285,9 +1285,82 @@ def unique_named_body(body_names, requested_name):
     matches = [index for index, name in enumerate(body_names) if name == requested_name]
     if len(matches) != 1:
         raise ValueError(
-            "body {!r} matched {} compiled bodies".format(requested_name, len(matches))
+            "body {!r} matched {} compiled bodies; available body names: {}".format(
+                requested_name, len(matches), body_names
+            )
         )
     return matches[0]
+
+
+def runtime_torso_fields(data, torso_body_id, torso_body_name, global_step, np):
+    try:
+        position = np.asarray(
+            data.body_xpos[torso_body_id], dtype=np.float64
+        ).reshape(-1).copy()
+        quaternion = np.asarray(
+            data.body_xquat[torso_body_id], dtype=np.float64
+        ).reshape(-1).copy()
+        linear_velocity = np.asarray(
+            data.body_xvelp[torso_body_id], dtype=np.float64
+        ).reshape(-1).copy()
+        angular_velocity = np.asarray(
+            data.body_xvelr[torso_body_id], dtype=np.float64
+        ).reshape(-1).copy()
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise ValueError(
+            "runtime torso data unavailable at global_physics_step={}: {}".format(
+                global_step, error
+            )
+        ) from error
+    if position.size != 3 or quaternion.size != 4:
+        raise ValueError(
+            "invalid torso position/quaternion shape at global_physics_step={}: {}/{}".format(
+                global_step, position.shape, quaternion.shape
+            )
+        )
+    if linear_velocity.size != 3 or angular_velocity.size != 3:
+        raise ValueError(
+            "invalid torso velocity shape at global_physics_step={}: {}/{}".format(
+                global_step, linear_velocity.shape, angular_velocity.shape
+            )
+        )
+    return {
+        "torso_body_name": torso_body_name,
+        "torso_position": position,
+        "torso_quaternion": quaternion,
+        "torso_linear_velocity": linear_velocity,
+        "torso_angular_velocity": angular_velocity,
+        "torso_height": float(position[2]),
+    }
+
+
+class MethodResultCapture:
+    """Capture a formal wrapper method result without changing its semantics."""
+
+    def __init__(self, owner, method_name):
+        self.owner = owner
+        self.method_name = method_name
+        self.original = getattr(owner, method_name)
+        self.had_instance_attribute = method_name in getattr(owner, "__dict__", {})
+        self.instance_attribute = getattr(owner, "__dict__", {}).get(method_name)
+        self.value = NOT_AVAILABLE
+
+    def _call(self, *args, **kwargs):
+        result = self.original(*args, **kwargs)
+        self.value = bool(result)
+        return result
+
+    def install(self):
+        setattr(self.owner, self.method_name, self._call)
+
+    def reset(self):
+        self.value = NOT_AVAILABLE
+
+    def restore(self):
+        if self.had_instance_attribute:
+            setattr(self.owner, self.method_name, self.instance_attribute)
+        else:
+            delattr(self.owner, self.method_name)
 
 
 def ground_contacts_at_substep(sim, names, ground, robot_geoms, np):
@@ -1358,7 +1431,9 @@ def first_ground_contact_record(
         actuator_force = np.asarray(data.actuator_force, dtype=np.float64).reshape(-1).copy()
     except (AttributeError, TypeError, ValueError):
         actuator_force = NOT_AVAILABLE
-    torso_position = np.asarray(data.body_xpos[torso_body_id], dtype=np.float64).copy()
+    torso = runtime_torso_fields(
+        data, torso_body_id, names["body"][torso_body_id], global_step, np
+    )
     record = {
         "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
         "backend": BACKEND,
@@ -1374,12 +1449,6 @@ def first_ground_contact_record(
         "root_quaternion": np.asarray(data.qpos[root_qpos + 3:root_qpos + 7], dtype=np.float64).copy(),
         "root_linear_velocity": np.asarray(data.qvel[root_dof:root_dof + 3], dtype=np.float64).copy(),
         "root_angular_velocity": np.asarray(data.qvel[root_dof + 3:root_dof + 6], dtype=np.float64).copy(),
-        "torso_body_name": names["body"][torso_body_id],
-        "torso_position": torso_position,
-        "torso_quaternion": np.asarray(data.body_xquat[torso_body_id], dtype=np.float64).copy(),
-        "torso_linear_velocity": np.asarray(data.body_xvelp[torso_body_id], dtype=np.float64).copy(),
-        "torso_angular_velocity": np.asarray(data.body_xvelr[torso_body_id], dtype=np.float64).copy(),
-        "torso_height": float(torso_position[2]),
         "joint_names": joint_names,
         "joint_qpos": joint_qpos,
         "joint_qvel": joint_qvel,
@@ -1410,6 +1479,7 @@ def first_ground_contact_record(
         "auto_reset_triggered": False,
         "evaluated_at_control_boundary": False,
     }
+    record.update(torso)
     return strict_json_value(record, global_physics_step=global_step)
 
 
@@ -1482,6 +1552,8 @@ def write_first_ground_contact_failure(output_dir, args, stage, error, metadata=
         "first_ground_contact_step": None,
         "error": str(error),
     }
+    if metadata and "torso_body_candidates" in metadata:
+        summary["torso_body_candidates"] = metadata["torso_body_candidates"]
     failure_metadata = {
         "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
         "backend": BACKEND,
@@ -1505,15 +1577,6 @@ def run_first_ground_contact_window(
 ):
     model, original_sim = base.sim.model, base.sim
     frame_skip = int(base.frame_skip)
-    ground = identify_unique_ground_geom(model, names["geom"], names["body"])
-    robot_geoms = robot_geom_ids(model, names["geom"], names["body"])
-    torso_body_id = unique_named_body(names["body"], "torso/0")
-    policy_action = np.zeros(env.action_space.shape, dtype=np.float32)
-    clipped_action = policy_action.copy()  # No explicit clipping occurs in the formal wrapper path.
-    window = FirstGroundContactWindow(args.contact_window_before, args.contact_window_after)
-    global_step = 0
-    current_control_step = 0
-    current_substep = 0
     failure_context = {
         "source_xml": str(source_xml),
         "source_xml_sha256": source_hash,
@@ -1522,6 +1585,22 @@ def run_first_ground_contact_window(
         "control_timestep": float(model.opt.timestep) * frame_skip,
         "decimation": frame_skip,
     }
+    ground = identify_unique_ground_geom(model, names["geom"], names["body"])
+    robot_geoms = robot_geom_ids(model, names["geom"], names["body"])
+    try:
+        torso_body_id = unique_named_body(names["body"], "torso/0")
+    except Exception as error:
+        failure_context["torso_body_candidates"] = names["body"]
+        write_first_ground_contact_failure(
+            output_dir, args, "torso_mapping", error, failure_context
+        )
+        raise
+    policy_action = np.zeros(env.action_space.shape, dtype=np.float32)
+    clipped_action = policy_action.copy()  # No explicit clipping occurs in the formal wrapper path.
+    window = FirstGroundContactWindow(args.contact_window_before, args.contact_window_after)
+    global_step = 0
+    current_control_step = 0
+    current_substep = 0
     try:
         initialization = apply_and_verify_canonical_state(
             base, canonical, policy_action, np
@@ -1548,14 +1627,25 @@ def run_first_ground_contact_window(
     proxy = StepRecordingSimProxy(original_sim, capture)
     base.sim = proxy
     falling_wrapper = find_wrapper_with_method(env, "has_fallen")
+    fallen_capture = (
+        MethodResultCapture(falling_wrapper, "has_fallen")
+        if falling_wrapper is not None
+        else None
+    )
+    if fallen_capture is not None:
+        fallen_capture.install()
     try:
         try:
             while global_step < args.max_physics_substeps and not window.complete:
                 current_control_step += 1
                 current_substep = 0
+                if fallen_capture is not None:
+                    fallen_capture.reset()
                 obs, reward, done, info = env.step(policy_action.copy())
                 if proxy.callback_error is not None:
-                    raise RuntimeError("physics-substep record failed") from proxy.callback_error
+                    raise RuntimeError(
+                        "physics-substep record failed: {}".format(proxy.callback_error)
+                    ) from proxy.callback_error
                 if info.get("mj_step_error"):
                     raise RuntimeError("formal MuJoCo do_simulation reported a step error")
                 boundary_record = next(
@@ -1571,8 +1661,8 @@ def run_first_ground_contact_window(
                         key: value for key, value in info.items() if "__reward__" in key
                     }
                     fallen = (
-                        bool(falling_wrapper.has_fallen(obs))
-                        if falling_wrapper is not None
+                        fallen_capture.value
+                        if fallen_capture is not None
                         else NOT_AVAILABLE
                     )
                     boundary_record.update(
@@ -1597,6 +1687,8 @@ def run_first_ground_contact_window(
             )
             raise
     finally:
+        if fallen_capture is not None:
+            fallen_capture.restore()
         base.sim = original_sim
 
     summary = window.summary()
@@ -1640,12 +1732,16 @@ def run_first_ground_contact_window(
         "reset_qpos_mode": args.canonical_qpos_mode,
         "action_mode": "zero",
         "ground_geom": ground,
+        "torso_body_name": names["body"][torso_body_id],
+        "torso_body_id": torso_body_id,
+        "torso_height_source": "data.xpos[torso_body_id, 2]",
+        "torso_height_frame": "world",
         "joint_names": [names["joint"][item] for item in canonical["policy_joint_ids"]],
         "body_names": names["body"],
         "geom_names": names["geom"],
         "root_quaternion_order": "wxyz",
         "torso_quaternion_order": "wxyz",
-        "torso_height_semantics": "world-frame z coordinate from data.body_xpos[torso_body_id, 2]",
+        "torso_height_semantics": "world-frame z coordinate from data.xpos[torso_body_id, 2] (exposed by the compatibility adapter as body_xpos)",
         "contact_frame_semantics": "MuJoCo contact.frame; first row is normal from geom1 toward geom2",
         "contact_force_convention": "mj_contactForce 6D force/torque in contact frame; force, not impulse",
         "first_ground_contact_definition": "first physics substep with exactly one pair side equal to the unique ground geom and the other side a torso/limb robot geom",
