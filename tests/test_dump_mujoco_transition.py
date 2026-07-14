@@ -630,6 +630,116 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
         self.assertEqual(callbacks, [1, 2])
         self.assertEqual(fake.resets, 0)
 
+    def test_contact_probe_reset_precedes_injection_and_step(self):
+        events = []
+
+        class FakeSim:
+            def __init__(self):
+                self.data = SimpleNamespace(
+                    qpos=np.zeros(8), qvel=np.zeros(7), ctrl=np.ones(1)
+                )
+
+            def forward(self):
+                events.append("forward")
+
+        class FakeBase:
+            def __init__(self):
+                self.sim = FakeSim()
+
+            def set_state(self, qpos, qvel):
+                events.append("inject")
+                self.sim.data.qpos[:] = qpos
+                self.sim.data.qvel[:] = qvel
+
+        class FakeEnv:
+            def __init__(self):
+                self.unwrapped = FakeBase()
+                self.has_reset = False
+
+            def reset(self):
+                events.append("reset")
+                self.has_reset = True
+
+            def step(self, action):
+                if not self.has_reset:
+                    raise RuntimeError("Cannot call env.step() before calling reset()")
+                events.append("step")
+                return {}, 0.0, False, {}
+
+        env = FakeEnv()
+        base = DUMP.prepare_env_for_probe_mode(env, True)
+        canonical = {
+            "qpos": np.array([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0, 0.25]),
+            "qvel": np.zeros(7),
+            "root_qpos_adr": 0,
+        }
+        verification = DUMP.apply_and_verify_canonical_state(
+            base, canonical, np.zeros(1), np
+        )
+        env.step(np.zeros(1))
+        self.assertEqual(events, ["reset", "inject", "forward", "step"])
+        self.assertEqual(events.count("reset"), 1)
+        self.assertEqual(verification["root_z_readback"], 1.2)
+        np.testing.assert_allclose(base.sim.data.qpos, canonical["qpos"])
+
+    def test_normal_probe_mode_does_not_add_wrapper_reset(self):
+        class FakeEnv:
+            def __init__(self):
+                self.unwrapped = object()
+                self.reset_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+
+        env = FakeEnv()
+        self.assertIs(DUMP.prepare_env_for_probe_mode(env, False), env.unwrapped)
+        self.assertEqual(env.reset_count, 0)
+
+    def test_canonical_readback_mismatch_fails_initialization(self):
+        class OverwritingBase:
+            def __init__(self):
+                self.sim = SimpleNamespace(
+                    data=SimpleNamespace(
+                        qpos=np.zeros(8), qvel=np.zeros(7), ctrl=np.zeros(1)
+                    ),
+                    forward=lambda: None,
+                )
+
+            def set_state(self, qpos, qvel):
+                self.sim.data.qpos[:] = qpos
+                self.sim.data.qpos[2] = 0.0
+                self.sim.data.qvel[:] = qvel
+
+        canonical = {
+            "qpos": np.array([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0, 0.25]),
+            "qvel": np.zeros(7),
+            "root_qpos_adr": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "qpos readback mismatch"):
+            DUMP.apply_and_verify_canonical_state(
+                OverwritingBase(), canonical, np.zeros(1), np
+            )
+
+    def test_initialization_failure_writes_staged_summary_and_is_nonzero(self):
+        args = SimpleNamespace(
+            morphology="floor-1409-0-3-01-15-56-55",
+            root_z=1.2,
+            canonical_qpos_mode="model-default",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            DUMP.write_first_ground_contact_failure(
+                output, args, "initialization", RuntimeError("reset failed")
+            )
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["stage"], "initialization")
+            self.assertFalse(summary["first_ground_contact_found"])
+            self.assertNotEqual(DUMP.contact_window_exit_code({
+                "first_ground_contact_found": False,
+                "window_complete": False,
+            }), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

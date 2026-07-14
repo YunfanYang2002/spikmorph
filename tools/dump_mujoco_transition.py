@@ -1420,6 +1420,85 @@ def write_strict_json(path, value):
     )
 
 
+def prepare_first_ground_contact_env(env):
+    """Satisfy the outer Gym wrapper lifecycle before canonical injection."""
+    env.reset()
+    return env.unwrapped
+
+
+def prepare_env_for_probe_mode(env, record_first_ground_contact_window):
+    if record_first_ground_contact_window:
+        return prepare_first_ground_contact_env(env)
+    return env.unwrapped
+
+
+def apply_and_verify_canonical_state(base, canonical, policy_action, np):
+    """Inject canonical state after reset, synchronize, and verify readback."""
+    sim = base.sim
+    expected_qpos = np.asarray(canonical["qpos"], dtype=np.float64).reshape(-1)
+    expected_qvel = np.asarray(canonical["qvel"], dtype=np.float64).reshape(-1)
+    base.set_state(expected_qpos.copy(), expected_qvel.copy())
+    sim.data.ctrl[:] = 0.0
+    sim.forward()
+    actual_qpos = np.asarray(sim.data.qpos, dtype=np.float64).reshape(-1)
+    actual_qvel = np.asarray(sim.data.qvel, dtype=np.float64).reshape(-1)
+    actual_ctrl = np.asarray(sim.data.ctrl, dtype=np.float64).reshape(-1)
+    if actual_qpos.shape != expected_qpos.shape or not np.allclose(
+        actual_qpos, expected_qpos, rtol=0.0, atol=1e-10
+    ):
+        raise ValueError(
+            "canonical qpos readback mismatch after reset: expected={}, actual={}".format(
+                expected_qpos.tolist(), actual_qpos.tolist()
+            )
+        )
+    if actual_qvel.shape != expected_qvel.shape or not np.allclose(
+        actual_qvel, expected_qvel, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "canonical qvel readback mismatch after reset: expected={}, actual={}".format(
+                expected_qvel.tolist(), actual_qvel.tolist()
+            )
+        )
+    if np.any(actual_ctrl != 0.0) or np.any(np.asarray(policy_action) != 0.0):
+        raise ValueError(
+            "zero-action initialization mismatch: policy_action={}, data.ctrl={}".format(
+                np.asarray(policy_action).tolist(), actual_ctrl.tolist()
+            )
+        )
+    return {
+        "root_z_expected": float(expected_qpos[canonical["root_qpos_adr"] + 2]),
+        "root_z_readback": float(actual_qpos[canonical["root_qpos_adr"] + 2]),
+        "qpos_verified": True,
+        "qvel_verified": True,
+        "zero_action_verified": True,
+    }
+
+
+def write_first_ground_contact_failure(output_dir, args, stage, error, metadata=None):
+    summary = {
+        "ok": False,
+        "stage": stage,
+        "first_ground_contact_found": False,
+        "first_ground_contact_step": None,
+        "error": str(error),
+    }
+    failure_metadata = {
+        "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
+        "backend": BACKEND,
+        "morphology_id": args.morphology,
+        "root_z": args.root_z,
+        "reset_qpos_mode": args.canonical_qpos_mode,
+        "action_mode": "zero",
+        "ok": False,
+        "failure_stage": stage,
+        "error": str(error),
+    }
+    if metadata:
+        failure_metadata.update(metadata)
+    write_strict_json(output_dir / "metadata.json", failure_metadata)
+    write_strict_json(output_dir / "summary.json", summary)
+
+
 def run_first_ground_contact_window(
     env, base, args, canonical, names, output_dir, source_xml, source_hash,
     walker_dir, morphology_xml, np,
@@ -1435,11 +1514,23 @@ def run_first_ground_contact_window(
     global_step = 0
     current_control_step = 0
     current_substep = 0
-
-    original_sim.reset()
-    base.set_state(canonical["qpos"].copy(), canonical["qvel"].copy())
-    original_sim.data.ctrl[:] = 0.0
-    original_sim.forward()
+    failure_context = {
+        "source_xml": str(source_xml),
+        "source_xml_sha256": source_hash,
+        "walker_dir": str(walker_dir),
+        "physics_timestep": float(model.opt.timestep),
+        "control_timestep": float(model.opt.timestep) * frame_skip,
+        "decimation": frame_skip,
+    }
+    try:
+        initialization = apply_and_verify_canonical_state(
+            base, canonical, policy_action, np
+        )
+    except Exception as error:
+        write_first_ground_contact_failure(
+            output_dir, args, "initialization", error, failure_context
+        )
+        raise
 
     def capture():
         nonlocal global_step, current_substep
@@ -1458,51 +1549,75 @@ def run_first_ground_contact_window(
     base.sim = proxy
     falling_wrapper = find_wrapper_with_method(env, "has_fallen")
     try:
-        while global_step < args.max_physics_substeps and not window.complete:
-            current_control_step += 1
-            current_substep = 0
-            obs, reward, done, info = env.step(policy_action.copy())
-            if proxy.callback_error is not None:
-                raise RuntimeError("physics-substep record failed") from proxy.callback_error
-            if info.get("mj_step_error"):
-                raise RuntimeError("formal MuJoCo do_simulation reported a step error")
-            boundary_record = next(
-                (
-                    record for record in reversed(window.records)
-                    if global_step <= args.max_physics_substeps
-                    and record["global_physics_step"] == global_step
-                ),
-                None,
-            )
-            if boundary_record is not None:
-                reward_components = {
-                    key: value for key, value in info.items() if "__reward__" in key
-                }
-                fallen = (
-                    bool(falling_wrapper.has_fallen(obs))
-                    if falling_wrapper is not None
-                    else NOT_AVAILABLE
+        try:
+            while global_step < args.max_physics_substeps and not window.complete:
+                current_control_step += 1
+                current_substep = 0
+                obs, reward, done, info = env.step(policy_action.copy())
+                if proxy.callback_error is not None:
+                    raise RuntimeError("physics-substep record failed") from proxy.callback_error
+                if info.get("mj_step_error"):
+                    raise RuntimeError("formal MuJoCo do_simulation reported a step error")
+                boundary_record = next(
+                    (
+                        record for record in reversed(window.records)
+                        if global_step <= args.max_physics_substeps
+                        and record["global_physics_step"] == global_step
+                    ),
+                    None,
                 )
-                boundary_record.update(
-                    strict_json_value(
-                        {
-                            "reward_components_if_available": reward_components,
-                            "reward_if_available": float(reward),
-                            "fallen": fallen,
-                            "done": bool(done),
-                            "termination_reason": (
-                                "fallen" if fallen is True else ("other" if done else None)
-                            ),
-                            "auto_reset_triggered": False,
-                            "evaluated_at_control_boundary": True,
-                        },
-                        global_physics_step=boundary_record["global_physics_step"],
+                if boundary_record is not None:
+                    reward_components = {
+                        key: value for key, value in info.items() if "__reward__" in key
+                    }
+                    fallen = (
+                        bool(falling_wrapper.has_fallen(obs))
+                        if falling_wrapper is not None
+                        else NOT_AVAILABLE
                     )
-                )
+                    boundary_record.update(
+                        strict_json_value(
+                            {
+                                "reward_components_if_available": reward_components,
+                                "reward_if_available": float(reward),
+                                "fallen": fallen,
+                                "done": bool(done),
+                                "termination_reason": (
+                                    "fallen" if fallen is True else ("other" if done else None)
+                                ),
+                                "auto_reset_triggered": False,
+                                "evaluated_at_control_boundary": True,
+                            },
+                            global_physics_step=boundary_record["global_physics_step"],
+                        )
+                    )
+        except Exception as error:
+            write_first_ground_contact_failure(
+                output_dir, args, "rollout", error, failure_context
+            )
+            raise
     finally:
         base.sim = original_sim
 
     summary = window.summary()
+    if not window.found:
+        summary.update(
+            {
+                "ok": False,
+                "stage": "contact_not_found",
+                "error": "no first ground contact within max_physics_substeps",
+            }
+        )
+    elif not window.complete:
+        summary.update(
+            {
+                "ok": False,
+                "stage": "rollout",
+                "error": "first ground contact found but requested after-window is incomplete",
+            }
+        )
+    else:
+        summary.update({"ok": True, "stage": "completed", "error": None})
     if window.found:
         for record in window.records:
             relative = int(record["global_physics_step"]) - int(window.first_step)
@@ -1548,23 +1663,30 @@ def run_first_ground_contact_window(
         "contact_window_before": args.contact_window_before,
         "contact_window_after": args.contact_window_after,
         "max_physics_substeps": args.max_physics_substeps,
+        "initialization_verification": initialization,
     }
     metadata.update(summary)
-    write_strict_json(output_dir / "metadata.json", metadata)
-    write_strict_json(output_dir / "summary.json", summary)
-    with (output_dir / "first_ground_contact_window.jsonl").open(
-        "w", encoding="utf-8", newline="\n"
-    ) as handle:
-        for record in window.records:
-            handle.write(
-                json.dumps(
-                    strict_json_value(
-                        record, global_physics_step=record["global_physics_step"]
-                    ),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ) + "\n"
-            )
+    try:
+        write_strict_json(output_dir / "metadata.json", metadata)
+        write_strict_json(output_dir / "summary.json", summary)
+        with (output_dir / "first_ground_contact_window.jsonl").open(
+            "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            for record in window.records:
+                handle.write(
+                    json.dumps(
+                        strict_json_value(
+                            record, global_physics_step=record["global_physics_step"]
+                        ),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ) + "\n"
+                )
+    except Exception as error:
+        write_first_ground_contact_failure(
+            output_dir, args, "serialization", error, failure_context
+        )
+        raise
     print("first_ground_contact_found={}".format(summary["first_ground_contact_found"]))
     print("first_ground_contact_step={}".format(summary["first_ground_contact_step"]))
     return contact_window_exit_code(summary)
@@ -1606,7 +1728,24 @@ def run(args) -> None:
 
     env = make_env(cfg.ENV_NAME, int(cfg.RNG_SEED), 0, xml_file=args.morphology)()
     try:
-        base = env.unwrapped
+        if args.record_first_ground_contact_window:
+            try:
+                base = prepare_env_for_probe_mode(env, True)
+            except Exception as error:
+                write_first_ground_contact_failure(
+                    output_dir,
+                    args,
+                    "initialization",
+                    error,
+                    {
+                        "source_xml": str(source_xml),
+                        "source_xml_sha256": source_xml_sha256,
+                        "walker_dir": str(walker_dir),
+                    },
+                )
+                raise
+        else:
+            base = prepare_env_for_probe_mode(env, False)
         sim, model = base.sim, base.sim.model
         names = {
             "joint": model_names(model, "joint", int(model.njnt)),
