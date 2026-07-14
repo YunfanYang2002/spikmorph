@@ -71,6 +71,91 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
                     self.cli_args("--target-joint-initial-position", "invalid")
                 )
 
+    def test_physics_substep_recording_defaults_off(self):
+        self.assertFalse(DUMP.parse_args(self.cli_args()).record_physics_substeps)
+        self.assertTrue(
+            DUMP.parse_args(
+                self.cli_args("--record-physics-substeps")
+            ).record_physics_substeps
+        )
+        for field in (
+            "control_step",
+            "physics_substep",
+            "global_physics_step",
+            "record_level",
+        ):
+            self.assertNotIn(field, DUMP.TRANSITION_CORE_FIELDS)
+
+    def test_physics_substep_index_sequence(self):
+        self.assertEqual(
+            DUMP.physics_substep_sequence(2, 4),
+            [
+                (0, 0, 0),
+                (1, 1, 1),
+                (1, 2, 2),
+                (1, 3, 3),
+                (1, 4, 4),
+                (2, 1, 5),
+                (2, 2, 6),
+                (2, 3, 7),
+                (2, 4, 8),
+            ],
+        )
+        self.assertEqual(
+            DUMP.physics_substep_fields(1, 4, 4),
+            {
+                "control_step": 1,
+                "physics_substep": 4,
+                "global_physics_step": 4,
+                "record_level": "physics_substep",
+            },
+        )
+
+    def test_contact_free_physics_prefix(self):
+        records = []
+        positive_total = [0, 0, 0, 1, 1]
+        positive_self = [0, 0, 0, 1, 1]
+        negative_total = [0, 0, 0, 0, 0]
+        negative_self = [0, 0, 0, 0, 0]
+        for case, totals, self_counts in (
+            ("positive", positive_total, positive_self),
+            ("negative", negative_total, negative_self),
+        ):
+            for global_step, (total, self_count) in enumerate(
+                zip(totals, self_counts)
+            ):
+                records.append(
+                    {
+                        "case": case,
+                        "global_physics_step": global_step,
+                        "contact_count_if_available": total,
+                        "self_contact_count_if_available": self_count,
+                    }
+                )
+        summary = DUMP.summarize_physics_contacts(
+            records, ["positive", "negative"], 4, True
+        )
+        self.assertEqual(
+            summary["first_contact_global_physics_step_by_case"],
+            {"positive": 3, "negative": None},
+        )
+        self.assertEqual(
+            summary["first_self_contact_global_physics_step_by_case"],
+            {"positive": 3, "negative": None},
+        )
+        self.assertEqual(
+            summary["contact_free_prefix_length_by_case"],
+            {"positive": 2, "negative": 4},
+        )
+
+        disabled = DUMP.summarize_physics_contacts(
+            records, ["positive", "negative"], 4, False
+        )
+        self.assertEqual(
+            disabled["contact_free_prefix_length_by_case"],
+            {"positive": DUMP.NOT_AVAILABLE, "negative": DUMP.NOT_AVAILABLE},
+        )
+
     def test_sha256_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "payload.bin"

@@ -181,6 +181,7 @@ def parse_args(argv=None):
         default="default",
     )
     parser.add_argument("--steps", default=10, type=int)
+    parser.add_argument("--record-physics-substeps", action="store_true")
     parser.add_argument("--joint-name", default="limbx/0")
     parser.add_argument("--action-magnitude", default=0.25, type=float)
     parser.add_argument("--cases", default=list(VALID_CASES), type=parse_cases)
@@ -658,6 +659,94 @@ def contact_free_from_summary(summary, field):
     return all(int(value) == 0 for value in values)
 
 
+def physics_substep_sequence(control_steps, frame_skip):
+    if control_steps <= 0 or frame_skip <= 0:
+        raise ValueError("control_steps and frame_skip must be positive")
+    sequence = [(0, 0, 0)]
+    for control_step in range(1, control_steps + 1):
+        for physics_substep in range(1, frame_skip + 1):
+            global_physics_step = (control_step - 1) * frame_skip + physics_substep
+            sequence.append(
+                (control_step, physics_substep, global_physics_step)
+            )
+    return sequence
+
+
+def physics_substep_fields(control_step, physics_substep, frame_skip):
+    if control_step == 0 and physics_substep == 0:
+        global_physics_step = 0
+    elif control_step > 0 and 1 <= physics_substep <= frame_skip:
+        global_physics_step = (control_step - 1) * frame_skip + physics_substep
+    else:
+        raise ValueError("invalid control_step/physics_substep coordinates")
+    return {
+        "control_step": control_step,
+        "physics_substep": physics_substep,
+        "global_physics_step": global_physics_step,
+        "record_level": "physics_substep",
+    }
+
+
+def summarize_physics_contacts(records, cases, total_physics_steps, enabled):
+    first_contact = {}
+    first_self_contact = {}
+    clean_prefix = {}
+    for case in cases:
+        if not enabled:
+            first_contact[case] = NOT_AVAILABLE
+            first_self_contact[case] = NOT_AVAILABLE
+            clean_prefix[case] = NOT_AVAILABLE
+            continue
+        case_records = sorted(
+            (record for record in records if record["case"] == case),
+            key=lambda record: record["global_physics_step"],
+        )
+        expected_steps = list(range(total_physics_steps + 1))
+        actual_steps = [record["global_physics_step"] for record in case_records]
+        if actual_steps != expected_steps:
+            raise ValueError("physics substep records are incomplete for case {!r}".format(case))
+
+        total_contacts = [
+            int(record["contact_count_if_available"]) for record in case_records
+        ]
+        first_contact[case] = next(
+            (
+                record["global_physics_step"]
+                for record, count in zip(case_records, total_contacts)
+                if count > 0
+            ),
+            None,
+        )
+
+        self_counts = [
+            record["self_contact_count_if_available"] for record in case_records
+        ]
+        if any(value == NOT_AVAILABLE for value in self_counts):
+            first_self_contact[case] = NOT_AVAILABLE
+        else:
+            first_self_contact[case] = next(
+                (
+                    record["global_physics_step"]
+                    for record, count in zip(case_records, self_counts)
+                    if int(count) > 0
+                ),
+                None,
+            )
+
+        prefix_length = 0
+        if total_contacts[0] == 0:
+            for count in total_contacts[1:]:
+                if count > 0:
+                    break
+                prefix_length += 1
+        clean_prefix[case] = prefix_length
+    return {
+        "first_contact_global_physics_step_by_case": first_contact,
+        "first_self_contact_global_physics_step_by_case": first_self_contact,
+        "contact_free_prefix_length_by_case": clean_prefix,
+    }
+
+
 def force_slice(data, name, dof_indices, np):
     try:
         values = np.asarray(getattr(data, name), dtype=np.float64).reshape(-1)
@@ -666,7 +755,17 @@ def force_slice(data, name, dof_indices, np):
         return NOT_AVAILABLE
 
 
-def transition_record(base_env, morphology, case, step, ctrl, canonical, names, np):
+def transition_record(
+    base_env,
+    morphology,
+    case,
+    step,
+    ctrl,
+    canonical,
+    names,
+    np,
+    record_fields=None,
+):
     sim, model, data = base_env.sim, base_env.sim.model, base_env.sim.data
     root_qpos = canonical["root_qpos_adr"]
     root_dof = canonical["root_dof_adr"]
@@ -709,6 +808,8 @@ def transition_record(base_env, morphology, case, step, ctrl, canonical, names, 
         "contacts_if_available": contacts,
         "done": False,
     }
+    if record_fields is not None:
+        record.update(record_fields)
     validate_transition_schema(record)
     return record
 
@@ -803,23 +904,81 @@ def run(args) -> None:
             base.set_state(canonical["qpos"].copy(), canonical["qvel"].copy())
             sim.data.ctrl[:] = ctrl
             sim.forward()
-            record = transition_record(base, args.morphology, case, 0, ctrl, canonical, names, np)
-            records.append(record)
-            max_contacts = int(record["contact_count_if_available"])
-            max_ground_contacts = record["ground_contact_count_if_available"]
-            max_self_contacts = record["self_contact_count_if_available"]
-            for step in range(1, args.steps + 1):
-                if base.do_simulation(ctrl):
-                    raise RuntimeError(
-                        "MuJoCo step failed for case {!r} at control step {}".format(case, step)
+            initial_record_fields = (
+                physics_substep_fields(0, 0, int(base.frame_skip))
+                if args.record_physics_substeps
+                else None
+            )
+            case_records = [
+                transition_record(
+                    base,
+                    args.morphology,
+                    case,
+                    0,
+                    ctrl,
+                    canonical,
+                    names,
+                    np,
+                    record_fields=initial_record_fields,
+                )
+            ]
+            for control_step in range(1, args.steps + 1):
+                if args.record_physics_substeps:
+                    base.step_count += 1
+                    sim.data.ctrl[:] = ctrl
+                    for physics_substep in range(1, int(base.frame_skip) + 1):
+                        try:
+                            sim.step()
+                        except Exception as error:
+                            raise RuntimeError(
+                                "MuJoCo step failed for case {!r}, control step {}, physics substep {}".format(
+                                    case, control_step, physics_substep
+                                )
+                            ) from error
+                        case_records.append(
+                            transition_record(
+                                base,
+                                args.morphology,
+                                case,
+                                control_step,
+                                ctrl,
+                                canonical,
+                                names,
+                                np,
+                                record_fields=physics_substep_fields(
+                                    control_step,
+                                    physics_substep,
+                                    int(base.frame_skip),
+                                ),
+                            )
+                        )
+                else:
+                    if base.do_simulation(ctrl):
+                        raise RuntimeError(
+                            "MuJoCo step failed for case {!r} at control step {}".format(
+                                case, control_step
+                            )
+                        )
+                    case_records.append(
+                        transition_record(
+                            base,
+                            args.morphology,
+                            case,
+                            control_step,
+                            ctrl,
+                            canonical,
+                            names,
+                            np,
+                        )
                     )
-                record = transition_record(
-                    base, args.morphology, case, step, ctrl, canonical, names, np
-                )
-                records.append(record)
-                max_contacts = max(
-                    max_contacts, int(record["contact_count_if_available"])
-                )
+            records.extend(case_records)
+            max_contacts = max(
+                int(record["contact_count_if_available"])
+                for record in case_records
+            )
+            max_ground_contacts = 0
+            max_self_contacts = 0
+            for record in case_records:
                 max_ground_contacts = max_contact_count(
                     max_ground_contacts,
                     record["ground_contact_count_if_available"],
@@ -876,6 +1035,12 @@ def run(args) -> None:
             if isinstance(ground_contact_free_valid, bool)
             and isinstance(self_contact_free_valid, bool)
             else NOT_AVAILABLE
+        )
+        physics_contact_summary = summarize_physics_contacts(
+            records,
+            args.cases,
+            args.steps * int(base.frame_skip),
+            args.record_physics_substeps,
         )
         metadata = {
             "schema_version": SCHEMA_VERSION,
@@ -964,7 +1129,11 @@ def run(args) -> None:
             },
             "policy_action_semantics": "actuator_order_ctrl",
             "environment_creation_path": "metamorph.algos.ppo.envs.make_env -> gym.make -> task.make_env",
-            "simulation_path": "env.unwrapped.set_state -> sim.forward -> env.unwrapped.do_simulation",
+            "simulation_path": (
+                "env.unwrapped.set_state -> sim.forward -> diagnostic data.ctrl write -> frame_skip * sim.step with substep records"
+                if args.record_physics_substeps
+                else "env.unwrapped.set_state -> sim.forward -> env.unwrapped.do_simulation"
+            ),
             "formal_action_wrapper_mapping": "MultiUnimalNodeCentricAction removes padded slots (and may mirror); this tool deliberately starts at its native actuator-order output",
             "native_action_or_ctrl_semantics": "mujoco_actuator_order_ctrl",
             "requested_torque_semantics": "joint_names order; sum(ctrl[actuator] * actuator_gear[actuator, 0]) via scalar joint transmissions and compiled joint/dof addresses",
@@ -974,6 +1143,16 @@ def run(args) -> None:
             "passive_force_semantics": "data.qfrc_passive at compiled non-root joint DOF addresses",
             "cases": args.cases,
             "steps": args.steps,
+            "record_physics_substeps": args.record_physics_substeps,
+            "first_contact_global_physics_step_by_case": physics_contact_summary[
+                "first_contact_global_physics_step_by_case"
+            ],
+            "first_self_contact_global_physics_step_by_case": physics_contact_summary[
+                "first_self_contact_global_physics_step_by_case"
+            ],
+            "contact_free_prefix_length_by_case": physics_contact_summary[
+                "contact_free_prefix_length_by_case"
+            ],
             "action_magnitude": args.action_magnitude,
             "contact_summary": contact_summary,
             "ground_contact_free_valid": ground_contact_free_valid,
