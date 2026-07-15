@@ -1460,6 +1460,26 @@ class MethodResultCapture:
             delattr(self.owner, self.method_name)
 
 
+def runtime_contact_parameters(contact, np):
+    def value(name, scalar=False):
+        try:
+            item = getattr(contact, name)
+            return int(item) if scalar else np.asarray(item, dtype=np.float64).copy()
+        except (AttributeError, TypeError, ValueError):
+            return NOT_AVAILABLE
+
+    return {
+        "contact_dim": value("dim", scalar=True),
+        "contact_solref": value("solref"),
+        "contact_solimp": value("solimp"),
+        "contact_friction": value("friction"),
+        "contact_includemargin": (
+            float(contact.includemargin)
+            if hasattr(contact, "includemargin") else NOT_AVAILABLE
+        ),
+    }
+
+
 def ground_contacts_at_substep(sim, names, ground, robot_geoms, np):
     model, data = sim.model, sim.data
     contacts = []
@@ -1499,9 +1519,184 @@ def ground_contacts_at_substep(sim, names, ground, robot_geoms, np):
                 "tangent_force_1": float(force[1]) if force_available else NOT_AVAILABLE,
                 "tangent_force_2": float(force[2]) if force_available else NOT_AVAILABLE,
                 "contact_force_6d": force,
+                **runtime_contact_parameters(contact, np),
             }
         )
     return contacts
+
+
+def indexed_model_parameter(model, name, index, np, scalar=False):
+    try:
+        value = getattr(model, name)[index]
+        if scalar:
+            return int(value)
+        return np.asarray(value, dtype=np.float64).copy()
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return NOT_AVAILABLE
+
+
+def matching_compiled_pair_ids(model, geom1_id, geom2_id, np):
+    try:
+        pair_geom1 = np.asarray(model.pair_geom1, dtype=np.int64).reshape(-1)
+        pair_geom2 = np.asarray(model.pair_geom2, dtype=np.int64).reshape(-1)
+    except (AttributeError, TypeError, ValueError):
+        return []
+    return [
+        pair_id
+        for pair_id, (first, second) in enumerate(zip(pair_geom1, pair_geom2))
+        if {int(first), int(second)} == {int(geom1_id), int(geom2_id)}
+    ]
+
+
+def build_contact_parameter_audit(model, first_ground_contacts, ground, np):
+    if not first_ground_contacts:
+        raise ValueError("first ground contact record has no robot-ground contacts")
+    pairs = {}
+    for contact in first_ground_contacts:
+        geom1_id, geom2_id = int(contact["geom1_id"]), int(contact["geom2_id"])
+        robot_geom_id = geom2_id if geom1_id == int(ground["geom_id"]) else geom1_id
+        key = tuple(sorted((robot_geom_id, int(ground["geom_id"]))))
+        pairs.setdefault(key, contact)
+    if len(pairs) != 1:
+        raise ValueError(
+            "first ground contact contains multiple runtime geom pairs: {}".format(
+                sorted(pairs)
+            )
+        )
+    (robot_geom_id, ground_geom_id), runtime_contact = next(iter(pairs.items()))
+    if ground_geom_id != int(ground["geom_id"]):
+        robot_geom_id, ground_geom_id = ground_geom_id, robot_geom_id
+    pair_ids = matching_compiled_pair_ids(
+        model, robot_geom_id, ground_geom_id, np
+    )
+    if len(pair_ids) > 1:
+        raise ValueError(
+            "runtime geom pair matched multiple compiled pair overrides: {}".format(pair_ids)
+        )
+    pair_id = pair_ids[0] if pair_ids else None
+    pair_source = pair_id is not None
+
+    def geom_parameter(name, geom_id, scalar=False):
+        return indexed_model_parameter(model, "geom_{}".format(name), geom_id, np, scalar)
+
+    def effective(runtime_name, pair_name, scalar=False):
+        runtime_value = runtime_contact.get(runtime_name, NOT_AVAILABLE)
+        if not isinstance(runtime_value, str):
+            return runtime_value
+        if pair_source:
+            return indexed_model_parameter(model, pair_name, pair_id, np, scalar)
+        return NOT_AVAILABLE
+
+    audit = {
+        "schema_version": "metamorph-mujoco-contact-parameter-audit-v1",
+        "runtime_model_source": "MjModel",
+        "robot_geom_id": robot_geom_id,
+        "robot_geom_name": runtime_contact[
+            "geom1_name" if int(runtime_contact["geom1_id"]) == robot_geom_id else "geom2_name"
+        ],
+        "ground_geom_id": ground_geom_id,
+        "ground_geom_name": ground["geom_name"],
+        "robot_geom_margin": geom_parameter("margin", robot_geom_id),
+        "ground_geom_margin": geom_parameter("margin", ground_geom_id),
+        "effective_contact_margin": (
+            indexed_model_parameter(model, "pair_margin", pair_id, np)
+            if pair_source else NOT_AVAILABLE
+        ),
+        "robot_geom_gap": geom_parameter("gap", robot_geom_id),
+        "ground_geom_gap": geom_parameter("gap", ground_geom_id),
+        "effective_contact_gap": (
+            indexed_model_parameter(model, "pair_gap", pair_id, np)
+            if pair_source else NOT_AVAILABLE
+        ),
+        "robot_geom_friction": geom_parameter("friction", robot_geom_id),
+        "ground_geom_friction": geom_parameter("friction", ground_geom_id),
+        "effective_contact_friction": effective("contact_friction", "pair_friction"),
+        "robot_geom_condim": geom_parameter("condim", robot_geom_id, scalar=True),
+        "ground_geom_condim": geom_parameter("condim", ground_geom_id, scalar=True),
+        "effective_contact_condim": effective("contact_dim", "pair_dim", scalar=True),
+        "robot_geom_solref": geom_parameter("solref", robot_geom_id),
+        "ground_geom_solref": geom_parameter("solref", ground_geom_id),
+        "effective_contact_solref": effective("contact_solref", "pair_solref"),
+        "robot_geom_solimp": geom_parameter("solimp", robot_geom_id),
+        "ground_geom_solimp": geom_parameter("solimp", ground_geom_id),
+        "effective_contact_solimp": effective("contact_solimp", "pair_solimp"),
+        "compiled_pair_override_present": pair_source,
+        "compiled_pair_id": pair_id if pair_source else NOT_AVAILABLE,
+        "pair_override_fields": (
+            ["margin", "gap", "friction", "condim", "solref", "solimp"]
+            if pair_source else []
+        ),
+        "parameter_source": (
+            "runtime_mjContact_with_compiled_pair_override"
+            if pair_source
+            else "runtime_mjContact_resolved_from_compiled_geom_parameters_and_mujoco_rules"
+        ),
+        "declaration_provenance": NOT_AVAILABLE,
+        "declaration_provenance_reason": "compiled MjModel does not retain whether a geom value originated from a default class, direct geom attributes, compiler defaults, or MuJoCo built-in defaults",
+        "effective_margin_gap_reason": (
+            "compiled pair override values"
+            if pair_source
+            else "not_available: mjContact exposes includemargin but not separate effective margin and gap provenance"
+        ),
+        "runtime_contact_includemargin": runtime_contact.get(
+            "contact_includemargin", NOT_AVAILABLE
+        ),
+    }
+    return strict_json_value(audit)
+
+
+def add_state_deltas(records, np):
+    vector_fields = (
+        "root_position",
+        "root_linear_velocity",
+        "root_angular_velocity",
+        "torso_position",
+        "torso_linear_velocity",
+        "joint_qpos",
+        "joint_qvel",
+    )
+    previous = None
+    for record in records:
+        if previous is None:
+            record["delta_from_previous_record"] = NOT_AVAILABLE
+            for field in (
+                "delta_root_vx",
+                "delta_root_vz",
+                "delta_root_angular_velocity_norm",
+                "delta_joint_qpos_abs_max",
+                "delta_joint_qvel_abs_max",
+            ):
+                record[field] = NOT_AVAILABLE
+            previous = record
+            continue
+        delta = {}
+        for field in vector_fields:
+            current_value = np.asarray(record[field], dtype=np.float64).reshape(-1)
+            previous_value = np.asarray(previous[field], dtype=np.float64).reshape(-1)
+            if current_value.shape != previous_value.shape:
+                raise ValueError(
+                    "delta shape mismatch for {} at global_physics_step={}: {} vs {}".format(
+                        field,
+                        record["global_physics_step"],
+                        current_value.shape,
+                        previous_value.shape,
+                    )
+                )
+            delta[field] = current_value - previous_value
+        root_linear_delta = delta["root_linear_velocity"]
+        record["delta_from_previous_record"] = delta
+        record["delta_root_vx"] = float(root_linear_delta[0])
+        record["delta_root_vz"] = float(root_linear_delta[2])
+        record["delta_root_angular_velocity_norm"] = float(
+            np.linalg.norm(delta["root_angular_velocity"])
+        )
+        record["delta_joint_qpos_abs_max"] = float(
+            np.max(np.abs(delta["joint_qpos"]))
+        ) if delta["joint_qpos"].size else 0.0
+        record["delta_joint_qvel_abs_max"] = float(
+            np.max(np.abs(delta["joint_qvel"]))
+        ) if delta["joint_qvel"].size else 0.0
+        previous = record
 
 
 def first_ground_contact_record(
@@ -1836,6 +2031,15 @@ def run_first_ground_contact_window(
             relative = int(record["global_physics_step"]) - int(window.first_step)
             record["relative_to_first_contact"] = relative
             record["is_first_ground_contact"] = relative == 0
+        add_state_deltas(window.records, np)
+        first_contact_record = next(
+            record for record in window.records if record["is_first_ground_contact"]
+        )
+        contact_parameter_audit = build_contact_parameter_audit(
+            model, first_contact_record["ground_contacts"], ground, np
+        )
+    else:
+        contact_parameter_audit = NOT_AVAILABLE
     metadata = {
         "schema_version": GROUND_CONTACT_SCHEMA_VERSION,
         "backend": BACKEND,
@@ -1873,6 +2077,11 @@ def run_first_ground_contact_window(
         "torso_height_semantics": "world-frame z coordinate from data.xpos[torso_body_id, 2] (exposed by the compatibility adapter as body_xpos)",
         "contact_frame_semantics": "MuJoCo contact.frame; first row is normal from geom1 toward geom2",
         "contact_force_convention": "mj_contactForce 6D force/torque in contact frame; force, not impulse",
+        "contact_parameter_audit_file": (
+            "mujoco_contact_parameter_audit.json"
+            if window.found else NOT_AVAILABLE
+        ),
+        "state_delta_semantics": "state_after_current_physics_substep minus state_after_previous_recorded_physics_substep",
         "first_ground_contact_definition": "first physics substep with exactly one pair side equal to the unique ground geom and the other side a torso/limb robot geom",
         "policy_action_semantics": "zero action in the outer node-centric policy action space",
         "clipped_action_semantics": "formal environment performs no explicit clip; zero action is unchanged",
@@ -1894,6 +2103,11 @@ def run_first_ground_contact_window(
     try:
         write_strict_json(output_dir / "metadata.json", metadata)
         write_strict_json(output_dir / "summary.json", summary)
+        if window.found:
+            write_strict_json(
+                output_dir / "mujoco_contact_parameter_audit.json",
+                contact_parameter_audit,
+            )
         with (output_dir / "first_ground_contact_window.jsonl").open(
             "w", encoding="utf-8", newline="\n"
         ) as handle:

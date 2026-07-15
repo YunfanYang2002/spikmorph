@@ -964,6 +964,127 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
         self.assertEqual(contacts[0]["distance"], -0.01)
         self.assertEqual(contacts[0]["contact_force_6d"].tolist(), list(range(6)))
 
+    def test_runtime_contact_parameters_are_added_from_mjcontact(self):
+        contact = SimpleNamespace(
+            dim=3,
+            solref=np.array([0.02, 1.0]),
+            solimp=np.array([0.9, 0.95, 0.001, 0.5, 2.0]),
+            friction=np.array([1.0, 1.0, 0.005, 0.0001, 0.0001]),
+        )
+        values = DUMP.runtime_contact_parameters(contact, np)
+        self.assertEqual(values["contact_dim"], 3)
+        np.testing.assert_allclose(values["contact_solref"], [0.02, 1.0])
+        np.testing.assert_allclose(values["contact_friction"][:2], [1.0, 1.0])
+
+    def test_contact_audit_uses_compiled_model_and_pair_override(self):
+        model = SimpleNamespace(
+            geom_margin=np.array([0.01, 0.02]),
+            geom_gap=np.array([0.001, 0.002]),
+            geom_friction=np.array([[0.8, 0.1, 0.01], [0.9, 0.2, 0.02]]),
+            geom_condim=np.array([3, 4]),
+            geom_solref=np.array([[0.03, 1.0], [0.04, 1.1]]),
+            geom_solimp=np.array([[0.8] * 5, [0.9] * 5]),
+            pair_geom1=np.array([0]),
+            pair_geom2=np.array([1]),
+            pair_margin=np.array([0.025]),
+            pair_gap=np.array([0.003]),
+            pair_friction=np.array([[1.2, 1.1, 0.03, 0.004, 0.005]]),
+            pair_dim=np.array([6]),
+            pair_solref=np.array([[0.015, 0.8]]),
+            pair_solimp=np.array([[0.95] * 5]),
+        )
+        runtime_contacts = [{
+            "geom1_id": 0,
+            "geom1_name": "floor/0",
+            "geom2_id": 1,
+            "geom2_name": "limb/0",
+            "contact_dim": 6,
+            "contact_solref": [0.015, 0.8],
+            "contact_solimp": [0.95] * 5,
+            "contact_friction": [1.2, 1.1, 0.03, 0.004, 0.005],
+        }]
+        audit = DUMP.build_contact_parameter_audit(
+            model,
+            runtime_contacts,
+            {"geom_id": 0, "geom_name": "floor/0"},
+            np,
+        )
+        self.assertEqual(audit["robot_geom_name"], "limb/0")
+        self.assertEqual(audit["ground_geom_name"], "floor/0")
+        self.assertTrue(audit["compiled_pair_override_present"])
+        self.assertEqual(audit["compiled_pair_id"], 0)
+        self.assertEqual(audit["effective_contact_condim"], 6)
+        self.assertEqual(audit["effective_contact_margin"], 0.025)
+        self.assertIn("compiled_pair_override", audit["parameter_source"])
+
+    def test_contact_audit_does_not_invent_declaration_provenance(self):
+        model = SimpleNamespace(
+            geom_margin=np.array([0.0, 0.0]),
+            geom_gap=np.array([0.0, 0.0]),
+            geom_friction=np.ones((2, 3)),
+            geom_condim=np.array([3, 3]),
+            geom_solref=np.ones((2, 2)),
+            geom_solimp=np.ones((2, 5)),
+            pair_geom1=np.array([], dtype=int),
+            pair_geom2=np.array([], dtype=int),
+        )
+        audit = DUMP.build_contact_parameter_audit(
+            model,
+            [{
+                "geom1_id": 0, "geom1_name": "floor/0",
+                "geom2_id": 1, "geom2_name": "limb/0",
+                "contact_dim": 3, "contact_solref": [1.0, 1.0],
+                "contact_solimp": [1.0] * 5, "contact_friction": [1.0] * 5,
+            }],
+            {"geom_id": 0, "geom_name": "floor/0"},
+            np,
+        )
+        self.assertFalse(audit["compiled_pair_override_present"])
+        self.assertEqual(audit["declaration_provenance"], DUMP.NOT_AVAILABLE)
+        self.assertEqual(audit["effective_contact_margin"], DUMP.NOT_AVAILABLE)
+
+    def test_state_delta_is_current_minus_previous_and_preserves_step(self):
+        def record(step, offset):
+            return {
+                "global_physics_step": step,
+                "root_position": [offset, 0.0, offset + 1.0],
+                "root_linear_velocity": [offset + 0.1, 0.0, offset + 0.3],
+                "root_angular_velocity": [offset, offset + 1.0, 0.0],
+                "torso_position": [offset, 0.0, offset + 1.0],
+                "torso_linear_velocity": [offset + 0.1, 0.0, offset + 0.3],
+                "joint_qpos": [offset, offset + 0.5],
+                "joint_qvel": [offset + 1.0, offset + 2.0],
+            }
+
+        records = [record(12, 1.0), record(13, 1.25)]
+        DUMP.add_state_deltas(records, np)
+        self.assertEqual(records[0]["delta_from_previous_record"], DUMP.NOT_AVAILABLE)
+        np.testing.assert_allclose(
+            records[1]["delta_from_previous_record"]["root_position"],
+            [0.25, 0.0, 0.25],
+        )
+        self.assertAlmostEqual(records[1]["delta_root_vx"], 0.25)
+        self.assertAlmostEqual(records[1]["delta_root_vz"], 0.25)
+        self.assertAlmostEqual(records[1]["delta_joint_qpos_abs_max"], 0.25)
+        self.assertEqual([item["global_physics_step"] for item in records], [12, 13])
+
+    def test_state_delta_rejects_joint_shape_mismatch(self):
+        base = {
+            "global_physics_step": 1,
+            "root_position": [0.0] * 3,
+            "root_linear_velocity": [0.0] * 3,
+            "root_angular_velocity": [0.0] * 3,
+            "torso_position": [0.0] * 3,
+            "torso_linear_velocity": [0.0] * 3,
+            "joint_qpos": [0.0],
+            "joint_qvel": [0.0],
+        }
+        next_record = dict(base)
+        next_record["global_physics_step"] = 2
+        next_record["joint_qvel"] = [0.0, 0.0]
+        with self.assertRaisesRegex(ValueError, "delta shape mismatch for joint_qvel"):
+            DUMP.add_state_deltas([base, next_record], np)
+
 
 if __name__ == "__main__":
     unittest.main()
