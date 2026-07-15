@@ -808,6 +808,162 @@ class DumpMujocoTransitionHelpersTest(unittest.TestCase):
             self.assertEqual(summary["stage"], "torso_mapping")
             self.assertEqual(summary["torso_body_candidates"], body_names)
 
+    def test_post_step_snapshot_refreshes_before_one_shot_capture(self):
+        events = []
+
+        class FakeData:
+            def __init__(self):
+                self.qpos = np.array([0.0])
+                self.qvel = np.array([0.0])
+                self.ctrl = np.array([0.0])
+                self.body_xpos = np.array([[0.0, 0.0, 0.0]])
+                self.body_xvelp = np.array([[0.0, 0.0, 0.0]])
+                self.body_xvelr = np.array([[0.0, 0.0, 0.0]])
+                self.ncon = 0
+
+        class FakeSim:
+            def __init__(self, live=False):
+                self.live = live
+                self.data = FakeData()
+                self.step_count = 0
+
+            def step(self):
+                events.append("mj_step")
+                self.step_count += 1
+                self.data.qpos[0] = float(self.step_count)
+                self.data.qvel[0] = 10.0 * self.step_count
+                # Mimic stale mj_step-derived Cartesian data.
+                self.data.body_xpos[0, 2] = float(self.step_count - 1)
+
+            def get_state(self):
+                return (self.data.qpos.copy(), self.data.qvel.copy())
+
+            def set_state(self, state):
+                events.append("snapshot_set_state")
+                self.data.qpos[:], self.data.qvel[:] = state
+
+            def forward(self):
+                events.append("snapshot_forward")
+                self.data.body_xpos[0, 2] = self.data.qpos[0]
+                self.data.body_xvelp[0, 2] = self.data.qvel[0]
+                self.data.ncon = int(self.data.qpos[0] >= 1.0)
+
+        live = FakeSim(live=True)
+        snapshot = FakeSim()
+        snapshotter = DUMP.PostPhysicsSnapshotter(live, np, snapshot_sim=snapshot)
+        captured = []
+
+        def callback(snapshot_sim, sequence_id):
+            events.append("capture")
+            captured.append(
+                (
+                    sequence_id,
+                    float(snapshot_sim.data.qpos[0]),
+                    float(snapshot_sim.data.body_xpos[0, 2]),
+                    float(snapshot_sim.data.body_xvelp[0, 2]),
+                    int(snapshot_sim.data.ncon),
+                )
+            )
+
+        proxy = DUMP.StepRecordingSimProxy(live, callback, snapshotter=snapshotter)
+        proxy.step()
+        proxy.step()
+        self.assertEqual(live.step_count, 2)
+        self.assertEqual(
+            events,
+            [
+                "mj_step", "snapshot_set_state", "snapshot_forward", "capture",
+                "mj_step", "snapshot_set_state", "snapshot_forward", "capture",
+            ],
+        )
+        self.assertEqual(captured[0], (1, 1.0, 1.0, 10.0, 1))
+        self.assertEqual(captured[1], (2, 2.0, 2.0, 20.0, 1))
+        self.assertNotEqual(captured[1][3], captured[0][3])
+
+    def test_snapshot_capture_does_not_advance_live_or_snapshot_sim(self):
+        class FakeSim:
+            def __init__(self):
+                self.data = SimpleNamespace(ctrl=np.zeros(1))
+                self.step_count = 0
+                self.forward_count = 0
+
+            def get_state(self):
+                return 1
+
+            def set_state(self, state):
+                self.state = state
+
+            def forward(self):
+                self.forward_count += 1
+
+        live, snapshot = FakeSim(), FakeSim()
+        snapshotter = DUMP.PostPhysicsSnapshotter(live, np, snapshot_sim=snapshot)
+        snapshotter.capture()
+        self.assertEqual(live.step_count, 0)
+        self.assertEqual(snapshot.step_count, 0)
+        self.assertEqual(live.forward_count, 0)
+        self.assertEqual(snapshot.forward_count, 1)
+
+    def test_same_root_and_torso_body_snapshot_must_be_consistent(self):
+        record = {
+            "global_physics_step": 4,
+            "root_position": [0.0, 0.0, 1.2],
+            "torso_position": [0.0, 0.0, 1.2],
+            "torso_height": 1.2,
+        }
+        DUMP.validate_snapshot_consistency(record, True, np)
+        record["torso_position"][2] = 1.1
+        record["torso_height"] = 1.1
+        with self.assertRaisesRegex(ValueError, "root/torso position mismatch"):
+            DUMP.validate_snapshot_consistency(record, True, np)
+
+    def test_root_body_mapping_uses_compiled_free_joint(self):
+        model = SimpleNamespace(
+            njnt=2,
+            jnt_type=np.array([0, 3]),
+            jnt_qposadr=np.array([0, 7]),
+            jnt_bodyid=np.array([1, 2]),
+        )
+        self.assertEqual(
+            DUMP.resolve_root_body(model, ["world", "torso/0", "limb/0"], 0),
+            (1, "torso/0"),
+        )
+
+    def test_contact_force_is_read_from_the_refreshed_snapshot(self):
+        events = []
+        contact = SimpleNamespace(
+            geom1=0,
+            geom2=1,
+            frame=np.eye(3).reshape(-1),
+            pos=np.array([0.0, 0.0, 0.1]),
+            dist=-0.01,
+        )
+        sim = SimpleNamespace(
+            model=SimpleNamespace(geom_bodyid=np.array([0, 1])),
+            data=SimpleNamespace(ncon=1, contact=[contact]),
+        )
+        names = {
+            "geom": ["floor/0", "limb/0"],
+            "body": ["world", "limb/0"],
+        }
+        ground = {"geom_id": 0, "geom_name": "floor/0"}
+        original = DUMP.contact_force_6d
+
+        def fake_contact_force(snapshot_sim, contact_index, np_module):
+            events.append(("contact_force", snapshot_sim.data.contact[contact_index].dist))
+            return np.arange(6, dtype=np.float64)
+
+        DUMP.contact_force_6d = fake_contact_force
+        try:
+            contacts = DUMP.ground_contacts_at_substep(
+                sim, names, ground, {1}, np
+            )
+        finally:
+            DUMP.contact_force_6d = original
+        self.assertEqual(events, [("contact_force", -0.01)])
+        self.assertEqual(contacts[0]["distance"], -0.01)
+        self.assertEqual(contacts[0]["contact_force_6d"].tolist(), list(range(6)))
+
 
 if __name__ == "__main__":
     unittest.main()

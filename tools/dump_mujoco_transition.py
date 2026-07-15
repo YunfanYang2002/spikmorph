@@ -1223,12 +1223,61 @@ def configure_environment(args, walker_dir, metadata_path):
     return cfg
 
 
-class StepRecordingSimProxy:
-    """Delegate the simulator API and notify after each real physics step."""
+def make_snapshot_sim(sim):
+    """Create a second simulator sharing the compiled model but not mjData."""
+    raw_model = getattr(sim, "_model", None)
+    if raw_model is not None:
+        return type(sim)(raw_model)
+    return type(sim)(sim.model)
 
-    def __init__(self, sim, callback):
+
+def copy_available_sim_arrays(source_data, target_data, np):
+    for name in (
+        "ctrl",
+        "qfrc_applied",
+        "xfrc_applied",
+        "mocap_pos",
+        "mocap_quat",
+        "userdata",
+        "qacc_warmstart",
+    ):
+        try:
+            source = np.asarray(getattr(source_data, name))
+            target = np.asarray(getattr(target_data, name))
+            if source.shape == target.shape:
+                target[...] = source
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+
+class PostPhysicsSnapshotter:
+    """Refresh derived data on an isolated mjData after each live step."""
+
+    def __init__(self, live_sim, np, snapshot_sim=None):
+        self.live_sim = live_sim
+        self.np = np
+        self.snapshot_sim = (
+            snapshot_sim if snapshot_sim is not None else make_snapshot_sim(live_sim)
+        )
+        self.sequence_id = 0
+
+    def capture(self):
+        self.snapshot_sim.set_state(self.live_sim.get_state())
+        copy_available_sim_arrays(
+            self.live_sim.data, self.snapshot_sim.data, self.np
+        )
+        self.snapshot_sim.forward()
+        self.sequence_id += 1
+        return self.snapshot_sim, self.sequence_id
+
+
+class StepRecordingSimProxy:
+    """Advance the live sim once, then record an isolated post-step snapshot."""
+
+    def __init__(self, sim, callback, snapshotter=None):
         self._sim = sim
         self._callback = callback
+        self._snapshotter = snapshotter
         self.callback_error = None
 
     def __getattr__(self, name):
@@ -1238,7 +1287,11 @@ class StepRecordingSimProxy:
         result = self._sim.step()
         if self.callback_error is None:
             try:
-                self._callback()
+                if self._snapshotter is None:
+                    self._callback()
+                else:
+                    snapshot_sim, sequence_id = self._snapshotter.capture()
+                    self._callback(snapshot_sim, sequence_id)
             except Exception as error:
                 # The formal do_simulation catches sim.step exceptions. Preserve
                 # the diagnostic failure and re-raise it after env.step returns.
@@ -1292,6 +1345,23 @@ def unique_named_body(body_names, requested_name):
     return matches[0]
 
 
+def resolve_root_body(model, body_names, root_qpos_address):
+    matches = [
+        joint_id
+        for joint_id in range(int(model.njnt))
+        if int(model.jnt_type[joint_id]) == 0
+        and int(model.jnt_qposadr[joint_id]) == int(root_qpos_address)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "expected one compiled free root joint at qpos address {}, found {}".format(
+                root_qpos_address, matches
+            )
+        )
+    body_id = int(model.jnt_bodyid[matches[0]])
+    return body_id, body_names[body_id]
+
+
 def runtime_torso_fields(data, torso_body_id, torso_body_name, global_step, np):
     try:
         position = np.asarray(
@@ -1332,6 +1402,33 @@ def runtime_torso_fields(data, torso_body_id, torso_body_name, global_step, np):
         "torso_angular_velocity": angular_velocity,
         "torso_height": float(position[2]),
     }
+
+
+def validate_snapshot_consistency(record, root_body_is_torso, np, tolerance=1e-9):
+    if not math.isclose(
+        float(record["torso_height"]),
+        float(record["torso_position"][2]),
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "torso height/position mismatch at global_physics_step={}".format(
+                record["global_physics_step"]
+            )
+        )
+    if root_body_is_torso and not np.allclose(
+        np.asarray(record["root_position"], dtype=np.float64),
+        np.asarray(record["torso_position"], dtype=np.float64),
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        raise ValueError(
+            "root/torso position mismatch in one snapshot at global_physics_step={}: root={}, torso={}".format(
+                record["global_physics_step"],
+                record["root_position"],
+                record["torso_position"],
+            )
+        )
 
 
 class MethodResultCapture:
@@ -1408,10 +1505,11 @@ def ground_contacts_at_substep(sim, names, ground, robot_geoms, np):
 
 
 def first_ground_contact_record(
-    base, args, canonical, names, ground, robot_geoms, torso_body_id,
-    policy_action, clipped_action, control_step, physics_substep, global_step, np,
+    sim, args, canonical, names, ground, robot_geoms, torso_body_id,
+    policy_action, clipped_action, control_step, physics_substep, global_step,
+    snapshot_sequence_id, root_body_is_torso, np,
 ):
-    sim, model, data = base.sim, base.sim.model, base.sim.data
+    model, data = sim.model, sim.data
     joint_ids = canonical["policy_joint_ids"]
     qpos_indices = [int(model.jnt_qposadr[joint_id]) for joint_id in joint_ids]
     dof_indices = non_root_dof_indices(model, joint_ids)
@@ -1442,6 +1540,8 @@ def first_ground_contact_record(
         "control_step": control_step,
         "physics_substep_in_control_step": physics_substep,
         "global_physics_step": global_step,
+        "snapshot_sequence_id": snapshot_sequence_id,
+        "record_timing": "post_physics_substep",
         "time": float(data.time),
         "relative_to_first_contact": NOT_AVAILABLE,
         "is_first_ground_contact": False,
@@ -1480,6 +1580,7 @@ def first_ground_contact_record(
         "evaluated_at_control_boundary": False,
     }
     record.update(torso)
+    validate_snapshot_consistency(record, root_body_is_torso, np)
     return strict_json_value(record, global_physics_step=global_step)
 
 
@@ -1584,6 +1685,8 @@ def run_first_ground_contact_window(
         "physics_timestep": float(model.opt.timestep),
         "control_timestep": float(model.opt.timestep) * frame_skip,
         "decimation": frame_skip,
+        "record_timing": "post_physics_substep",
+        "derived_state_refresh_strategy": "isolated snapshot mjData forward refresh after each live mj_step",
     }
     ground = identify_unique_ground_geom(model, names["geom"], names["body"])
     robot_geoms = robot_geom_ids(model, names["geom"], names["body"])
@@ -1595,6 +1698,16 @@ def run_first_ground_contact_window(
             output_dir, args, "torso_mapping", error, failure_context
         )
         raise
+    try:
+        root_body_id, root_body_name = resolve_root_body(
+            model, names["body"], canonical["root_qpos_adr"]
+        )
+    except Exception as error:
+        write_first_ground_contact_failure(
+            output_dir, args, "initialization", error, failure_context
+        )
+        raise
+    root_body_is_torso = root_body_id == torso_body_id
     policy_action = np.zeros(env.action_space.shape, dtype=np.float32)
     clipped_action = policy_action.copy()  # No explicit clipping occurs in the formal wrapper path.
     window = FirstGroundContactWindow(args.contact_window_before, args.contact_window_after)
@@ -1611,20 +1724,28 @@ def run_first_ground_contact_window(
         )
         raise
 
-    def capture():
+    try:
+        snapshotter = PostPhysicsSnapshotter(original_sim, np)
+    except Exception as error:
+        write_first_ground_contact_failure(
+            output_dir, args, "initialization", error, failure_context
+        )
+        raise
+
+    def capture(snapshot_sim, snapshot_sequence_id):
         nonlocal global_step, current_substep
         current_substep += 1
         global_step += 1
         if global_step > args.max_physics_substeps:
             return
         record = first_ground_contact_record(
-            base, args, canonical, names, ground, robot_geoms, torso_body_id,
+            snapshot_sim, args, canonical, names, ground, robot_geoms, torso_body_id,
             policy_action, clipped_action, current_control_step, current_substep,
-            global_step, np,
+            global_step, snapshot_sequence_id, root_body_is_torso, np,
         )
         window.observe(record, record["ground_contact_count"] > 0)
 
-    proxy = StepRecordingSimProxy(original_sim, capture)
+    proxy = StepRecordingSimProxy(original_sim, capture, snapshotter=snapshotter)
     base.sim = proxy
     falling_wrapper = find_wrapper_with_method(env, "has_fallen")
     fallen_capture = (
@@ -1732,10 +1853,18 @@ def run_first_ground_contact_window(
         "reset_qpos_mode": args.canonical_qpos_mode,
         "action_mode": "zero",
         "ground_geom": ground,
+        "root_body_name": root_body_name,
+        "root_body_id": root_body_id,
         "torso_body_name": names["body"][torso_body_id],
         "torso_body_id": torso_body_id,
+        "root_body_is_torso": root_body_is_torso,
         "torso_height_source": "data.xpos[torso_body_id, 2]",
         "torso_height_frame": "world",
+        "record_timing": "post_physics_substep",
+        "derived_state_refresh_strategy": "copy post-mj_step integration state and inputs to isolated snapshot mjData, then mj_forward(snapshot) before one-shot capture; live rollout mjData is not forwarded",
+        "body_velocity_source": "snapshot data.body_xvelr/body_xvelp; angular and linear components from MuJoCo object-centered spatial velocity with world orientation",
+        "body_velocity_output_semantics": "torso_angular_velocity and torso_linear_velocity are separate xyz vectors in world orientation, evaluated at the torso body origin",
+        "contact_source": "snapshot data.contact/data.ncon after isolated mj_forward at the post-substep qpos/qvel; mj_contactForce evaluated on the same snapshot mjData",
         "joint_names": [names["joint"][item] for item in canonical["policy_joint_ids"]],
         "body_names": names["body"],
         "geom_names": names["geom"],
