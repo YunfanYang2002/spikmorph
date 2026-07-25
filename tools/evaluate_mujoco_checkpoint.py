@@ -131,6 +131,23 @@ def info_scalar(
     return None
 
 
+def official_fall_measurement(
+    info: dict[str, Any], tracker: FiniteTracker
+) -> dict[str, Any]:
+    torso_height = info_scalar(info, tracker, "formal_torso_height")
+    threshold = info_scalar(info, tracker, "formal_fallen_threshold")
+    return {
+        "formal_torso_height": torso_height,
+        "formal_fallen_threshold": threshold,
+        "formal_torso_height_source": "official_termination_info",
+        "formal_torso_height_status": (
+            "available"
+            if torso_height is not None
+            else "unavailable_from_official_termination_info"
+        ),
+    }
+
+
 def choose_raw_action(distribution, observation, action_mode: str):
     """Return the unmodified policy-space action and valid-dimension mask."""
     import torch
@@ -300,6 +317,7 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     info, tracker, "x_vel", "x_velocity"
                 )
                 torso_x = info_scalar(info, tracker, "x_pos")
+                fall_measurement = official_fall_measurement(info, tracker)
 
                 if initial_x is None:
                     before = info.get("xy_pos_before")
@@ -327,10 +345,7 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "reported_x_velocity": x_velocity,
                     "root_x": None,
                     "torso_x": torso_x,
-                    "formal_torso_height": None,
-                    "formal_torso_height_status": (
-                        "unavailable_from_selected_observation_and_vecenv_info"
-                    ),
+                    **fall_measurement,
                     "fallen": fallen,
                     "terminated": terminated,
                     "truncated": truncated,
@@ -374,6 +389,10 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
     restored_policy_std_mean = tracker.scalar(
         torch.exp(model.log_std).mean().detach().cpu().item()
     )
+    formal_height_count = sum(
+        transition["formal_torso_height"] is not None
+        for transition in transitions
+    )
     summary = {
         "schema_version": "spikmorph-mujoco-checkpoint-evaluation-v1",
         "action_mode": args.action_mode,
@@ -412,6 +431,11 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             total_out_of_bounds_actions / total_valid_actions
             if total_valid_actions and all_action_values_finite
             else (0.0 if all_action_values_finite else None)
+        ),
+        "formal_torso_height_source": "official_termination_info",
+        "formal_torso_height_available_count": formal_height_count,
+        "formal_torso_height_missing_count": (
+            len(transitions) - formal_height_count
         ),
         "all_values_finite": tracker.all_values_finite,
         "episodes": episode_records,
@@ -462,10 +486,12 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             "deterministic_reset_forced": False,
         },
         "formal_torso_height": {
-            "available": False,
-            "reason": (
-                "the selected model observation and formal VecEnv info do not "
-                "expose the pre-autoreset torso-height quantity"
+            "available": formal_height_count == len(transitions),
+            "source": "official_termination_info",
+            "available_count": formal_height_count,
+            "missing_count": len(transitions) - formal_height_count,
+            "reason_if_missing": (
+                "formal termination info did not expose the measurement"
             ),
         },
     }

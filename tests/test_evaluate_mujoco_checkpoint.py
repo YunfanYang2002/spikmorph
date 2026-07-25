@@ -71,6 +71,26 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertAlmostEqual(diagnostics["raw_action_max"], 1.2, places=6)
         self.assertAlmostEqual(diagnostics["raw_action_min"], -1.3, places=6)
 
+    def test_evaluator_uses_official_fall_info_without_recomputing(self):
+        tracker = EVALUATOR.FiniteTracker()
+        measurement = EVALUATOR.official_fall_measurement(
+            {
+                "formal_torso_height": 0.42,
+                "formal_fallen_threshold": 0.5,
+                # Deliberately inconsistent: the evaluator must preserve
+                # official fields, not derive a new fallen decision.
+                "fallen": False,
+            },
+            tracker,
+        )
+        self.assertEqual(measurement["formal_torso_height"], 0.42)
+        self.assertEqual(measurement["formal_fallen_threshold"], 0.5)
+        self.assertEqual(
+            measurement["formal_torso_height_source"],
+            "official_termination_info",
+        )
+        self.assertNotIn("fallen", measurement)
+
     def test_nonfinite_values_are_json_safe_and_flagged(self):
         tracker = EVALUATOR.FiniteTracker()
         self.assertIsNone(tracker.scalar(float("nan")))

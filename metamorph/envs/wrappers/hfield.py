@@ -319,12 +319,26 @@ class TerminateOnFalling(gym.Wrapper):
         obs, rew, done, info = self.env.step(action)
         fallen = self.has_fallen(obs)
         info["fallen"] = bool(fallen)
+        info["formal_torso_height"] = self._last_formal_torso_height
+        info["formal_fallen_threshold"] = self._last_formal_fallen_threshold
         if fallen:
             done = True
         return obs, rew, done, info
 
     def has_fallen(self, obs):
-        if obs["torso_height"] <= self.env.metadata["fall_threshold"]:
+        torso_height = obs["torso_height"]
+        fall_threshold = self.env.metadata["fall_threshold"]
+        self._last_formal_torso_height = (
+            torso_height.copy()
+            if hasattr(torso_height, "copy")
+            else torso_height
+        )
+        self._last_formal_fallen_threshold = (
+            fall_threshold.copy()
+            if hasattr(fall_threshold, "copy")
+            else fall_threshold
+        )
+        if torso_height <= fall_threshold:
             return True
         else:
             return False
