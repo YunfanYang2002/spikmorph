@@ -140,12 +140,26 @@ class PPO:
 
             lr = ou.get_iter_lr(cur_iter)
             ou.set_lr(self.optimizer, lr)
+            self.train_meter.add_train_stat("learning_rate", float(lr))
+            rollout_nonfinite_count = 0
+            sampled_action_count = 0
+            sampled_action_out_of_bounds_count = 0
 
             for step in range(cfg.PPO.TIMESTEPS):
                 # Sample actions
                 val, act, logp = self.agent.act(obs)
 
+                valid_action = act[~obs["act_padding_mask"].bool()]
+                sampled_action_count += valid_action.numel()
+                sampled_action_out_of_bounds_count += int(
+                    (valid_action.abs() > 1.0).sum().item()
+                )
+
                 next_obs, reward, done, infos = self.envs.step(act)
+                rollout_nonfinite_count += sum(
+                    int((~torch.isfinite(tensor)).sum().item())
+                    for tensor in (val, act, logp, reward)
+                )
 
                 self.train_meter.add_ep_info(infos)
 
@@ -163,6 +177,17 @@ class PPO:
                 self.buffer.insert(obs, act, logp, val, reward, masks, timeouts)
                 obs = next_obs
 
+            action_oob_fraction = (
+                sampled_action_out_of_bounds_count / sampled_action_count
+                if sampled_action_count
+                else 0.0
+            )
+            self.train_meter.add_train_stat(
+                "sampled_action_out_of_bounds_fraction", action_oob_fraction
+            )
+            self.train_meter.add_train_stat(
+                "rollout_nonfinite_count", rollout_nonfinite_count
+            )
             next_val = self.agent.get_value(obs)
             self.buffer.compute_returns(next_val)
             self.sync_vec_normalize()
@@ -226,6 +251,7 @@ class PPO:
                 )
 
                 if approx_kl > cfg.PPO.KL_TARGET_COEF * 0.01:
+                    self.train_meter.add_train_stat("kl_early_stop", 1)
                     return
 
                 surr1 = ratio * batch["adv"]
@@ -250,6 +276,10 @@ class PPO:
                 loss = val_loss * cfg.PPO.VALUE_COEF
                 loss += pi_loss
                 loss += -ent * cfg.PPO.ENTROPY_COEF
+                self.train_meter.add_train_stat(
+                    "ppo_nonfinite_minibatch",
+                    int(not bool(torch.isfinite(loss).item())),
+                )
                 loss.backward()
 
                 # Log training stats
@@ -284,6 +314,8 @@ class PPO:
                 )
 
                 self.optimizer.step()
+
+        self.train_meter.add_train_stat("kl_early_stop", 0)
 
         # Save weight histogram
         if cfg.SAVE_HIST_WEIGHTS and self.writer:

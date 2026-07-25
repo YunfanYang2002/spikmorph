@@ -317,7 +317,9 @@ class TerminateOnFalling(gym.Wrapper):
 
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
-        if self.has_fallen(obs):
+        fallen = self.has_fallen(obs)
+        info["fallen"] = bool(fallen)
+        if fallen:
             done = True
         return obs, rew, done, info
 

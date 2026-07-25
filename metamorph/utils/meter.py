@@ -22,11 +22,21 @@ class AgentMeter:
         self.ep_count = 0
         self.ep_len = deque(maxlen=10)
         self.ep_len_ema = -1
+        self.transition_vel = []
+        self.fallen_count = []
+        self._transition_vel_sum = 0.0
+        self._transition_vel_count = 0
+        self._fallen_count = 0
 
     def add_ep_info(self, infos):
         for info in infos:
             if info["name"] != self.name:
                 continue
+            if "x_vel" in info:
+                self._transition_vel_sum += float(info["x_vel"])
+                self._transition_vel_count += 1
+            if info.get("fallen", False):
+                self._fallen_count += 1
             if "episode" in info.keys():
                 self.ep_rew["reward"].append(info["episode"]["r"])
                 self.ep_count += 1
@@ -51,6 +61,17 @@ class AgentMeter:
                     self.ep_metric.append(info["metric"])
 
     def update_mean(self):
+        transition_vel = (
+            self._transition_vel_sum / self._transition_vel_count
+            if self._transition_vel_count
+            else float("nan")
+        )
+        self.transition_vel.append(transition_vel)
+        self.fallen_count.append(self._fallen_count)
+        self._transition_vel_sum = 0.0
+        self._transition_vel_count = 0
+        self._fallen_count = 0
+
         if len(self.ep_rew["reward"]) == 0:
             return False
 
@@ -97,6 +118,8 @@ class TrainMeter:
         self.mean_vel = []
         self.mean_metric = []
         self.mean_ep_len = []
+        self.transition_vel = []
+        self.fallen_count = []
 
     def add_train_stat(self, stat_type, stat_value):
         self.train_stats[stat_type].append(stat_value)
@@ -106,10 +129,23 @@ class TrainMeter:
             agent_meter.add_ep_info(infos)
 
     def update_mean(self):
+        successes = []
         for _, agent_meter in self.agent_meters.items():
-            success = agent_meter.update_mean()
-            if not success:
-                return
+            successes.append(agent_meter.update_mean())
+
+        transition_vel = [
+            meter.transition_vel[-1]
+            for meter in self.agent_meters.values()
+            if np.isfinite(meter.transition_vel[-1])
+        ]
+        self.transition_vel.append(
+            float(np.mean(transition_vel)) if transition_vel else float("nan")
+        )
+        self.fallen_count.append(
+            int(sum(meter.fallen_count[-1] for meter in self.agent_meters.values()))
+        )
+        if not all(successes):
+            return
 
         metrics = ["mean_pos", "mean_vel", "mean_metric", "mean_ep_len"]
         for metric in metrics:
@@ -149,6 +185,8 @@ class TrainMeter:
                 "vel": agent_meter.mean_vel,
                 "metric": agent_meter.mean_metric,
                 "ep_len": agent_meter.mean_ep_len,
+                "transition_vel": agent_meter.transition_vel,
+                "fallen_count": agent_meter.fallen_count,
             }
 
         stats["__env__"] = {
@@ -157,6 +195,8 @@ class TrainMeter:
                 "vel": self.mean_vel,
                 "metric": self.mean_metric,
                 "ep_len": self.mean_ep_len,
+                "transition_vel": self.transition_vel,
+                "fallen_count": self.fallen_count,
         }
         stats["__env__"].update(dict(self.train_stats))
         return stats
