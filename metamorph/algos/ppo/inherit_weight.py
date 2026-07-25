@@ -3,8 +3,17 @@ import torch
 from metamorph.config import cfg
 
 
-def restore_from_checkpoint(ac):
-    model_p, ob_rms = torch.load(cfg.PPO.CHECKPOINT_PATH)
+def restore_from_checkpoint(ac, map_location=None):
+    load_kwargs = {}
+    if map_location is not None:
+        load_kwargs["map_location"] = map_location
+    try:
+        model_p, ob_rms = torch.load(
+            cfg.PPO.CHECKPOINT_PATH, weights_only=False, **load_kwargs
+        )
+    except TypeError:
+        # ``weights_only`` is unavailable on older supported PyTorch versions.
+        model_p, ob_rms = torch.load(cfg.PPO.CHECKPOINT_PATH, **load_kwargs)
 
     state_dict_c = ac.state_dict()
     state_dict_p = model_p.state_dict()

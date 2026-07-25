@@ -62,7 +62,11 @@ def parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=512,
-        help="Effective Isaac reference minibatch size for the 4x128 rollout.",
+        help=(
+            "Configured MuJoCo minibatch size. The original sampler requires "
+            "this to be no larger than the rollout; 512 matches the corrected "
+            "Isaac effective geometry but not its configured value 5120."
+        ),
     )
     result.add_argument(
         "--target-kl",
@@ -274,6 +278,9 @@ def training_profile(args: argparse.Namespace) -> dict[str, Any]:
         "iterations": args.max_state_action_pairs // transitions_per_iteration,
         "max_state_action_pairs": args.max_state_action_pairs,
         "batch_size": args.batch_size,
+        "isaac_reference_configured_batch_size": 5120,
+        "configured_batch_size_match": args.batch_size == 5120,
+        "effective_update_geometry_match": args.batch_size == 512,
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "epochs": 8,
