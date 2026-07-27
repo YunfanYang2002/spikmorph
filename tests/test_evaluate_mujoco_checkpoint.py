@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -34,6 +35,23 @@ class FakeDistribution:
 
 
 class EvaluateMujocoCheckpointTests(unittest.TestCase):
+    def test_direct_script_bootstraps_repository_import_path(self):
+        code = (
+            "import runpy, sys; "
+            f"namespace = runpy.run_path({str(MODULE_PATH)!r}, "
+            "run_name='evaluator_import_probe'); "
+            "print(str(namespace['REPO_ROOT']) in sys.path)"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=MODULE_PATH.parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "True")
+
     @staticmethod
     def fake_mujoco_env():
         class Model:

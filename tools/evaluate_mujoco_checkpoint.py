@@ -14,10 +14,14 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 ACTION_MODES = ("zero", "mean", "sample")
 OUTPUT_FILENAMES = ("metadata.json", "summary.json", "transitions.jsonl")
 
