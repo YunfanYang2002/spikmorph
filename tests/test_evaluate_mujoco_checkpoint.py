@@ -57,6 +57,7 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         class Model:
             joint_names = ("root", "hip", "knee")
             jnt_type = np.asarray([0, 3, 3])
+            jnt_bodyid = np.asarray([1, 2, 2])
             jnt_range = np.asarray([[0, 0], [-1, 1], [-2, 2]])
             nv = 8
             nu = 2
@@ -86,6 +87,9 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
             qpos=np.asarray([1, 2, 3, 1, 0, 0, 0, 0.25, -0.5]),
             qvel=np.asarray([1, 2, 3, 4, 5, 6, 0.7, -0.8]),
             body_xpos=np.asarray([[0, 0, 0], [1, 2, 0.55], [1, 2, 0.3]]),
+            body_xquat=np.asarray(
+                [[1, 0, 0, 0], [0.9, 0.1, 0.2, 0.3], [1, 0, 0, 0]]
+            ),
             body_xvelp=np.asarray([[0, 0, 0], [0.1, 0.2, 0.3], [0, 0, 0]]),
             body_xvelr=np.asarray([[0, 0, 0], [0.4, 0.5, 0.6], [0, 0, 0]]),
             ctrl=np.asarray([0.0, 0.0]),
@@ -96,7 +100,8 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
             contact=[],
         )
         return SimpleNamespace(
-            sim=SimpleNamespace(model=Model(), data=data), frame_skip=4
+            sim=SimpleNamespace(model=Model(), data=data), frame_skip=4,
+            step_count=1,
         )
 
     def test_free_root_and_ordinary_joint_mapping_are_separate(self):
@@ -106,6 +111,10 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertEqual(metadata["root_free_joint"]["qpos_indices"], list(range(7)))
         self.assertEqual(metadata["root_free_joint"]["qvel_indices"], list(range(6)))
         self.assertEqual(metadata["ordered_joint_names"], ["hip", "knee"])
+        self.assertEqual(metadata["joint_index_map"], {"0": "hip", "1": "knee"})
+        self.assertTrue(metadata["all_ordinary_joints_one_dof_hinge"])
+        self.assertEqual(metadata["root_body_name"], "torso/0")
+        self.assertTrue(metadata["root_body_is_torso_body"])
         self.assertEqual(
             [item["qpos_indices"] for item in metadata["ordinary_joint_mapping"]],
             [[7], [8]],
@@ -122,8 +131,21 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
 
         self.assertEqual(snapshot["root_free_joint_position"], [1.0, 2.0, 3.0])
         self.assertEqual(snapshot["root_free_joint_orientation_wxyz"], [1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(
+            snapshot["root_world_orientation_wxyz"], [0.9, 0.1, 0.2, 0.3]
+        )
+        self.assertEqual(
+            snapshot["root_local_to_env_position_xyz"], [1.0, 2.0, 0.55]
+        )
         self.assertEqual(snapshot["ordered_joint_qpos"], [0.25, -0.5])
         self.assertEqual(snapshot["ordered_joint_qvel"], [0.7, -0.8])
+        self.assertEqual(snapshot["joint_qpos"], [0.25, -0.5])
+        self.assertEqual(snapshot["joint_qvel"], [0.7, -0.8])
+        self.assertEqual(snapshot["joint_qfrc_actuator"], [6.0, 7.0])
+        np.testing.assert_allclose(
+            snapshot["joint_qfrc_passive"], [0.6, 0.7]
+        )
+        self.assertEqual(snapshot["joint_actuator_ctrl"], [0.0, 0.0])
         self.assertEqual(len(snapshot["full_qpos"]), 9)
         self.assertEqual(len(snapshot["full_qvel"]), 8)
         self.assertEqual(len(snapshot["qfrc_actuator"]), 8)
@@ -151,6 +173,74 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertTrue(args.record_state_trajectory)
         self.assertEqual(args.max_eval_steps, 220)
         self.assertEqual(args.reset_noise_scale, 0.0)
+
+    def test_trajectory_cli_is_default_off(self):
+        args = EVALUATOR.parser().parse_args(
+            [
+                "--checkpoint", "checkpoint.pt",
+                "--walker-dir", "walkers",
+                "--morphology-id", "walker",
+                "--action-mode", "zero",
+                "--output-dir", "output",
+            ]
+        )
+        self.assertFalse(args.record_state_trajectory)
+        self.assertIsNone(args.max_eval_steps)
+
+    def test_velocity_frame_and_quaternion_metadata_are_explicit(self):
+        metadata = EVALUATOR.build_state_trajectory_metadata(
+            self.fake_mujoco_env()
+        )
+        conventions = metadata["coordinate_conventions"]
+        self.assertEqual(conventions["body_orientation"], "quaternion wxyz")
+        self.assertIn("world-aligned", conventions["body_linear_velocity"])
+        self.assertIn("mj_objectVelocity", metadata["body_velocity_convention"])
+
+    def test_zero_reset_metadata_reports_effective_facts(self):
+        metadata = EVALUATOR.native_reset_metadata(0.0, 0.0)
+        self.assertEqual(metadata["reset_noise_scale"], 0.0)
+        self.assertFalse(metadata["reset_state_noise_active"])
+        self.assertFalse(metadata["qpos_qvel_noise_preserved"])
+        self.assertTrue(metadata["deterministic_reset_effective"])
+        self.assertTrue(metadata["deterministic_reset_forced"])
+
+    def test_terminal_capture_precedes_auto_reset(self):
+        base_env = self.fake_mujoco_env()
+        metadata = EVALUATOR.build_state_trajectory_metadata(base_env)
+        snapshots = {}
+        tracker = EVALUATOR.FiniteTracker()
+
+        class TerminationWrapper:
+            def step(self, action):
+                return "terminal_obs", 1.0, True, {"fallen": True}
+
+        wrapper = TerminationWrapper()
+        EVALUATOR.install_pre_autoreset_state_capture(
+            wrapper, base_env, metadata, tracker, snapshots
+        )
+
+        class DummyAutoReset:
+            def step(self, action):
+                result = wrapper.step(action)
+                if result[2]:
+                    base_env.sim.data.qpos[:7] = np.asarray(
+                        [9, 9, 9, 1, 0, 0, 0]
+                    )
+                    base_env.sim.data.body_xpos[1] = np.asarray([9, 9, 9])
+                return result
+
+        result = DummyAutoReset().step([0.0, 0.0])
+
+        self.assertTrue(result[2])
+        self.assertTrue(result[3]["fallen"])
+        self.assertEqual(
+            snapshots["latest"]["root_free_joint_position"],
+            [1.0, 2.0, 3.0],
+        )
+        self.assertEqual(
+            snapshots["latest"]["root_world_position_xyz"],
+            [1.0, 2.0, 0.55],
+        )
 
     def observation(self):
         return {

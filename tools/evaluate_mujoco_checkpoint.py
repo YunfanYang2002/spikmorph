@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 import subprocess
 import sys
+from types import MethodType
 from typing import Any, Sequence
 
 
@@ -238,6 +239,20 @@ def evaluator_cutoff_reached(step_count: int, max_eval_steps: int | None) -> boo
     return max_eval_steps is not None and step_count >= max_eval_steps
 
 
+def native_reset_metadata(
+    effective_noise_scale: float, requested_noise_scale: float | None
+) -> dict[str, Any]:
+    noise_active = bool(float(effective_noise_scale) != 0.0)
+    return {
+        "reset_noise_scale": float(effective_noise_scale),
+        "requested_reset_noise_scale": requested_noise_scale,
+        "reset_state_noise_active": noise_active,
+        "qpos_qvel_noise_preserved": noise_active,
+        "deterministic_reset_effective": not noise_active,
+        "deterministic_reset_forced": bool(requested_noise_scale == 0.0),
+    }
+
+
 def _indices(address: int | tuple[int, int]) -> list[int]:
     if isinstance(address, tuple):
         return list(range(int(address[0]), int(address[1])))
@@ -268,6 +283,49 @@ def unwrap_single_mujoco_env(envs: Any) -> Any:
     return base
 
 
+def find_env_wrapper(envs: Any, class_name: str) -> Any:
+    current = envs
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        if current.__class__.__name__ == class_name:
+            return current
+        if "venv" in vars(current):
+            current = vars(current)["venv"]
+            continue
+        if "envs" in vars(current):
+            candidates = vars(current)["envs"]
+            if len(candidates) != 1:
+                raise RuntimeError("state trajectory requires exactly one raw env")
+            current = candidates[0]
+            continue
+        if "env" in vars(current):
+            current = vars(current)["env"]
+            continue
+        break
+    raise RuntimeError(f"required wrapper is unavailable: {class_name}")
+
+
+def install_pre_autoreset_state_capture(
+    termination_wrapper: Any,
+    base_env: Any,
+    metadata: dict[str, Any],
+    tracker: FiniteTracker,
+    snapshots: dict[str, dict[str, Any]],
+) -> None:
+    """Capture post-termination MuJoCo state before DummyVecEnv auto-reset."""
+    original_step = termination_wrapper.step
+
+    def step(self: Any, action: Any):
+        result = original_step(action)
+        snapshots["latest"] = capture_state_trajectory(
+            base_env, metadata, tracker
+        )
+        return result
+
+    termination_wrapper.step = MethodType(step, termination_wrapper)
+
+
 def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
     model = base_env.sim.model
     type_names = {0: "free", 1: "ball", 2: "slide", 3: "hinge"}
@@ -294,6 +352,8 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
     ordinary = [joint for joint in joints if joint is not root]
     if any(len(joint["qpos_indices"]) != 1 or len(joint["qvel_indices"]) != 1 for joint in ordinary):
         raise RuntimeError("ordinary agent joints must have scalar qpos/qvel")
+    if any(joint["joint_type"] != "hinge" for joint in ordinary):
+        raise RuntimeError("ordinary policy joints must all be one-DOF hinge joints")
     actuator_names = tuple(getattr(model, "actuator_names", ()))
     actuators = []
     for actuator_id in range(int(model.nu)):
@@ -308,6 +368,32 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
                 "actuator_force_index": actuator_id,
             }
         )
+    for policy_index, joint in enumerate(ordinary):
+        actuator_indices = [
+            item["actuator_id"]
+            for item in actuators
+            if item["joint_id"] == joint["joint_id"]
+        ]
+        if len(actuator_indices) != 1:
+            raise RuntimeError(
+                "each ordinary policy joint must map to exactly one actuator: "
+                f"joint={joint['joint_name']!r}, actuators={actuator_indices}"
+            )
+        joint.update(
+            {
+                "policy_index": policy_index,
+                "source_joint_name": joint["joint_name"],
+                "actuator_indices": actuator_indices,
+                "qfrc_indices": list(joint["qvel_indices"]),
+            }
+        )
+    actuator_joint_names = [item["joint_name"] for item in actuators]
+    ordinary_joint_names = [joint["joint_name"] for joint in ordinary]
+    if actuator_joint_names != ordinary_joint_names:
+        raise RuntimeError(
+            "formal policy actuator order does not match source ordinary-joint "
+            f"order: actuators={actuator_joint_names}, joints={ordinary_joint_names}"
+        )
     dof_mapping = []
     for joint in joints:
         components = (
@@ -318,6 +404,7 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
         dof_mapping.extend(
             {
                 "qvel_index": index,
+                "qfrc_index": index,
                 "joint_name": joint["joint_name"],
                 "component": components[offset],
             }
@@ -328,16 +415,41 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
             f"generalized DOF mapping mismatch: {len(dof_mapping)} != {model.nv}"
         )
     torso_id = int(model.body_name2id("torso/0"))
+    root_body_id = int(model.jnt_bodyid[root["joint_id"]])
+    root_body_name = str(model.body_id2name(root_body_id))
+    root["body_id"] = root_body_id
+    root["body_name"] = root_body_name
+    root["qfrc_indices"] = list(root["qvel_indices"])
+    joint_names = [joint["joint_name"] for joint in ordinary]
     return {
         "physics_timestep": float(model.opt.timestep),
         "frame_skip": int(base_env.frame_skip),
         "control_dt": float(model.opt.timestep * base_env.frame_skip),
         "root_free_joint": root,
         "root_qpos_convention": "[world_x, world_y, world_z, quat_w, quat_x, quat_y, quat_z]",
-        "root_qvel_convention": "native MuJoCo generalized free-joint [linear_xyz, angular_xyz]",
-        "torso_velocity_convention": "sim.data.body_xvelp/body_xvelr, world-frame Cartesian",
+        "root_qvel_convention": (
+            "native MuJoCo generalized free-joint [linear_xyz, angular_xyz]; "
+            "retained for diagnostics and not asserted equivalent to world-frame body velocity"
+        ),
+        "body_velocity_convention": (
+            "sim.data.body_xvelp/body_xvelr compatibility API; modern MuJoCo "
+            "uses mj_objectVelocity with flg_local=0, world-aligned Cartesian"
+        ),
+        "root_body_id": root_body_id,
+        "root_body_name": root_body_name,
+        "root_body_is_torso_body": root_body_id == torso_id,
         "ordinary_joint_mapping": ordinary,
-        "ordered_joint_names": [joint["joint_name"] for joint in ordinary],
+        "all_ordinary_joints_one_dof_hinge": True,
+        "joint_order_semantics": (
+            "source MJCF ordinary-joint order, validated equal to formal "
+            "MuJoCo actuator/control order"
+        ),
+        "ordered_joint_names": joint_names,
+        "joint_names": joint_names,
+        "joint_indices": list(range(len(joint_names))),
+        "joint_index_map": {
+            str(index): name for index, name in enumerate(joint_names)
+        },
         "generalized_dof_mapping": dof_mapping,
         "actuator_mapping": actuators,
         "body_mapping": [
@@ -346,6 +458,9 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
         ],
         "torso_body_id": torso_id,
         "torso_body_name": "torso/0",
+        "cross_backend_alias_status": (
+            "not_asserted_without_isaac_articulation_root_frame_mapping"
+        ),
         "direct_field_availability": {
             name: hasattr(base_env.sim.data, name)
             for name in (
@@ -356,8 +471,23 @@ def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
                 "contact",
             )
         },
+        "force_semantics": {
+            "native_action": "policy-space action after padding removal",
+            "actuator_ctrl": "MuJoCo actuator control input in model actuator order",
+            "actuator_force": "MuJoCo actuator scalar force in model actuator order",
+            "qfrc_actuator": "actuator contribution to generalized force in nv/DOF order",
+            "qfrc_passive": "passive generalized force in nv/DOF order",
+            "joint_qfrc_mapping": "source joint qvel/DOF address; not policy array index",
+        },
         "coordinate_conventions": {
             "positions": "MuJoCo world frame, metres",
+            "env_origin_world_xyz": [0.0, 0.0, 0.0],
+            "root_local_to_env_origin": (
+                "identical to MuJoCo world xyz for this single-environment evaluator"
+            ),
+            "body_orientation": "quaternion wxyz",
+            "body_linear_velocity": "world-aligned Cartesian, metres/second",
+            "body_angular_velocity": "world-aligned Cartesian, radians/second",
             "ordinary_joint_qpos": "native scalar joint coordinates, radians for hinge joints",
             "ordinary_joint_qvel": "native scalar joint velocities, radians/second for hinge joints",
         },
@@ -374,7 +504,12 @@ def capture_state_trajectory(base_env: Any, metadata: dict[str, Any], tracker: F
     qvel = np.asarray(data.qvel)
     root_qpos = qpos[root["qpos_indices"]]
     root_qvel = qvel[root["qvel_indices"]]
+    root_body_id = metadata["root_body_id"]
     torso_id = metadata["torso_body_id"]
+    body_xpos = np.asarray(data.body_xpos)
+    body_xquat = np.asarray(data.body_xquat)
+    body_xvelp = np.asarray(data.body_xvelp)
+    body_xvelr = np.asarray(data.body_xvelr)
     contacts = []
     for contact in data.contact[: int(data.ncon)]:
         geom1, geom2 = int(contact.geom1), int(contact.geom2)
@@ -392,22 +527,54 @@ def capture_state_trajectory(base_env: Any, metadata: dict[str, Any], tracker: F
             }
         )
     ordinary = metadata["ordinary_joint_mapping"]
+    actuator_force = getattr(data, "actuator_force", None)
+    ordinary_actuator_indices = [
+        joint["actuator_indices"][0] for joint in ordinary
+    ]
+    ordinary_qfrc_indices = [joint["qfrc_indices"][0] for joint in ordinary]
+    joint_qpos = [
+        tracker.scalar(qpos[joint["qpos_indices"][0]]) for joint in ordinary
+    ]
+    joint_qvel = [
+        tracker.scalar(qvel[joint["qvel_indices"][0]]) for joint in ordinary
+    ]
     return {
         "simulation_time": tracker.scalar(data.time),
+        "backend_episode_step": int(base_env.step_count),
         "full_qpos": tracker.vector(qpos),
         "full_qvel": tracker.vector(qvel),
-        "torso_world_position": tracker.vector(data.body_xpos[torso_id]),
+        "root_world_position_xyz": tracker.vector(body_xpos[root_body_id]),
+        "root_local_to_env_position_xyz": tracker.vector(
+            body_xpos[root_body_id]
+        ),
+        "root_world_orientation_wxyz": tracker.vector(body_xquat[root_body_id]),
+        "root_world_linear_velocity_xyz": tracker.vector(body_xvelp[root_body_id]),
+        "root_world_angular_velocity_xyz": tracker.vector(body_xvelr[root_body_id]),
+        "torso_world_position_xyz": tracker.vector(body_xpos[torso_id]),
+        "torso_world_orientation_wxyz": tracker.vector(body_xquat[torso_id]),
+        "torso_world_linear_velocity_xyz": tracker.vector(body_xvelp[torso_id]),
+        "torso_world_angular_velocity_xyz": tracker.vector(body_xvelr[torso_id]),
         "root_free_joint_position": tracker.vector(root_qpos[:3]),
         "root_free_joint_orientation_wxyz": tracker.vector(root_qpos[3:7]),
-        "root_linear_velocity_world": tracker.vector(data.body_xvelp[torso_id]),
-        "root_angular_velocity_world": tracker.vector(data.body_xvelr[torso_id]),
-        "torso_linear_velocity_world": tracker.vector(data.body_xvelp[torso_id]),
-        "torso_angular_velocity_world": tracker.vector(data.body_xvelr[torso_id]),
         "root_generalized_qvel": tracker.vector(root_qvel),
-        "ordered_joint_qpos": [tracker.scalar(qpos[joint["qpos_indices"][0]]) for joint in ordinary],
-        "ordered_joint_qvel": [tracker.scalar(qvel[joint["qvel_indices"][0]]) for joint in ordinary],
+        "root_qfrc_actuator": tracker.vector(data.qfrc_actuator[root["qfrc_indices"]]),
+        "root_qfrc_passive": tracker.vector(data.qfrc_passive[root["qfrc_indices"]]),
+        "joint_qpos": joint_qpos,
+        "joint_qvel": joint_qvel,
+        "ordered_joint_qpos": joint_qpos,
+        "ordered_joint_qvel": joint_qvel,
         "actuator_ctrl": tracker.vector(data.ctrl),
-        "actuator_force": tracker.vector(getattr(data, "actuator_force", [])),
+        "actuator_force": (
+            tracker.vector(actuator_force) if actuator_force is not None else None
+        ),
+        "joint_actuator_ctrl": tracker.vector(data.ctrl[ordinary_actuator_indices]),
+        "joint_actuator_force": (
+            tracker.vector(actuator_force[ordinary_actuator_indices])
+            if actuator_force is not None
+            else None
+        ),
+        "joint_qfrc_actuator": tracker.vector(data.qfrc_actuator[ordinary_qfrc_indices]),
+        "joint_qfrc_passive": tracker.vector(data.qfrc_passive[ordinary_qfrc_indices]),
         "qfrc_actuator": tracker.vector(data.qfrc_actuator),
         "qfrc_passive": tracker.vector(data.qfrc_passive),
         "contact_count": int(data.ncon),
@@ -486,11 +653,20 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
     all_action_values_finite = True
     base_env = None
     trajectory_metadata = None
+    trajectory_snapshots: dict[str, dict[str, Any]] = {}
     try:
         observation = envs.reset()
         if args.record_state_trajectory:
             base_env = unwrap_single_mujoco_env(envs)
             trajectory_metadata = build_state_trajectory_metadata(base_env)
+            termination_wrapper = find_env_wrapper(envs, "TerminateOnFalling")
+            install_pre_autoreset_state_capture(
+                termination_wrapper,
+                base_env,
+                trajectory_metadata,
+                tracker,
+                trajectory_snapshots,
+            )
         for episode_index in range(args.episodes):
             episode_reward = 0.0
             episode_rewards_finite = True
@@ -512,6 +688,11 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                 action_stats = raw_action_diagnostics(
                     raw_action, valid_mask, tracker
                 )
+                native_action = (
+                    tracker.vector(raw_action[valid_mask].detach().cpu().numpy())
+                    if trajectory_metadata is not None
+                    else None
+                )
                 total_valid_actions += action_stats.pop("_valid_action_count")
                 total_out_of_bounds_actions += action_stats.pop(
                     "_out_of_bounds_count"
@@ -520,6 +701,8 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "_action_values_finite"
                 )
 
+                if trajectory_metadata is not None:
+                    trajectory_snapshots.clear()
                 next_observation, reward_tensor, done_array, infos = envs.step(
                     raw_action
                 )
@@ -568,21 +751,24 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     **action_stats,
                 }
                 if trajectory_metadata is not None and base_env is not None:
-                    record["control_step"] = episode_length - 1
+                    record["native_action"] = native_action
+                    record["torso_height_above_ground"] = record[
+                        "formal_torso_height"
+                    ]
+                    record["control_step"] = episode_length
+                    record["backend_episode_step"] = episode_length
                     record["elapsed_control_time"] = episode_length * float(
                         trajectory_metadata["control_dt"]
                     )
-                    if done:
-                        record["state_snapshot_status"] = (
-                            "unavailable_after_dummy_vec_env_auto_reset"
+                    snapshot = trajectory_snapshots.get("latest")
+                    if snapshot is None:
+                        raise RuntimeError(
+                            "pre-auto-reset state capture did not run for transition"
                         )
-                    else:
-                        record.update(
-                            capture_state_trajectory(
-                                base_env, trajectory_metadata, tracker
-                            )
-                        )
-                        record["state_snapshot_status"] = "post_control_step"
+                    record.update(snapshot)
+                    record["state_snapshot_status"] = (
+                        "post_termination_pre_dummy_vec_env_auto_reset"
+                    )
                 transitions.append(record)
 
                 observation = next_observation
@@ -679,6 +865,17 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
         "transition_count": len(transitions),
         "evaluator_max_steps": args.max_eval_steps,
     }
+    if args.record_state_trajectory:
+        summary.update(
+            {
+                "environment_completed_episode_count": sum(
+                    not record["evaluator_cutoff"] for record in episode_records
+                ),
+                "evaluator_cutoff_count": sum(
+                    record["evaluator_cutoff"] for record in episode_records
+                ),
+            }
+        )
     metadata = {
         "schema_version": "spikmorph-mujoco-checkpoint-evaluation-metadata-v1",
         "created_at": datetime.now().astimezone().isoformat(),
@@ -719,13 +916,9 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             "raw_reward_equals_reported_reward": True,
             "clip_observation": float(vec_normalize.clipob),
         },
-        "native_reset": {
-            "reset_noise_scale": float(cfg.ENV.RESET_NOISE_SCALE),
-            "requested_reset_noise_scale": args.reset_noise_scale,
-            "qpos_qvel_noise_preserved": bool(cfg.ENV.RESET_NOISE_SCALE != 0.0),
-            "deterministic_reset_effective": bool(cfg.ENV.RESET_NOISE_SCALE == 0.0),
-            "deterministic_reset_forced": bool(args.reset_noise_scale == 0.0),
-        },
+        "native_reset": native_reset_metadata(
+            cfg.ENV.RESET_NOISE_SCALE, args.reset_noise_scale
+        ),
         "formal_torso_height": {
             "available": formal_height_count == len(transitions),
             "source": "official_termination_info",
@@ -738,9 +931,20 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
         "state_trajectory": {
             "enabled": bool(args.record_state_trajectory),
             "evaluator_max_steps": args.max_eval_steps,
+            "control_step_indexing": (
+                "1-based post-control-step; reset state is not a transition"
+            ),
+            "capture_timing": (
+                "post-physics, post-reward, post-formal-fallen-decision, "
+                "pre-DummyVecEnv-auto-reset"
+            ),
+            "evaluator_cutoff_semantics": (
+                "capture/evaluation stop only; never reported as environment "
+                "terminated or truncated"
+            ),
             "terminal_snapshot_note": (
-                "DummyVecEnv auto-resets before evaluator readback; terminal state "
-                "snapshots are marked unavailable"
+                "terminal transition state is captured by an opt-in read-only "
+                "TerminateOnFalling wrapper hook before DummyVecEnv reset"
             ),
             **(trajectory_metadata or {}),
         },
