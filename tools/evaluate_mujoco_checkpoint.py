@@ -35,6 +35,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output-dir", required=True)
     result.add_argument("--device", default="cpu")
     result.add_argument("--cfg", default="configs/ft.yaml")
+    result.add_argument(
+        "--record-state-trajectory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    result.add_argument("--max-eval-steps", type=int)
+    result.add_argument("--reset-noise-scale", type=float)
     return result
 
 
@@ -66,6 +73,12 @@ def require_file(path: Path, label: str) -> Path:
 def validate_args(args: argparse.Namespace) -> dict[str, Path]:
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    max_eval_steps = getattr(args, "max_eval_steps", None)
+    reset_noise_scale = getattr(args, "reset_noise_scale", None)
+    if max_eval_steps is not None and max_eval_steps <= 0:
+        raise ValueError("--max-eval-steps must be positive")
+    if reset_noise_scale is not None and reset_noise_scale < 0.0:
+        raise ValueError("--reset-noise-scale must be non-negative")
     checkpoint = require_file(Path(args.checkpoint), "checkpoint")
     walker_dir = Path(args.walker_dir).resolve()
     morphology_xml = require_file(
@@ -110,6 +123,15 @@ class FiniteTracker:
             self.all_values_finite = False
             return None
         return result
+
+    def vector(self, value: Any) -> list[float] | None:
+        import numpy as np
+
+        result = np.asarray(value, dtype=np.float64).reshape(-1)
+        if not np.isfinite(result).all():
+            self.all_values_finite = False
+            return None
+        return result.tolist()
 
 
 def info_scalar(
@@ -208,6 +230,187 @@ def mean_or_none(values: Sequence[float | int | None]) -> float | None:
     return sum(valid) / len(valid) if valid else None
 
 
+def evaluator_cutoff_reached(step_count: int, max_eval_steps: int | None) -> bool:
+    return max_eval_steps is not None and step_count >= max_eval_steps
+
+
+def _indices(address: int | tuple[int, int]) -> list[int]:
+    if isinstance(address, tuple):
+        return list(range(int(address[0]), int(address[1])))
+    return [int(address)]
+
+
+def unwrap_single_mujoco_env(envs: Any) -> Any:
+    current = envs
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        if "venv" in vars(current):
+            current = vars(current)["venv"]
+            continue
+        if "envs" in vars(current):
+            candidates = vars(current)["envs"]
+            if len(candidates) != 1:
+                raise RuntimeError("state trajectory requires exactly one raw env")
+            current = candidates[0]
+            continue
+        if "env" in vars(current):
+            current = vars(current)["env"]
+            continue
+        break
+    base = getattr(current, "unwrapped", current)
+    if getattr(base, "sim", None) is None:
+        raise RuntimeError("MuJoCo simulation is unavailable for state trajectory")
+    return base
+
+
+def build_state_trajectory_metadata(base_env: Any) -> dict[str, Any]:
+    model = base_env.sim.model
+    type_names = {0: "free", 1: "ball", 2: "slide", 3: "hinge"}
+    joints = []
+    for joint_id, raw_name in enumerate(model.joint_names):
+        name = str(raw_name)
+        qpos_indices = _indices(model.get_joint_qpos_addr(name))
+        qvel_indices = _indices(model.get_joint_qvel_addr(name))
+        joints.append(
+            {
+                "joint_id": joint_id,
+                "joint_name": name,
+                "source_mjcf_name": name,
+                "joint_type": type_names.get(int(model.jnt_type[joint_id]), "unknown"),
+                "qpos_indices": qpos_indices,
+                "qvel_indices": qvel_indices,
+                "joint_range": [float(value) for value in model.jnt_range[joint_id]],
+            }
+        )
+    free_joints = [joint for joint in joints if joint["joint_type"] == "free"]
+    if len(free_joints) != 1:
+        raise RuntimeError(f"expected one free root joint, found {len(free_joints)}")
+    root = free_joints[0]
+    ordinary = [joint for joint in joints if joint is not root]
+    if any(len(joint["qpos_indices"]) != 1 or len(joint["qvel_indices"]) != 1 for joint in ordinary):
+        raise RuntimeError("ordinary agent joints must have scalar qpos/qvel")
+    actuator_names = tuple(getattr(model, "actuator_names", ()))
+    actuators = []
+    for actuator_id in range(int(model.nu)):
+        joint_id = int(model.actuator_trnid[actuator_id, 0])
+        actuators.append(
+            {
+                "actuator_id": actuator_id,
+                "actuator_name": str(actuator_names[actuator_id]) if actuator_id < len(actuator_names) else f"actuator/{actuator_id}",
+                "joint_id": joint_id,
+                "joint_name": str(model.joint_names[joint_id]),
+                "ctrl_index": actuator_id,
+                "actuator_force_index": actuator_id,
+            }
+        )
+    dof_mapping = []
+    for joint in joints:
+        components = (
+            ("linear_x", "linear_y", "linear_z", "angular_x", "angular_y", "angular_z")
+            if joint["joint_type"] == "free"
+            else ("velocity",)
+        )
+        dof_mapping.extend(
+            {
+                "qvel_index": index,
+                "joint_name": joint["joint_name"],
+                "component": components[offset],
+            }
+            for offset, index in enumerate(joint["qvel_indices"])
+        )
+    if len(dof_mapping) != int(model.nv):
+        raise RuntimeError(
+            f"generalized DOF mapping mismatch: {len(dof_mapping)} != {model.nv}"
+        )
+    torso_id = int(model.body_name2id("torso/0"))
+    return {
+        "physics_timestep": float(model.opt.timestep),
+        "frame_skip": int(base_env.frame_skip),
+        "control_dt": float(model.opt.timestep * base_env.frame_skip),
+        "root_free_joint": root,
+        "root_qpos_convention": "[world_x, world_y, world_z, quat_w, quat_x, quat_y, quat_z]",
+        "root_qvel_convention": "native MuJoCo generalized free-joint [linear_xyz, angular_xyz]",
+        "torso_velocity_convention": "sim.data.body_xvelp/body_xvelr, world-frame Cartesian",
+        "ordinary_joint_mapping": ordinary,
+        "ordered_joint_names": [joint["joint_name"] for joint in ordinary],
+        "generalized_dof_mapping": dof_mapping,
+        "actuator_mapping": actuators,
+        "body_mapping": [
+            {"body_id": index, "body_name": str(name)}
+            for index, name in enumerate(model.body_names)
+        ],
+        "torso_body_id": torso_id,
+        "torso_body_name": "torso/0",
+        "direct_field_availability": {
+            name: hasattr(base_env.sim.data, name)
+            for name in (
+                "ctrl",
+                "actuator_force",
+                "qfrc_actuator",
+                "qfrc_passive",
+                "contact",
+            )
+        },
+        "coordinate_conventions": {
+            "positions": "MuJoCo world frame, metres",
+            "ordinary_joint_qpos": "native scalar joint coordinates, radians for hinge joints",
+            "ordinary_joint_qvel": "native scalar joint velocities, radians/second for hinge joints",
+        },
+    }
+
+
+def capture_state_trajectory(base_env: Any, metadata: dict[str, Any], tracker: FiniteTracker) -> dict[str, Any]:
+    import numpy as np
+
+    sim = base_env.sim
+    data, model = sim.data, sim.model
+    root = metadata["root_free_joint"]
+    qpos = np.asarray(data.qpos)
+    qvel = np.asarray(data.qvel)
+    root_qpos = qpos[root["qpos_indices"]]
+    root_qvel = qvel[root["qvel_indices"]]
+    torso_id = metadata["torso_body_id"]
+    contacts = []
+    for contact in data.contact[: int(data.ncon)]:
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        body1, body2 = int(model.geom_bodyid[geom1]), int(model.geom_bodyid[geom2])
+        contacts.append(
+            {
+                "geom1_id": geom1,
+                "geom1_name": model.geom_id2name(geom1),
+                "body1_id": body1,
+                "body1_name": model.body_id2name(body1),
+                "geom2_id": geom2,
+                "geom2_name": model.geom_id2name(geom2),
+                "body2_id": body2,
+                "body2_name": model.body_id2name(body2),
+            }
+        )
+    ordinary = metadata["ordinary_joint_mapping"]
+    return {
+        "simulation_time": tracker.scalar(data.time),
+        "full_qpos": tracker.vector(qpos),
+        "full_qvel": tracker.vector(qvel),
+        "torso_world_position": tracker.vector(data.body_xpos[torso_id]),
+        "root_free_joint_position": tracker.vector(root_qpos[:3]),
+        "root_free_joint_orientation_wxyz": tracker.vector(root_qpos[3:7]),
+        "root_linear_velocity_world": tracker.vector(data.body_xvelp[torso_id]),
+        "root_angular_velocity_world": tracker.vector(data.body_xvelr[torso_id]),
+        "torso_linear_velocity_world": tracker.vector(data.body_xvelp[torso_id]),
+        "torso_angular_velocity_world": tracker.vector(data.body_xvelr[torso_id]),
+        "root_generalized_qvel": tracker.vector(root_qvel),
+        "ordered_joint_qpos": [tracker.scalar(qpos[joint["qpos_indices"][0]]) for joint in ordinary],
+        "ordered_joint_qvel": [tracker.scalar(qvel[joint["qvel_indices"][0]]) for joint in ordinary],
+        "actuator_ctrl": tracker.vector(data.ctrl),
+        "actuator_force": tracker.vector(getattr(data, "actuator_force", [])),
+        "qfrc_actuator": tracker.vector(data.qfrc_actuator),
+        "qfrc_passive": tracker.vector(data.qfrc_passive),
+        "contact_count": int(data.ncon),
+        "contacts": contacts,
+    }
+
+
 def configure_runtime(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     from metamorph.config import cfg
     from tools.train_ppo import calculate_max_limbs_joints
@@ -220,6 +423,9 @@ def configure_runtime(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     cfg.PPO.NUM_ENVS = 1
     cfg.VECENV.TYPE = "DummyVecEnv"
     cfg.PPO.CHECKPOINT_PATH = str(paths["checkpoint"])
+    reset_noise_scale = getattr(args, "reset_noise_scale", None)
+    if reset_noise_scale is not None:
+        cfg.ENV.RESET_NOISE_SCALE = float(reset_noise_scale)
     calculate_max_limbs_joints()
 
 
@@ -274,8 +480,13 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
     total_valid_actions = 0
     total_out_of_bounds_actions = 0
     all_action_values_finite = True
+    base_env = None
+    trajectory_metadata = None
     try:
         observation = envs.reset()
+        if args.record_state_trajectory:
+            base_env = unwrap_single_mujoco_env(envs)
+            trajectory_metadata = build_state_trajectory_metadata(base_env)
         for episode_index in range(args.episodes):
             episode_reward = 0.0
             episode_rewards_finite = True
@@ -286,6 +497,7 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             episode_fallen = False
             episode_terminated = False
             episode_truncated = False
+            evaluator_cutoff = False
 
             while True:
                 with torch.no_grad():
@@ -351,6 +563,22 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "truncated": truncated,
                     **action_stats,
                 }
+                if trajectory_metadata is not None and base_env is not None:
+                    record["control_step"] = episode_length - 1
+                    record["elapsed_control_time"] = episode_length * float(
+                        trajectory_metadata["control_dt"]
+                    )
+                    if done:
+                        record["state_snapshot_status"] = (
+                            "unavailable_after_dummy_vec_env_auto_reset"
+                        )
+                    else:
+                        record.update(
+                            capture_state_trajectory(
+                                base_env, trajectory_metadata, tracker
+                            )
+                        )
+                        record["state_snapshot_status"] = "post_control_step"
                 transitions.append(record)
 
                 observation = next_observation
@@ -358,6 +586,10 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     episode_fallen = fallen
                     episode_terminated = terminated
                     episode_truncated = truncated
+                    break
+                if evaluator_cutoff_reached(episode_length, args.max_eval_steps):
+                    evaluator_cutoff = True
+                    observation = envs.reset()
                     break
 
             displacement = (
@@ -381,6 +613,7 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "fallen": episode_fallen,
                     "terminated": episode_terminated,
                     "truncated": episode_truncated,
+                    "evaluator_cutoff": evaluator_cutoff,
                 }
             )
     finally:
@@ -439,6 +672,8 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
         ),
         "all_values_finite": tracker.all_values_finite,
         "episodes": episode_records,
+        "transition_count": len(transitions),
+        "evaluator_max_steps": args.max_eval_steps,
     }
     metadata = {
         "schema_version": "spikmorph-mujoco-checkpoint-evaluation-metadata-v1",
@@ -482,8 +717,10 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
         },
         "native_reset": {
             "reset_noise_scale": float(cfg.ENV.RESET_NOISE_SCALE),
-            "qpos_qvel_noise_preserved": True,
-            "deterministic_reset_forced": False,
+            "requested_reset_noise_scale": args.reset_noise_scale,
+            "qpos_qvel_noise_preserved": bool(cfg.ENV.RESET_NOISE_SCALE != 0.0),
+            "deterministic_reset_effective": bool(cfg.ENV.RESET_NOISE_SCALE == 0.0),
+            "deterministic_reset_forced": bool(args.reset_noise_scale == 0.0),
         },
         "formal_torso_height": {
             "available": formal_height_count == len(transitions),
@@ -493,6 +730,15 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             "reason_if_missing": (
                 "formal termination info did not expose the measurement"
             ),
+        },
+        "state_trajectory": {
+            "enabled": bool(args.record_state_trajectory),
+            "evaluator_max_steps": args.max_eval_steps,
+            "terminal_snapshot_note": (
+                "DummyVecEnv auto-resets before evaluator readback; terminal state "
+                "snapshots are marked unavailable"
+            ),
+            **(trajectory_metadata or {}),
         },
     }
     return metadata, summary, transitions

@@ -3,8 +3,10 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
+import numpy as np
 import torch
 
 from metamorph.config import cfg
@@ -32,6 +34,106 @@ class FakeDistribution:
 
 
 class EvaluateMujocoCheckpointTests(unittest.TestCase):
+    @staticmethod
+    def fake_mujoco_env():
+        class Model:
+            joint_names = ("root", "hip", "knee")
+            jnt_type = np.asarray([0, 3, 3])
+            jnt_range = np.asarray([[0, 0], [-1, 1], [-2, 2]])
+            nv = 8
+            nu = 2
+            actuator_names = ("hip_motor", "knee_motor")
+            actuator_trnid = np.asarray([[1, 0], [2, 0]])
+            body_names = ("world", "torso/0", "limb/0")
+            geom_bodyid = np.asarray([0, 1, 2])
+            opt = SimpleNamespace(timestep=0.005)
+
+            def get_joint_qpos_addr(self, name):
+                return {"root": (0, 7), "hip": 7, "knee": 8}[name]
+
+            def get_joint_qvel_addr(self, name):
+                return {"root": (0, 6), "hip": 6, "knee": 7}[name]
+
+            def body_name2id(self, name):
+                return self.body_names.index(name)
+
+            def body_id2name(self, index):
+                return self.body_names[index]
+
+            def geom_id2name(self, index):
+                return ("floor", "torso_geom", "limb_geom")[index]
+
+        data = SimpleNamespace(
+            time=0.02,
+            qpos=np.asarray([1, 2, 3, 1, 0, 0, 0, 0.25, -0.5]),
+            qvel=np.asarray([1, 2, 3, 4, 5, 6, 0.7, -0.8]),
+            body_xpos=np.asarray([[0, 0, 0], [1, 2, 0.55], [1, 2, 0.3]]),
+            body_xvelp=np.asarray([[0, 0, 0], [0.1, 0.2, 0.3], [0, 0, 0]]),
+            body_xvelr=np.asarray([[0, 0, 0], [0.4, 0.5, 0.6], [0, 0, 0]]),
+            ctrl=np.asarray([0.0, 0.0]),
+            actuator_force=np.asarray([0.0, 0.0]),
+            qfrc_actuator=np.arange(8),
+            qfrc_passive=np.arange(8) * 0.1,
+            ncon=0,
+            contact=[],
+        )
+        return SimpleNamespace(
+            sim=SimpleNamespace(model=Model(), data=data), frame_skip=4
+        )
+
+    def test_free_root_and_ordinary_joint_mapping_are_separate(self):
+        base_env = self.fake_mujoco_env()
+        metadata = EVALUATOR.build_state_trajectory_metadata(base_env)
+
+        self.assertEqual(metadata["root_free_joint"]["qpos_indices"], list(range(7)))
+        self.assertEqual(metadata["root_free_joint"]["qvel_indices"], list(range(6)))
+        self.assertEqual(metadata["ordered_joint_names"], ["hip", "knee"])
+        self.assertEqual(
+            [item["qpos_indices"] for item in metadata["ordinary_joint_mapping"]],
+            [[7], [8]],
+        )
+        self.assertEqual(metadata["physics_timestep"], 0.005)
+        self.assertEqual(metadata["control_dt"], 0.02)
+
+    def test_state_snapshot_uses_joint_mapping_and_direct_force_arrays(self):
+        base_env = self.fake_mujoco_env()
+        metadata = EVALUATOR.build_state_trajectory_metadata(base_env)
+        snapshot = EVALUATOR.capture_state_trajectory(
+            base_env, metadata, EVALUATOR.FiniteTracker()
+        )
+
+        self.assertEqual(snapshot["root_free_joint_position"], [1.0, 2.0, 3.0])
+        self.assertEqual(snapshot["root_free_joint_orientation_wxyz"], [1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(snapshot["ordered_joint_qpos"], [0.25, -0.5])
+        self.assertEqual(snapshot["ordered_joint_qvel"], [0.7, -0.8])
+        self.assertEqual(len(snapshot["full_qpos"]), 9)
+        self.assertEqual(len(snapshot["full_qvel"]), 8)
+        self.assertEqual(len(snapshot["qfrc_actuator"]), 8)
+        self.assertEqual(len(snapshot["qfrc_passive"]), 8)
+        self.assertEqual(snapshot["contact_count"], 0)
+
+    def test_evaluator_cutoff_does_not_claim_environment_termination(self):
+        self.assertFalse(EVALUATOR.evaluator_cutoff_reached(219, 220))
+        self.assertTrue(EVALUATOR.evaluator_cutoff_reached(220, 220))
+        self.assertFalse(EVALUATOR.evaluator_cutoff_reached(1000, None))
+
+    def test_trajectory_cli_accepts_deterministic_reset_and_step_limit(self):
+        args = EVALUATOR.parser().parse_args(
+            [
+                "--checkpoint", "checkpoint.pt",
+                "--walker-dir", "walkers",
+                "--morphology-id", "walker",
+                "--action-mode", "zero",
+                "--output-dir", "output",
+                "--record-state-trajectory",
+                "--max-eval-steps", "220",
+                "--reset-noise-scale", "0.0",
+            ]
+        )
+        self.assertTrue(args.record_state_trajectory)
+        self.assertEqual(args.max_eval_steps, 220)
+        self.assertEqual(args.reset_noise_scale, 0.0)
+
     def observation(self):
         return {
             "act_padding_mask": torch.tensor(
