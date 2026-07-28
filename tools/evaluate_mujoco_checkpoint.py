@@ -30,6 +30,7 @@ JOINT_LIMIT_OUTPUT_FILENAMES = (
     "joint_mapping.json",
     "first_contact_and_limit_summary.json",
     "validation.json",
+    "contact_generalized_response_summary.json",
 )
 
 
@@ -60,6 +61,16 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--joint-limit-probe-names",
+        nargs="+",
+        default=[],
+    )
+    result.add_argument(
+        "--record-contact-generalized-response",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    result.add_argument(
+        "--contact-probe-body-names",
         nargs="+",
         default=[],
     )
@@ -103,6 +114,9 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
     record_limit_substeps = bool(
         getattr(args, "record_joint_limit_substeps", False)
     )
+    record_contact_response = bool(
+        getattr(args, "record_contact_generalized_response", False)
+    )
     probe_names = list(getattr(args, "joint_limit_probe_names", []))
     if record_limit_substeps:
         if args.action_mode != "zero":
@@ -123,6 +137,18 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
             )
         if len(set(probe_names)) != len(probe_names):
             raise ValueError("--joint-limit-probe-names must be unique")
+    if record_contact_response:
+        body_names = list(getattr(args, "contact_probe_body_names", []))
+        if not record_limit_substeps:
+            raise ValueError(
+                "contact generalized response requires --record-joint-limit-substeps"
+            )
+        if not body_names:
+            raise ValueError(
+                "contact generalized response requires --contact-probe-body-names"
+            )
+        if len(set(body_names)) != len(body_names):
+            raise ValueError("--contact-probe-body-names must be unique")
     checkpoint = require_file(Path(args.checkpoint), "checkpoint")
     walker_dir = Path(args.walker_dir).resolve()
     morphology_xml = require_file(
@@ -642,7 +668,10 @@ def _runtime_object_names(model: Any, kind: str, count: int) -> list[str]:
 
 
 def build_joint_limit_probe_mapping(
-    base_env: Any, probe_names: Sequence[str], trajectory_metadata: dict[str, Any]
+    base_env: Any,
+    probe_names: Sequence[str],
+    trajectory_metadata: dict[str, Any],
+    contact_probe_body_names: Sequence[str] = (),
 ) -> dict[str, Any]:
     model = base_env.sim.model
     joint_names = _runtime_object_names(model, "joint", int(model.njnt))
@@ -678,6 +707,21 @@ def build_joint_limit_probe_mapping(
                 "dof_frictionloss": float(model.dof_frictionloss[dof_address]),
             }
         )
+    body_probes = []
+    for name in contact_probe_body_names:
+        matches = [index for index, candidate in enumerate(body_names) if candidate == name]
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected one compiled body named {name!r}, found {len(matches)}"
+            )
+        body_probes.append({"body_name": name, "body_id": matches[0]})
+    floor_geom_ids = [
+        index for index, name in enumerate(geom_names) if name == "floor/0"
+    ]
+    if contact_probe_body_names and len(floor_geom_ids) != 1:
+        raise ValueError(
+            f"expected one compiled floor geom named 'floor/0', found {len(floor_geom_ids)}"
+        )
     return {
         "schema_version": "spikmorph-mujoco-joint-limit-mapping-v1",
         "constraint_row_identity": "efc_type == mjCNSTR_LIMIT_JOINT and efc_id == compiled joint_id; resolved independently after every mj_step",
@@ -686,6 +730,9 @@ def build_joint_limit_probe_mapping(
         "joint_names": joint_names,
         "body_names": body_names,
         "geom_names": geom_names,
+        "contact_probe_bodies": body_probes,
+        "floor_geom_id": floor_geom_ids[0] if floor_geom_ids else None,
+        "floor_geom_name": "floor/0" if floor_geom_ids else None,
         "root_free_joint": trajectory_metadata["root_free_joint"],
         "root_body_id": trajectory_metadata["root_body_id"],
         "root_body_name": trajectory_metadata["root_body_name"],
@@ -721,6 +768,196 @@ def _selected_constraint_reconstruction(data: Any, dof_address: int, nefc: int, 
     return float(total)
 
 
+def contact_efc_rows(
+    efc_address: int, dim: int, pyramidal: bool, nefc: int
+) -> list[int]:
+    """Map one mjContact to all of its dynamic constraint rows."""
+    if efc_address < 0:
+        return []
+    row_count = dim if not pyramidal else (1 if dim == 1 else 2 * (dim - 1))
+    stop = efc_address + row_count
+    if stop > nefc:
+        raise ValueError(
+            f"contact efc rows [{efc_address}, {stop}) exceed nefc={nefc}"
+        )
+    return list(range(efc_address, stop))
+
+
+def aggregate_constraint_rows(
+    data: Any, rows: Sequence[int], nefc: int, nv: int
+) -> tuple[list[dict[str, Any]], list[float]]:
+    """Compute the exact sum of J_row^T * efc_force over selected rows."""
+    generalized = [0.0] * int(nv)
+    row_records = []
+    for row in rows:
+        indices, values = constraint_jacobian_row(data, int(row), nefc, nv)
+        force = float(data.efc_force[row])
+        for index, value in zip(indices, values):
+            generalized[index] += float(value) * force
+        row_records.append(
+            {
+                "efc_row": int(row),
+                "efc_type": int(data.efc_type[row]),
+                "efc_id": int(data.efc_id[row]),
+                "efc_force": force,
+                "J_row": {"dof_indices": indices, "values": values},
+            }
+        )
+    return row_records, generalized
+
+
+def _native_model_data(sim: Any) -> tuple[Any, Any, Any]:
+    from metamorph.utils import mujoco_compat as mjc
+
+    raw_sim = getattr(sim, "_sim", sim)
+    raw_model = getattr(raw_sim, "_model", None)
+    raw_data = getattr(raw_sim, "_data", None)
+    if mjc.BACKEND != "mujoco" or raw_model is None or raw_data is None:
+        raise RuntimeError(
+            "contact response oracle requires the modern native MuJoCo backend"
+        )
+    return mjc.mujoco, raw_model, raw_data
+
+
+def make_body_kinematics_snapshot_data(sim: Any) -> Any:
+    mujoco, model, _ = _native_model_data(sim)
+    return mujoco.MjData(model)
+
+
+def capture_native_body_states(
+    sim: Any,
+    bodies: Sequence[dict[str, Any]],
+    tracker: FiniteTracker,
+    snapshot_data: Any,
+) -> dict[str, dict[str, Any]]:
+    """Derive synchronized Cartesian state from live generalized state on isolated mjData."""
+    import numpy as np
+
+    mujoco, model, live_data = _native_model_data(sim)
+    snapshot_data.qpos[:] = live_data.qpos
+    snapshot_data.qvel[:] = live_data.qvel
+    if snapshot_data.act.size:
+        snapshot_data.act[:] = live_data.act
+    if snapshot_data.mocap_pos.size:
+        snapshot_data.mocap_pos[:] = live_data.mocap_pos
+        snapshot_data.mocap_quat[:] = live_data.mocap_quat
+    snapshot_data.time = live_data.time
+    mujoco.mj_forward(model, snapshot_data)
+    result = {}
+    for item in bodies:
+        body_id = int(item["body_id"])
+        spatial_velocity = np.zeros(6, dtype=np.float64)
+        mujoco.mj_objectVelocity(
+            model,
+            snapshot_data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            body_id,
+            spatial_velocity,
+            0,
+        )
+        result[item["body_name"]] = {
+            "xpos": tracker.vector(snapshot_data.xpos[body_id]),
+            "xquat_wxyz": tracker.vector(snapshot_data.xquat[body_id]),
+            "linear_velocity_world_at_body_origin": tracker.vector(
+                spatial_velocity[3:6]
+            ),
+            "angular_velocity_world": tracker.vector(spatial_velocity[0:3]),
+        }
+    return result
+
+
+def capture_contact_response(
+    sim: Any,
+    mapping: dict[str, Any],
+    tracker: FiniteTracker,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Read mjContact, mj_contactForce and each contact's EFC contribution."""
+    import numpy as np
+
+    mujoco, raw_model, raw_data = _native_model_data(sim)
+    model, data = sim.model, sim.data
+    nefc, nv = int(data.nefc), int(model.nv)
+    pyramidal = int(raw_model.opt.cone) == int(mujoco.mjtCone.mjCONE_PYRAMIDAL)
+    selected = {
+        item["joint_name"]: int(item["dof_address"])
+        for item in mapping["joints"]
+    }
+    total_selected = {name: 0.0 for name in selected}
+    contacts = []
+    for contact_index in range(int(data.ncon)):
+        contact = raw_data.contact[contact_index]
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        body1 = int(raw_model.geom_bodyid[geom1])
+        body2 = int(raw_model.geom_bodyid[geom2])
+        rows = contact_efc_rows(
+            int(contact.efc_address), int(contact.dim), pyramidal, nefc
+        )
+        row_records, generalized = aggregate_constraint_rows(
+            data, rows, nefc, nv
+        )
+        joint_limit_type = int(
+            mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT
+        )
+        if any(
+            row_record["efc_type"] == joint_limit_type
+            for row_record in row_records
+        ):
+            raise RuntimeError(
+                f"contact {contact_index} row range includes a joint-limit row"
+            )
+        selected_contribution = {
+            name: tracker.scalar(generalized[dof])
+            for name, dof in selected.items()
+        }
+        for name, value in selected_contribution.items():
+            total_selected[name] += float(value)
+        wrench = np.zeros(6, dtype=np.float64)
+        mujoco.mj_contactForce(raw_model, raw_data, contact_index, wrench)
+        frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+        world_force_on_geom2 = frame.T @ wrench[0:3]
+        world_torque_on_geom2 = frame.T @ wrench[3:6]
+        contacts.append(
+            {
+                "contact_index": contact_index,
+                "geom1_id": geom1,
+                "geom1_name": mapping["geom_names"][geom1],
+                "body1_id": body1,
+                "body1_name": mapping["body_names"][body1],
+                "geom2_id": geom2,
+                "geom2_name": mapping["geom_names"][geom2],
+                "body2_id": body2,
+                "body2_name": mapping["body_names"][body2],
+                "position_world": tracker.vector(contact.pos),
+                "contact_frame_world_rows": tracker.vector(frame.reshape(-1)),
+                "normal_world_geom1_to_geom2": tracker.vector(frame[0]),
+                "dist": tracker.scalar(contact.dist),
+                "includemargin": tracker.scalar(contact.includemargin),
+                "friction": tracker.vector(contact.friction),
+                "solref": tracker.vector(contact.solref),
+                "solimp": tracker.vector(contact.solimp),
+                "dim": int(contact.dim),
+                "efc_address": int(contact.efc_address),
+                "efc_rows": rows,
+                "constraint_rows": row_records,
+                "constraint_rows_exclude_joint_limits": True,
+                "contact_frame_wrench_on_geom2": tracker.vector(wrench),
+                "normal_force_on_geom2": tracker.scalar(wrench[0]),
+                "tangential_force_components_on_geom2": tracker.vector(wrench[1:3]),
+                "contact_frame_torque_on_geom2": tracker.vector(wrench[3:6]),
+                "world_force_on_geom2": tracker.vector(world_force_on_geom2),
+                "world_force_on_geom1": tracker.vector(-world_force_on_geom2),
+                "world_torque_on_geom2": tracker.vector(world_torque_on_geom2),
+                "world_torque_on_geom1": tracker.vector(-world_torque_on_geom2),
+                "selected_dof_generalized_contribution": selected_contribution,
+                "is_floor_contact": (
+                    geom1 == mapping["floor_geom_id"]
+                    or geom2 == mapping["floor_geom_id"]
+                ),
+            }
+        )
+    return contacts, total_selected
+
+
 class JointLimitSubstepRecorder:
     """Observe each formal mj_step result without extra simulation calls."""
 
@@ -734,6 +971,11 @@ class JointLimitSubstepRecorder:
         self.episode = 0
         self.physics_substep = 0
         self.global_physics_step = 0
+        self.body_snapshot_data = (
+            make_body_kinematics_snapshot_data(sim)
+            if mapping["contact_probe_bodies"]
+            else None
+        )
 
     def begin_control_step(self, episode: int, control_step: int) -> None:
         self.episode = int(episode)
@@ -771,6 +1013,16 @@ class JointLimitSubstepRecorder:
                 }
                 for item in self.mapping["joints"]
             },
+            "contact_probe_bodies": (
+                capture_native_body_states(
+                    self.sim,
+                    self.mapping["contact_probe_bodies"],
+                    self.tracker,
+                    self.body_snapshot_data,
+                )
+                if self.body_snapshot_data is not None
+                else {}
+            ),
         }
 
     def capture_post_step(self, pre: dict[str, Any]) -> None:
@@ -784,6 +1036,9 @@ class JointLimitSubstepRecorder:
         nv = int(model.nv)
         limit_type = int(mjc.mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT)
         contacts = []
+        contact_generalized_totals = {
+            item["joint_name"]: 0.0 for item in self.mapping["joints"]
+        }
         limb_floor_contact = False
         body_names = self.mapping["body_names"]
         geom_names = self.mapping["geom_names"]
@@ -797,7 +1052,21 @@ class JointLimitSubstepRecorder:
                 "body2_id": body2, "body2_name": body_names[body2],
             }
             contacts.append(pair)
-            limb_floor_contact |= {pair["body1_name"], pair["body2_name"]} == {"limb/0", "floor/0"}
+            floor_geom_id = self.mapping["floor_geom_id"]
+            limb_floor_contact |= (
+                floor_geom_id in (geom1, geom2)
+                and "limb/0" in (pair["body1_name"], pair["body2_name"])
+            )
+        if self.mapping["contact_probe_bodies"]:
+            contacts, contact_generalized_totals = capture_contact_response(
+                self.sim, self.mapping, self.tracker
+            )
+            floor_geom_id = self.mapping["floor_geom_id"]
+            limb_floor_contact = any(
+                floor_geom_id in (contact["geom1_id"], contact["geom2_id"])
+                and "limb/0" in (contact["body1_name"], contact["body2_name"])
+                for contact in contacts
+            )
 
         joint_records = []
         for item in self.mapping["joints"]:
@@ -856,6 +1125,12 @@ class JointLimitSubstepRecorder:
                 "qacc_smooth": self.tracker.scalar(data.qacc_smooth[dof]),
             })
         self.global_physics_step += 1
+        selected_constraint_force = {
+            item["joint_name"]: self.tracker.scalar(
+                data.qfrc_constraint[item["dof_address"]]
+            )
+            for item in self.mapping["joints"]
+        }
         self.records.append({
             "episode": self.episode, "control_step": self.control_step,
             "physics_substep_in_control": self.physics_substep,
@@ -863,8 +1138,31 @@ class JointLimitSubstepRecorder:
             "pre_step_simulation_time": pre["simulation_time"],
             "simulation_time": self.tracker.scalar(data.time),
             "pre_step_root": pre["root"], "post_step_root": self._state(),
+            "pre_step_contact_probe_bodies": pre["contact_probe_bodies"],
+            "post_step_contact_probe_bodies": (
+                capture_native_body_states(
+                    self.sim,
+                    self.mapping["contact_probe_bodies"],
+                    self.tracker,
+                    self.body_snapshot_data,
+                )
+                if self.body_snapshot_data is not None
+                else {}
+            ),
             "joints": joint_records, "nefc": nefc, "ncon": int(data.ncon),
             "contacts": contacts, "contains_limb_0_floor_0_contact": limb_floor_contact,
+            "sum_contact_generalized_force_selected_dofs": {
+                name: self.tracker.scalar(value)
+                for name, value in contact_generalized_totals.items()
+            },
+            "qfrc_constraint_selected_dofs": selected_constraint_force,
+            "contact_vs_qfrc_constraint_reconstruction_error": {
+                name: self.tracker.scalar(
+                    contact_generalized_totals[name]
+                    - selected_constraint_force[name]
+                )
+                for name in selected_constraint_force
+            },
         })
         self.physics_substep += 1
 
@@ -1015,11 +1313,106 @@ def build_joint_limit_oracle_outputs(
         },
         "default_mode_note": "no proxy is installed unless --record-joint-limit-substeps is enabled",
     }
+    contact_summary = (
+        build_contact_generalized_response_summary(records, mapping)
+        if mapping.get("contact_probe_bodies")
+        else None
+    )
+    if contact_summary is not None:
+        validation["global_55_contact_reconstruction"] = contact_summary.get(
+            "global_55_contact_reconstruction"
+        )
     return {
         "records": list(records),
         "mapping": mapping,
         "summary": summary,
         "validation": validation,
+        "contact_summary": contact_summary,
+    }
+
+
+def build_contact_generalized_response_summary(
+    records: Sequence[dict[str, Any]], mapping: dict[str, Any]
+) -> dict[str, Any]:
+    floor_geom_id = mapping["floor_geom_id"]
+    selected_names = [item["joint_name"] for item in mapping["joints"]]
+    window = {}
+    for global_step in (54, 55, 56):
+        record = next(
+            (
+                candidate for candidate in records
+                if int(candidate["global_physics_step"]) == global_step
+            ),
+            None,
+        )
+        if record is None:
+            window[str(global_step)] = None
+            continue
+        focus_contacts = []
+        for contact in record["contacts"]:
+            if (
+                floor_geom_id in (contact["geom1_id"], contact["geom2_id"])
+                and any(
+                    body in (contact["body1_name"], contact["body2_name"])
+                    for body in ("limb/12", "limb/11")
+                )
+            ):
+                focus_contacts.append(contact)
+        window[str(global_step)] = {
+            "control_step": record["control_step"],
+            "physics_substep_in_control": record["physics_substep_in_control"],
+            "simulation_time": record["simulation_time"],
+            "pre_step_contact_probe_bodies": record[
+                "pre_step_contact_probe_bodies"
+            ],
+            "post_step_contact_probe_bodies": record[
+                "post_step_contact_probe_bodies"
+            ],
+            "focus_limb_12_limb_11_floor_contacts": focus_contacts,
+            "all_contacts": record["contacts"],
+            "sum_contact_generalized_force_selected_dofs": record[
+                "sum_contact_generalized_force_selected_dofs"
+            ],
+            "qfrc_constraint_selected_dofs": record[
+                "qfrc_constraint_selected_dofs"
+            ],
+            "contact_vs_qfrc_constraint_reconstruction_error": record[
+                "contact_vs_qfrc_constraint_reconstruction_error"
+            ],
+        }
+    global_55 = window.get("55")
+    reconstruction = None
+    if global_55 is not None:
+        reconstruction = {
+            name: {
+                "sum_contact_generalized_force": global_55[
+                    "sum_contact_generalized_force_selected_dofs"
+                ][name],
+                "qfrc_constraint": global_55[
+                    "qfrc_constraint_selected_dofs"
+                ][name],
+                "error": global_55[
+                    "contact_vs_qfrc_constraint_reconstruction_error"
+                ][name],
+            }
+            for name in selected_names
+        }
+    return {
+        "schema_version": "spikmorph-mujoco-contact-generalized-response-v1",
+        "focus_global_physics_steps": [54, 55, 56],
+        "floor_identity": {
+            "geom_id": floor_geom_id,
+            "geom_name": mapping["floor_geom_name"],
+            "body_name_is_not_used_for_floor_detection": True,
+        },
+        "velocity_source": "mujoco.mj_objectVelocity on isolated mjData synchronized from each pre/post live generalized qpos/qvel",
+        "velocity_frame": "world-oriented; linear component evaluated at body origin",
+        "body_kinematics_purity": "mj_forward is called only on isolated MjData; live mjData and formal stepping are not modified",
+        "contact_frame_convention": "rows are world-frame contact axes; row 0 is normal from geom1 toward geom2",
+        "contact_wrench_convention": "mj_contactForce raw 6-vector is force/torque on geom2 by geom1 in the contact frame; equal-and-opposite world vectors are also recorded for geom1",
+        "constraint_reconstruction": "sum each contact's dynamic rows from contact.efc_address using current cone type and contact.dim; accumulate J_row^T * efc_force",
+        "window": window,
+        "global_55_contact_reconstruction": reconstruction,
     }
 
 
@@ -1115,7 +1508,14 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             )
         if args.record_joint_limit_substeps:
             joint_limit_mapping = build_joint_limit_probe_mapping(
-                base_env, args.joint_limit_probe_names, trajectory_metadata
+                base_env,
+                args.joint_limit_probe_names,
+                trajectory_metadata,
+                contact_probe_body_names=(
+                    args.contact_probe_body_names
+                    if args.record_contact_generalized_response
+                    else ()
+                ),
             )
             original_sim = base_env.sim
             joint_limit_recorder = JointLimitSubstepRecorder(
@@ -1437,6 +1837,22 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             "probe_names": list(args.joint_limit_probe_names),
             "record_count": len(joint_limit_recorder.records),
         }
+        if args.record_contact_generalized_response:
+            metadata["contact_generalized_response_oracle"] = {
+                "enabled": True,
+                "probe_body_names": list(args.contact_probe_body_names),
+                "body_velocity_api": "mujoco.mj_objectVelocity",
+                "body_velocity_local_flag": 0,
+                "body_velocity_frame": "world-oriented",
+                "body_linear_velocity_point": "body origin",
+                "body_state_synchronization": "copy live generalized qpos/qvel into isolated MjData, mj_forward isolated data, then read xpos/xquat and mj_objectVelocity",
+                "contact_wrench_api": "mujoco.mj_contactForce",
+                "contact_row_mapping": "contact.efc_address plus cone-dependent row count from contact.dim",
+                "floor_detection": "compiled geom identity floor/0",
+                "extra_mj_step_calls": 0,
+                "extra_live_mj_forward_calls": 0,
+                "isolated_body_kinematics_mj_forward_calls_per_substep": 2,
+            }
         summary["joint_limit_substep_record_count"] = len(
             joint_limit_recorder.records
         )
@@ -1484,6 +1900,13 @@ def write_outputs(
         ) as stream:
             for record in oracle["records"]:
                 stream.write(json.dumps(record, **json_options) + "\n")
+        if oracle.get("contact_summary") is not None:
+            (output_dir / "contact_generalized_response_summary.json").write_text(
+                json.dumps(
+                    oracle["contact_summary"], indent=2, **json_options
+                ) + "\n",
+                encoding="utf-8",
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

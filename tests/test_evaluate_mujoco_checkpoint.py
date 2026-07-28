@@ -216,6 +216,8 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertFalse(args.record_state_trajectory)
         self.assertFalse(args.record_joint_limit_substeps)
         self.assertEqual(args.joint_limit_probe_names, [])
+        self.assertFalse(args.record_contact_generalized_response)
+        self.assertEqual(args.contact_probe_body_names, [])
         self.assertIsNone(args.max_eval_steps)
 
     def test_joint_limit_substep_cli_is_opt_in(self):
@@ -233,6 +235,23 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertTrue(args.record_joint_limit_substeps)
         self.assertEqual(args.joint_limit_probe_names, ["limby/12", "limby/11"])
 
+    def test_contact_response_cli_is_opt_in(self):
+        args = EVALUATOR.parser().parse_args(
+            [
+                "--checkpoint", "checkpoint.pt",
+                "--walker-dir", "walkers",
+                "--morphology-id", "walker",
+                "--action-mode", "zero",
+                "--output-dir", "output",
+                "--record-joint-limit-substeps",
+                "--joint-limit-probe-names", "limby/12", "limby/11",
+                "--record-contact-generalized-response",
+                "--contact-probe-body-names", "limb/0", "limb/12",
+            ]
+        )
+        self.assertTrue(args.record_contact_generalized_response)
+        self.assertEqual(args.contact_probe_body_names, ["limb/0", "limb/12"])
+
     def test_dense_and_sparse_constraint_jacobian_rows(self):
         dense = SimpleNamespace(efc_J=np.asarray([[0.0, -1.0, 2.0], [3.0, 0.0, 0.0]]))
         self.assertEqual(
@@ -248,6 +267,78 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertEqual(
             EVALUATOR.constraint_jacobian_row(sparse, 0, 2, 3),
             ([1, 2], [-1.0, 2.0]),
+        )
+
+    def test_contact_efc_row_mapping_for_elliptic_and_pyramidal(self):
+        self.assertEqual(EVALUATOR.contact_efc_rows(7, 3, False, 20), [7, 8, 9])
+        self.assertEqual(
+            EVALUATOR.contact_efc_rows(7, 3, True, 20), [7, 8, 9, 10]
+        )
+        self.assertEqual(EVALUATOR.contact_efc_rows(-1, 3, True, 20), [])
+
+    def test_multiple_contact_rows_aggregate_JT_efc_force(self):
+        data = SimpleNamespace(
+            efc_J=np.asarray(
+                [
+                    [0.0, 1.0, -2.0],
+                    [0.0, 3.0, 0.5],
+                    [1.0, 0.0, 0.0],
+                ]
+            ),
+            efc_force=np.asarray([10.0, -2.0, 99.0]),
+            efc_type=np.asarray([6, 6, 3]),
+            efc_id=np.asarray([0, 0, 1]),
+        )
+        rows, generalized = EVALUATOR.aggregate_constraint_rows(
+            data, [0, 1], 3, 3
+        )
+        self.assertEqual([item["efc_row"] for item in rows], [0, 1])
+        np.testing.assert_allclose(generalized, [0.0, 4.0, -21.0])
+
+    def test_contact_summary_uses_floor_geom_identity(self):
+        mapping = {
+            "floor_geom_id": 4,
+            "floor_geom_name": "floor/0",
+            "joints": [
+                {"joint_name": "limby/12"},
+                {"joint_name": "limby/11"},
+            ],
+        }
+        contact = {
+            "geom1_id": 8,
+            "geom1_name": "limb/12",
+            "body1_name": "limb/12",
+            "geom2_id": 4,
+            "geom2_name": "floor/0",
+            "body2_name": "world",
+        }
+        record = {
+            "global_physics_step": 55,
+            "control_step": 14,
+            "physics_substep_in_control": 2,
+            "simulation_time": 0.275,
+            "pre_step_contact_probe_bodies": {},
+            "post_step_contact_probe_bodies": {},
+            "contacts": [contact],
+            "sum_contact_generalized_force_selected_dofs": {
+                "limby/12": 92.0, "limby/11": 92.0,
+            },
+            "qfrc_constraint_selected_dofs": {
+                "limby/12": 92.0, "limby/11": 92.0,
+            },
+            "contact_vs_qfrc_constraint_reconstruction_error": {
+                "limby/12": 0.0, "limby/11": 0.0,
+            },
+        }
+        summary = EVALUATOR.build_contact_generalized_response_summary(
+            [record], mapping
+        )
+        focus = summary["window"]["55"][
+            "focus_limb_12_limb_11_floor_contacts"
+        ]
+        self.assertEqual(focus, [contact])
+        self.assertTrue(
+            summary["floor_identity"]["body_name_is_not_used_for_floor_detection"]
         )
 
     def test_step_proxy_calls_live_step_exactly_once(self):
