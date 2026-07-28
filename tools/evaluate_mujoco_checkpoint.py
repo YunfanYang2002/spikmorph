@@ -25,6 +25,12 @@ if str(REPO_ROOT) not in sys.path:
 
 ACTION_MODES = ("zero", "mean", "sample")
 OUTPUT_FILENAMES = ("metadata.json", "summary.json", "transitions.jsonl")
+JOINT_LIMIT_OUTPUT_FILENAMES = (
+    "substeps.jsonl",
+    "joint_mapping.json",
+    "first_contact_and_limit_summary.json",
+    "validation.json",
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +53,16 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--max-eval-steps", type=int)
     result.add_argument("--reset-noise-scale", type=float)
+    result.add_argument(
+        "--record-joint-limit-substeps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    result.add_argument(
+        "--joint-limit-probe-names",
+        nargs="+",
+        default=[],
+    )
     return result
 
 
@@ -84,6 +100,29 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
         raise ValueError("--max-eval-steps must be positive")
     if reset_noise_scale is not None and reset_noise_scale < 0.0:
         raise ValueError("--reset-noise-scale must be non-negative")
+    record_limit_substeps = bool(
+        getattr(args, "record_joint_limit_substeps", False)
+    )
+    probe_names = list(getattr(args, "joint_limit_probe_names", []))
+    if record_limit_substeps:
+        if args.action_mode != "zero":
+            raise ValueError("joint-limit substep recording requires --action-mode zero")
+        if args.episodes != 1:
+            raise ValueError("joint-limit substep recording requires --episodes 1")
+        if max_eval_steps is None:
+            raise ValueError(
+                "joint-limit substep recording requires --max-eval-steps"
+            )
+        if reset_noise_scale != 0.0:
+            raise ValueError(
+                "joint-limit substep recording requires --reset-noise-scale 0.0"
+            )
+        if not probe_names:
+            raise ValueError(
+                "joint-limit substep recording requires --joint-limit-probe-names"
+            )
+        if len(set(probe_names)) != len(probe_names):
+            raise ValueError("--joint-limit-probe-names must be unique")
     checkpoint = require_file(Path(args.checkpoint), "checkpoint")
     walker_dir = Path(args.walker_dir).resolve()
     morphology_xml = require_file(
@@ -95,7 +134,10 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
     )
     config = require_file(REPO_ROOT / args.cfg, "config")
     output_dir = Path(args.output_dir).resolve()
-    existing = [output_dir / name for name in OUTPUT_FILENAMES]
+    output_names = list(OUTPUT_FILENAMES)
+    if record_limit_substeps:
+        output_names.extend(JOINT_LIMIT_OUTPUT_FILENAMES)
+    existing = [output_dir / name for name in output_names]
     collisions = [path for path in existing if path.exists()]
     if collisions:
         raise FileExistsError(
@@ -582,6 +624,405 @@ def capture_state_trajectory(base_env: Any, metadata: dict[str, Any], tracker: F
     }
 
 
+def _runtime_object_names(model: Any, kind: str, count: int) -> list[str]:
+    """Read compiled names without relying on native convenience attributes."""
+    raw_model = getattr(model, "_model", model)
+    try:
+        from metamorph.utils import mujoco_compat as mjc
+
+        if mjc.BACKEND == "mujoco":
+            object_type = getattr(mjc.mujoco.mjtObj, f"mjOBJ_{kind.upper()}")
+            return [
+                mjc.mujoco.mj_id2name(raw_model, object_type, index) or ""
+                for index in range(int(count))
+            ]
+    except (AttributeError, ImportError):
+        pass
+    return [str(name) for name in getattr(model, f"{kind}_names")]
+
+
+def build_joint_limit_probe_mapping(
+    base_env: Any, probe_names: Sequence[str], trajectory_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    model = base_env.sim.model
+    joint_names = _runtime_object_names(model, "joint", int(model.njnt))
+    body_names = _runtime_object_names(model, "body", int(model.nbody))
+    geom_names = _runtime_object_names(model, "geom", int(model.ngeom))
+    mappings = []
+    for name in probe_names:
+        matches = [index for index, candidate in enumerate(joint_names) if candidate == name]
+        if len(matches) != 1:
+            raise ValueError(f"expected one compiled joint named {name!r}, found {len(matches)}")
+        joint_id = matches[0]
+        if int(model.jnt_type[joint_id]) != 3:
+            raise ValueError(f"joint-limit probe {name!r} is not a hinge joint")
+        if not bool(model.jnt_limited[joint_id]):
+            raise ValueError(f"joint-limit probe {name!r} is not limited")
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        dof_address = int(model.jnt_dofadr[joint_id])
+        mappings.append(
+            {
+                "joint_name": name,
+                "joint_id": joint_id,
+                "qpos_address": qpos_address,
+                "dof_address": dof_address,
+                "joint_body_id": int(model.jnt_bodyid[joint_id]),
+                "joint_body_name": body_names[int(model.jnt_bodyid[joint_id])],
+                "jnt_range": [float(value) for value in model.jnt_range[joint_id]],
+                "jnt_margin": float(model.jnt_margin[joint_id]),
+                "jnt_solref": [float(value) for value in model.jnt_solref[joint_id]],
+                "jnt_solimp": [float(value) for value in model.jnt_solimp[joint_id]],
+                "jnt_stiffness": float(model.jnt_stiffness[joint_id]),
+                "dof_damping": float(model.dof_damping[dof_address]),
+                "dof_armature": float(model.dof_armature[dof_address]),
+                "dof_frictionloss": float(model.dof_frictionloss[dof_address]),
+            }
+        )
+    return {
+        "schema_version": "spikmorph-mujoco-joint-limit-mapping-v1",
+        "constraint_row_identity": "efc_type == mjCNSTR_LIMIT_JOINT and efc_id == compiled joint_id; resolved independently after every mj_step",
+        "joint_limit_constraint_type": "mjCNSTR_LIMIT_JOINT",
+        "joints": mappings,
+        "joint_names": joint_names,
+        "body_names": body_names,
+        "geom_names": geom_names,
+        "root_free_joint": trajectory_metadata["root_free_joint"],
+        "root_body_id": trajectory_metadata["root_body_id"],
+        "root_body_name": trajectory_metadata["root_body_name"],
+        "torso_body_id": trajectory_metadata["torso_body_id"],
+        "torso_body_name": trajectory_metadata["torso_body_name"],
+    }
+
+
+def constraint_jacobian_row(data: Any, row: int, nefc: int, nv: int) -> tuple[list[int], list[float]]:
+    """Return one efc_J row for either MuJoCo dense or sparse storage."""
+    import numpy as np
+
+    jacobian = np.asarray(data.efc_J, dtype=np.float64).reshape(-1)
+    if jacobian.size == nefc * nv:
+        dense = jacobian.reshape(nefc, nv)[row]
+        indices = np.flatnonzero(dense).astype(int).tolist()
+        return indices, [float(dense[index]) for index in indices]
+    row_nnz = np.asarray(data.efc_J_rownnz, dtype=np.int64)
+    row_address = np.asarray(data.efc_J_rowadr, dtype=np.int64)
+    column_indices = np.asarray(data.efc_J_colind, dtype=np.int64)
+    start = int(row_address[row])
+    count = int(row_nnz[row])
+    stop = start + count
+    return column_indices[start:stop].astype(int).tolist(), jacobian[start:stop].astype(float).tolist()
+
+
+def _selected_constraint_reconstruction(data: Any, dof_address: int, nefc: int, nv: int) -> float:
+    total = 0.0
+    for row in range(nefc):
+        indices, values = constraint_jacobian_row(data, row, nefc, nv)
+        if dof_address in indices:
+            total += values[indices.index(dof_address)] * float(data.efc_force[row])
+    return float(total)
+
+
+class JointLimitSubstepRecorder:
+    """Observe each formal mj_step result without extra simulation calls."""
+
+    def __init__(self, sim: Any, frame_skip: int, mapping: dict[str, Any], tracker: FiniteTracker) -> None:
+        self.sim = sim
+        self.frame_skip = int(frame_skip)
+        self.mapping = mapping
+        self.tracker = tracker
+        self.records: list[dict[str, Any]] = []
+        self.control_step: int | None = None
+        self.episode = 0
+        self.physics_substep = 0
+        self.global_physics_step = 0
+
+    def begin_control_step(self, episode: int, control_step: int) -> None:
+        self.episode = int(episode)
+        self.control_step = int(control_step)
+        self.physics_substep = 0
+
+    def end_control_step(self) -> None:
+        if self.physics_substep != self.frame_skip:
+            raise RuntimeError(f"expected {self.frame_skip} physics substeps, observed {self.physics_substep}")
+
+    def _state(self) -> dict[str, Any]:
+        data = self.sim.data
+        root = self.mapping["root_free_joint"]
+        root_body_id = int(self.mapping["root_body_id"])
+        torso_body_id = int(self.mapping["torso_body_id"])
+        return {
+            "root_position": self.tracker.vector(data.body_xpos[root_body_id]),
+            "root_quaternion_wxyz": self.tracker.vector(data.body_xquat[root_body_id]),
+            "root_linear_velocity": self.tracker.vector(data.body_xvelp[root_body_id]),
+            "root_angular_velocity": self.tracker.vector(data.body_xvelr[root_body_id]),
+            "root_generalized_qpos": self.tracker.vector(data.qpos[root["qpos_indices"]]),
+            "root_generalized_qvel": self.tracker.vector(data.qvel[root["qvel_indices"]]),
+            "torso_height": self.tracker.scalar(data.body_xpos[torso_body_id][2]),
+        }
+
+    def capture_pre_step(self) -> dict[str, Any]:
+        data = self.sim.data
+        return {
+            "simulation_time": self.tracker.scalar(data.time),
+            "root": self._state(),
+            "joints": {
+                item["joint_name"]: {
+                    "qpos": self.tracker.scalar(data.qpos[item["qpos_address"]]),
+                    "qvel": self.tracker.scalar(data.qvel[item["dof_address"]]),
+                }
+                for item in self.mapping["joints"]
+            },
+        }
+
+    def capture_post_step(self, pre: dict[str, Any]) -> None:
+        if self.control_step is None:
+            raise RuntimeError("physics step occurred outside a control step")
+        from metamorph.utils import mujoco_compat as mjc
+
+        data = self.sim.data
+        model = self.sim.model
+        nefc = int(data.nefc)
+        nv = int(model.nv)
+        limit_type = int(mjc.mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT)
+        contacts = []
+        limb_floor_contact = False
+        body_names = self.mapping["body_names"]
+        geom_names = self.mapping["geom_names"]
+        for contact in data.contact[: int(data.ncon)]:
+            geom1, geom2 = int(contact.geom1), int(contact.geom2)
+            body1, body2 = int(model.geom_bodyid[geom1]), int(model.geom_bodyid[geom2])
+            pair = {
+                "geom1_id": geom1, "geom1_name": geom_names[geom1],
+                "body1_id": body1, "body1_name": body_names[body1],
+                "geom2_id": geom2, "geom2_name": geom_names[geom2],
+                "body2_id": body2, "body2_name": body_names[body2],
+            }
+            contacts.append(pair)
+            limb_floor_contact |= {pair["body1_name"], pair["body2_name"]} == {"limb/0", "floor/0"}
+
+        joint_records = []
+        for item in self.mapping["joints"]:
+            joint_id, dof = int(item["joint_id"]), int(item["dof_address"])
+            rows = [row for row in range(nefc) if int(data.efc_type[row]) == limit_type and int(data.efc_id[row]) == joint_id]
+            if len(rows) > 1:
+                raise RuntimeError(f"multiple joint-limit rows found for {item['joint_name']}: {rows}")
+            if rows:
+                row = rows[0]
+                indices, values = constraint_jacobian_row(data, row, nefc, nv)
+                coefficient = float(values[indices.index(dof)]) if dof in indices else 0.0
+                force = float(data.efc_force[row])
+                kbip = [float(value) for value in data.efc_KBIP[row]]
+                constraint = {
+                    "limit_constraint_present": True,
+                    "efc_row": row, "efc_type": int(data.efc_type[row]), "efc_id": int(data.efc_id[row]),
+                    "efc_pos": self.tracker.scalar(data.efc_pos[row]),
+                    "efc_margin": self.tracker.scalar(data.efc_margin[row]),
+                    "efc_vel": self.tracker.scalar(data.efc_vel[row]),
+                    "efc_aref": self.tracker.scalar(data.efc_aref[row]),
+                    "efc_diagApprox": self.tracker.scalar(data.efc_diagApprox[row]),
+                    "efc_KBIP": self.tracker.vector(kbip),
+                    "efc_KBIP_components": {"K": kbip[0], "B": kbip[1], "impedance": kbip[2], "impedance_derivative": kbip[3]},
+                    "efc_D": self.tracker.scalar(data.efc_D[row]),
+                    "efc_R": self.tracker.scalar(data.efc_R[row]),
+                    "efc_force": self.tracker.scalar(force),
+                    "efc_state": int(data.efc_state[row]),
+                    "J_row": {"dof_indices": indices, "values": values},
+                    "selected_dof_J": self.tracker.scalar(coefficient),
+                    "selected_dof_limit_generalized_force": self.tracker.scalar(coefficient * force),
+                }
+            else:
+                constraint = {field: None for field in (
+                    "efc_row", "efc_type", "efc_id", "efc_pos", "efc_margin", "efc_vel", "efc_aref",
+                    "efc_diagApprox", "efc_KBIP", "efc_KBIP_components", "efc_D", "efc_R", "efc_force",
+                    "efc_state", "J_row", "selected_dof_J", "selected_dof_limit_generalized_force",
+                )}
+                constraint["limit_constraint_present"] = False
+            reconstructed = _selected_constraint_reconstruction(data, dof, nefc, nv)
+            qfrc_constraint = float(data.qfrc_constraint[dof])
+            joint_records.append({
+                "joint_name": item["joint_name"], "joint_id": joint_id,
+                "qpos_address": int(item["qpos_address"]), "dof_address": dof,
+                "pre_step_qpos": pre["joints"][item["joint_name"]]["qpos"],
+                "pre_step_qvel": pre["joints"][item["joint_name"]]["qvel"],
+                "post_step_qpos": self.tracker.scalar(data.qpos[item["qpos_address"]]),
+                "post_step_qvel": self.tracker.scalar(data.qvel[dof]),
+                **constraint,
+                "qfrc_constraint": self.tracker.scalar(qfrc_constraint),
+                "qfrc_constraint_reconstructed_from_JT_efc_force": self.tracker.scalar(reconstructed),
+                "qfrc_constraint_reconstruction_error": self.tracker.scalar(reconstructed - qfrc_constraint),
+                "qfrc_passive": self.tracker.scalar(data.qfrc_passive[dof]),
+                "qfrc_actuator": self.tracker.scalar(data.qfrc_actuator[dof]),
+                "qfrc_applied": self.tracker.scalar(data.qfrc_applied[dof]),
+                "qfrc_bias": self.tracker.scalar(data.qfrc_bias[dof]),
+                "qacc_smooth": self.tracker.scalar(data.qacc_smooth[dof]),
+            })
+        self.global_physics_step += 1
+        self.records.append({
+            "episode": self.episode, "control_step": self.control_step,
+            "physics_substep_in_control": self.physics_substep,
+            "global_physics_step": self.global_physics_step,
+            "pre_step_simulation_time": pre["simulation_time"],
+            "simulation_time": self.tracker.scalar(data.time),
+            "pre_step_root": pre["root"], "post_step_root": self._state(),
+            "joints": joint_records, "nefc": nefc, "ncon": int(data.ncon),
+            "contacts": contacts, "contains_limb_0_floor_0_contact": limb_floor_contact,
+        })
+        self.physics_substep += 1
+
+
+class JointLimitRecordingSimProxy:
+    def __init__(self, sim: Any, recorder: JointLimitSubstepRecorder) -> None:
+        self._sim, self._recorder = sim, recorder
+        self.callback_error: Exception | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sim, name)
+
+    def step(self) -> Any:
+        pre = None
+        if self.callback_error is None:
+            try:
+                pre = self._recorder.capture_pre_step()
+            except Exception as error:
+                self.callback_error = error
+        result = self._sim.step()
+        if self.callback_error is None:
+            try:
+                self._recorder.capture_post_step(pre)
+            except Exception as error:
+                self.callback_error = error
+        return result
+
+
+def build_joint_limit_oracle_outputs(
+    records: Sequence[dict[str, Any]],
+    mapping: dict[str, Any],
+    expected_control_steps: int | None,
+    frame_skip: int,
+) -> dict[str, Any]:
+    joint_names = [item["joint_name"] for item in mapping["joints"]]
+    first_contact = next(
+        (record for record in records if record["contains_limb_0_floor_0_contact"]),
+        None,
+    )
+    joint_summary = {}
+    finite_limit_forces = True
+    max_reconstruction_error = 0.0
+    for joint_name in joint_names:
+        samples = [
+            (record, next(item for item in record["joints"] if item["joint_name"] == joint_name))
+            for record in records
+        ]
+        mapping_item = next(item for item in mapping["joints"] if item["joint_name"] == joint_name)
+        upper = float(mapping_item["jnt_range"][1])
+        first_constraint = next((pair for pair in samples if pair[1]["limit_constraint_present"]), None)
+        first_penetration = next((pair for pair in samples if pair[1]["post_step_qpos"] > upper), None)
+        first_force = next(
+            (
+                pair for pair in samples
+                if pair[1]["selected_dof_limit_generalized_force"] is not None
+                and pair[1]["selected_dof_limit_generalized_force"] != 0.0
+            ),
+            None,
+        )
+        force_samples = [
+            pair for pair in samples
+            if pair[1]["selected_dof_limit_generalized_force"] is not None
+        ]
+        for _, item in force_samples:
+            finite_limit_forces &= math.isfinite(item["selected_dof_limit_generalized_force"])
+        max_force = max(
+            force_samples,
+            key=lambda pair: abs(pair[1]["selected_dof_limit_generalized_force"]),
+            default=None,
+        )
+        max_penetration = max(
+            samples,
+            key=lambda pair: max(0.0, pair[1]["post_step_qpos"] - upper),
+            default=None,
+        )
+        for _, item in samples:
+            error = item["qfrc_constraint_reconstruction_error"]
+            if error is not None and math.isfinite(error):
+                max_reconstruction_error = max(max_reconstruction_error, abs(error))
+
+        def location(pair: Any) -> dict[str, Any] | None:
+            if pair is None:
+                return None
+            record, item = pair
+            return {
+                "control_step": record["control_step"],
+                "physics_substep_in_control": record["physics_substep_in_control"],
+                "global_physics_step": record["global_physics_step"],
+                "post_step_qpos": item["post_step_qpos"],
+                "efc_force": item.get("efc_force"),
+                "selected_dof_limit_generalized_force": item["selected_dof_limit_generalized_force"],
+            }
+
+        joint_summary[joint_name] = {
+            "first_limit_constraint_control_step": first_constraint[0]["control_step"] if first_constraint else None,
+            "first_limit_constraint_substep": first_constraint[0]["physics_substep_in_control"] if first_constraint else None,
+            "first_limit_constraint": location(first_constraint),
+            "first_positive_source_limit_penetration": location(first_penetration),
+            "first_nonzero_limit_force": location(first_force),
+            "max_limit_force_steps_1_30": location(max_force),
+            "max_penetration_steps_1_30": location(max_penetration),
+            "max_positive_penetration_radians": (
+                max(0.0, max_penetration[1]["post_step_qpos"] - upper)
+                if max_penetration is not None else None
+            ),
+        }
+    detailed_indices = [
+        {
+            "record_index": index,
+            "control_step": record["control_step"],
+            "physics_substep_in_control": record["physics_substep_in_control"],
+            "global_physics_step": record["global_physics_step"],
+        }
+        for index, record in enumerate(records)
+        if 8 <= int(record["control_step"]) <= 15
+    ]
+    expected_count = (
+        int(expected_control_steps) * int(frame_skip)
+        if expected_control_steps is not None else None
+    )
+    summary = {
+        "schema_version": "spikmorph-mujoco-joint-limit-substep-summary-v1",
+        "first_ground_contact_control_step": first_contact["control_step"] if first_contact else None,
+        "first_ground_contact_substep": first_contact["physics_substep_in_control"] if first_contact else None,
+        "first_ground_contact_global_physics_step": first_contact["global_physics_step"] if first_contact else None,
+        "joints": joint_summary,
+        "control_steps_8_through_15_record_indices": detailed_indices,
+    }
+    validation = {
+        "schema_version": "spikmorph-mujoco-joint-limit-substep-validation-v1",
+        "expected_record_count": expected_count,
+        "actual_record_count": len(records),
+        "record_count_matches": expected_count is None or len(records) == expected_count,
+        "physics_substeps_per_control": int(frame_skip),
+        "all_selected_dof_limit_generalized_forces_finite": finite_limit_forces,
+        "max_abs_qfrc_constraint_reconstruction_error": max_reconstruction_error,
+        "JT_efc_force_reconstruction_sign_and_value_match": max_reconstruction_error <= 1e-7,
+        "limit_constraint_presence_steps_1_through_8": {
+            joint_name: sum(
+                1
+                for record in records
+                if int(record["control_step"]) <= 8
+                for item in record["joints"]
+                if item["joint_name"] == joint_name
+                and item["limit_constraint_present"]
+            )
+            for joint_name in joint_names
+        },
+        "default_mode_note": "no proxy is installed unless --record-joint-limit-substeps is enabled",
+    }
+    return {
+        "records": list(records),
+        "mapping": mapping,
+        "summary": summary,
+        "validation": validation,
+    }
+
+
 def configure_runtime(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     from metamorph.config import cfg
     from tools.train_ppo import calculate_max_limbs_joints
@@ -654,11 +1095,16 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
     base_env = None
     trajectory_metadata = None
     trajectory_snapshots: dict[str, dict[str, Any]] = {}
+    joint_limit_mapping = None
+    joint_limit_recorder = None
+    joint_limit_proxy = None
+    original_sim = None
     try:
         observation = envs.reset()
-        if args.record_state_trajectory:
+        if args.record_state_trajectory or args.record_joint_limit_substeps:
             base_env = unwrap_single_mujoco_env(envs)
             trajectory_metadata = build_state_trajectory_metadata(base_env)
+        if args.record_state_trajectory:
             termination_wrapper = find_env_wrapper(envs, "TerminateOnFalling")
             install_pre_autoreset_state_capture(
                 termination_wrapper,
@@ -667,6 +1113,18 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                 tracker,
                 trajectory_snapshots,
             )
+        if args.record_joint_limit_substeps:
+            joint_limit_mapping = build_joint_limit_probe_mapping(
+                base_env, args.joint_limit_probe_names, trajectory_metadata
+            )
+            original_sim = base_env.sim
+            joint_limit_recorder = JointLimitSubstepRecorder(
+                original_sim, base_env.frame_skip, joint_limit_mapping, tracker
+            )
+            joint_limit_proxy = JointLimitRecordingSimProxy(
+                original_sim, joint_limit_recorder
+            )
+            base_env.sim = joint_limit_proxy
         for episode_index in range(args.episodes):
             episode_reward = 0.0
             episode_rewards_finite = True
@@ -701,11 +1159,21 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "_action_values_finite"
                 )
 
-                if trajectory_metadata is not None:
+                if args.record_state_trajectory and trajectory_metadata is not None:
                     trajectory_snapshots.clear()
+                if joint_limit_recorder is not None:
+                    joint_limit_recorder.begin_control_step(
+                        episode_index, episode_length + 1
+                    )
                 next_observation, reward_tensor, done_array, infos = envs.step(
                     raw_action
                 )
+                if joint_limit_recorder is not None:
+                    joint_limit_recorder.end_control_step()
+                    if joint_limit_proxy.callback_error is not None:
+                        raise RuntimeError(
+                            "joint-limit substep instrumentation failed"
+                        ) from joint_limit_proxy.callback_error
                 info = dict(infos[0])
                 reward = tracker.scalar(reward_tensor.reshape(-1)[0].item())
                 done = bool(done_array[0])
@@ -750,7 +1218,7 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     "truncated": truncated,
                     **action_stats,
                 }
-                if trajectory_metadata is not None and base_env is not None:
+                if args.record_state_trajectory and trajectory_metadata is not None and base_env is not None:
                     record["native_action"] = native_action
                     record["torso_height_above_ground"] = record[
                         "formal_torso_height"
@@ -779,7 +1247,8 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     break
                 if evaluator_cutoff_reached(episode_length, args.max_eval_steps):
                     evaluator_cutoff = True
-                    observation = envs.reset()
+                    if not args.record_joint_limit_substeps:
+                        observation = envs.reset()
                     break
 
             displacement = (
@@ -807,6 +1276,8 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                 }
             )
     finally:
+        if base_env is not None and original_sim is not None:
+            base_env.sim = original_sim
         envs.close()
 
     restored_policy_std_mean = tracker.scalar(
@@ -949,7 +1420,27 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
             **(trajectory_metadata or {}),
         },
     }
-    return metadata, summary, transitions
+    oracle = None
+    if joint_limit_recorder is not None and joint_limit_mapping is not None:
+        oracle = build_joint_limit_oracle_outputs(
+            joint_limit_recorder.records,
+            joint_limit_mapping,
+            expected_control_steps=args.max_eval_steps,
+            frame_skip=int(trajectory_metadata["frame_skip"]),
+        )
+        metadata["joint_limit_substep_oracle"] = {
+            "enabled": True,
+            "capture_timing": "pre live mj_step state, then immediate post live mj_step solver data and state",
+            "extra_mj_step_calls": 0,
+            "extra_mj_forward_calls": 0,
+            "physics_substep_indexing": "0-based within each 1-based control_step",
+            "probe_names": list(args.joint_limit_probe_names),
+            "record_count": len(joint_limit_recorder.records),
+        }
+        summary["joint_limit_substep_record_count"] = len(
+            joint_limit_recorder.records
+        )
+    return metadata, summary, transitions, oracle
 
 
 def write_outputs(
@@ -957,6 +1448,7 @@ def write_outputs(
     metadata: dict[str, Any],
     summary: dict[str, Any],
     transitions: Sequence[dict[str, Any]],
+    oracle: dict[str, Any] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_options = {
@@ -977,14 +1469,29 @@ def write_outputs(
     ) as stream:
         for transition in transitions:
             stream.write(json.dumps(transition, **json_options) + "\n")
+    if oracle is not None:
+        for name, payload in (
+            ("joint_mapping.json", oracle["mapping"]),
+            ("first_contact_and_limit_summary.json", oracle["summary"]),
+            ("validation.json", oracle["validation"]),
+        ):
+            (output_dir / name).write_text(
+                json.dumps(payload, indent=2, **json_options) + "\n",
+                encoding="utf-8",
+            )
+        with (output_dir / "substeps.jsonl").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as stream:
+            for record in oracle["records"]:
+                stream.write(json.dumps(record, **json_options) + "\n")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     paths = validate_args(args)
     configure_runtime(args, paths)
-    metadata, summary, transitions = evaluate(args, paths)
-    write_outputs(paths["output_dir"], metadata, summary, transitions)
+    metadata, summary, transitions, oracle = evaluate(args, paths)
+    write_outputs(paths["output_dir"], metadata, summary, transitions, oracle)
     print(
         json.dumps(
             {

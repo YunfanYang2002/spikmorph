@@ -56,14 +56,28 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
     def fake_mujoco_env():
         class Model:
             joint_names = ("root", "hip", "knee")
+            njnt = 3
+            nbody = 3
+            ngeom = 3
             jnt_type = np.asarray([0, 3, 3])
             jnt_bodyid = np.asarray([1, 2, 2])
             jnt_range = np.asarray([[0, 0], [-1, 1], [-2, 2]])
+            jnt_limited = np.asarray([False, True, True])
+            jnt_qposadr = np.asarray([0, 7, 8])
+            jnt_dofadr = np.asarray([0, 6, 7])
+            jnt_margin = np.asarray([0.0, 0.0, 0.0])
+            jnt_solref = np.asarray([[0.02, 1.0]] * 3)
+            jnt_solimp = np.asarray([[0.0, 0.99, 0.01, 0.5, 2.0]] * 3)
+            jnt_stiffness = np.asarray([0.0, 1.0, 1.0])
+            dof_damping = np.ones(8)
+            dof_armature = np.ones(8)
+            dof_frictionloss = np.zeros(8)
             nv = 8
             nu = 2
             actuator_names = ("hip_motor", "knee_motor")
             actuator_trnid = np.asarray([[1, 0], [2, 0]])
             body_names = ("world", "torso/0", "limb/0")
+            geom_names = ("floor", "torso_geom", "limb_geom")
             geom_bodyid = np.asarray([0, 1, 2])
             opt = SimpleNamespace(timestep=0.005)
 
@@ -152,6 +166,21 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertEqual(len(snapshot["qfrc_passive"]), 8)
         self.assertEqual(snapshot["contact_count"], 0)
 
+    def test_joint_limit_mapping_uses_compiled_addresses_and_parameters(self):
+        base_env = self.fake_mujoco_env()
+        trajectory = EVALUATOR.build_state_trajectory_metadata(base_env)
+        mapping = EVALUATOR.build_joint_limit_probe_mapping(
+            base_env, ["hip", "knee"], trajectory
+        )
+        hip = mapping["joints"][0]
+        self.assertEqual(hip["joint_id"], 1)
+        self.assertEqual(hip["qpos_address"], 7)
+        self.assertEqual(hip["dof_address"], 6)
+        self.assertEqual(hip["jnt_solref"], [0.02, 1.0])
+        self.assertEqual(hip["jnt_solimp"], [0.0, 0.99, 0.01, 0.5, 2.0])
+        self.assertEqual(hip["dof_damping"], 1.0)
+        self.assertEqual(hip["dof_armature"], 1.0)
+
     def test_evaluator_cutoff_does_not_claim_environment_termination(self):
         self.assertFalse(EVALUATOR.evaluator_cutoff_reached(219, 220))
         self.assertTrue(EVALUATOR.evaluator_cutoff_reached(220, 220))
@@ -185,7 +214,101 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
             ]
         )
         self.assertFalse(args.record_state_trajectory)
+        self.assertFalse(args.record_joint_limit_substeps)
+        self.assertEqual(args.joint_limit_probe_names, [])
         self.assertIsNone(args.max_eval_steps)
+
+    def test_joint_limit_substep_cli_is_opt_in(self):
+        args = EVALUATOR.parser().parse_args(
+            [
+                "--checkpoint", "checkpoint.pt",
+                "--walker-dir", "walkers",
+                "--morphology-id", "walker",
+                "--action-mode", "zero",
+                "--output-dir", "output",
+                "--record-joint-limit-substeps",
+                "--joint-limit-probe-names", "limby/12", "limby/11",
+            ]
+        )
+        self.assertTrue(args.record_joint_limit_substeps)
+        self.assertEqual(args.joint_limit_probe_names, ["limby/12", "limby/11"])
+
+    def test_dense_and_sparse_constraint_jacobian_rows(self):
+        dense = SimpleNamespace(efc_J=np.asarray([[0.0, -1.0, 2.0], [3.0, 0.0, 0.0]]))
+        self.assertEqual(
+            EVALUATOR.constraint_jacobian_row(dense, 0, 2, 3),
+            ([1, 2], [-1.0, 2.0]),
+        )
+        sparse = SimpleNamespace(
+            efc_J=np.asarray([-1.0, 2.0, 3.0]),
+            efc_J_rownnz=np.asarray([2, 1]),
+            efc_J_rowadr=np.asarray([0, 2]),
+            efc_J_colind=np.asarray([1, 2, 0]),
+        )
+        self.assertEqual(
+            EVALUATOR.constraint_jacobian_row(sparse, 0, 2, 3),
+            ([1, 2], [-1.0, 2.0]),
+        )
+
+    def test_step_proxy_calls_live_step_exactly_once(self):
+        events = []
+
+        class Sim:
+            def step(self):
+                events.append("mj_step")
+
+        class Recorder:
+            def capture_pre_step(self):
+                events.append("pre")
+                return {"pre": True}
+
+            def capture_post_step(self, pre):
+                self.pre = pre
+                events.append("post")
+
+        recorder = Recorder()
+        proxy = EVALUATOR.JointLimitRecordingSimProxy(Sim(), recorder)
+        proxy.step()
+        self.assertEqual(events, ["pre", "mj_step", "post"])
+        self.assertEqual(recorder.pre, {"pre": True})
+        self.assertIsNone(proxy.callback_error)
+
+    def test_oracle_summary_counts_four_substeps_and_missing_rows(self):
+        mapping = {
+            "joints": [
+                {"joint_name": "limby/12", "jnt_range": [-1.57, 0.0]},
+                {"joint_name": "limby/11", "jnt_range": [-1.57, 0.0]},
+            ]
+        }
+        records = []
+        for substep in range(4):
+            joints = []
+            for name in ("limby/12", "limby/11"):
+                joints.append(
+                    {
+                        "joint_name": name,
+                        "post_step_qpos": 0.001 if substep >= 2 else 0.0,
+                        "limit_constraint_present": substep >= 2,
+                        "selected_dof_limit_generalized_force": (
+                            -2.0 if substep >= 2 else None
+                        ),
+                        "qfrc_constraint_reconstruction_error": 0.0,
+                    }
+                )
+            records.append(
+                {
+                    "control_step": 1,
+                    "physics_substep_in_control": substep,
+                    "global_physics_step": substep + 1,
+                    "contains_limb_0_floor_0_contact": substep == 1,
+                    "joints": joints,
+                }
+            )
+        oracle = EVALUATOR.build_joint_limit_oracle_outputs(records, mapping, 1, 4)
+        self.assertTrue(oracle["validation"]["record_count_matches"])
+        self.assertEqual(oracle["summary"]["first_ground_contact_substep"], 1)
+        first = oracle["summary"]["joints"]["limby/12"]["first_limit_constraint"]
+        self.assertEqual(first["physics_substep_in_control"], 2)
 
     def test_velocity_frame_and_quaternion_metadata_are_explicit(self):
         metadata = EVALUATOR.build_state_trajectory_metadata(
