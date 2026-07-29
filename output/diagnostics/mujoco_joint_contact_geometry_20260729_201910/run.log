@@ -1,0 +1,16 @@
+2026-07-29T20:19:10+08:00 MuJoCo joint/contact geometry diagnostic
+TASK_CLASSIFICATION=E,C
+CODEX_ROLE=minimal instrumentation, limited validation
+
+PASS python -B -m unittest tests.test_evaluate_mujoco_checkpoint
+Ran 28 tests; OK
+PASS git diff --check
+
+RUNTIME_NOT_EXECUTED
+Existing physical-contact artifact: absent
+Reusable formal evaluator checkpoint/walker inputs: not found
+MuJoCo import in C:/Python311/python.exe: ModuleNotFoundError: No module named 'mujoco'
+
+No XML, friction, contact, joint, action, solver, timestep, or dynamics setting was modified.
+No mj_step or mj_forward call was added.
+MUJOCO_JOINT_CONTACT_GEOMETRY=INSUFFICIENT_EVIDENCE

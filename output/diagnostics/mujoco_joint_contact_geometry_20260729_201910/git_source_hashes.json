@@ -1,0 +1,8 @@
+{
+  "git_head": "76e5e5fcd5547b25e55701cdb7c3973bd9123f38",
+  "git_status_note": "instrumentation source, tests, and dated changelog modified; diagnostic output is ignored",
+  "source": {
+    "path": "tools/evaluate_mujoco_checkpoint.py",
+    "sha256": "07d87e71a9ce2de655e9ac5b64146d8701688c4386b77ba6352d446b8cfa2b40"
+  }
+}

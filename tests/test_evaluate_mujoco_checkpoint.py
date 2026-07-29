@@ -320,8 +320,19 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
                     [force[0] + 2.0 * force[1], force[2]], dtype=np.float64
                 )
 
-        model = SimpleNamespace(nv=2)
-        data = SimpleNamespace(qfrc_applied=np.asarray([7.0, 8.0]))
+        model = SimpleNamespace(
+            nv=2,
+            dof_jntid=np.asarray([0, 1]),
+            jnt_qposadr=np.asarray([0, 1]),
+            jnt_dofadr=np.asarray([0, 1]),
+        )
+        data = SimpleNamespace(
+            qfrc_applied=np.asarray([7.0, 8.0]),
+            qpos=np.asarray([0.4, -0.5]),
+            qvel=np.asarray([0.6, -0.7]),
+            xanchor=np.asarray([[0.0, 0.0, 0.0], [0.1, 0.2, 0.0]]),
+            xaxis=np.asarray([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+        )
         contact = SimpleNamespace(
             frame=np.eye(3), pos=np.asarray([0.1, 0.2, 0.3]), dim=3
         )
@@ -347,6 +358,47 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertAlmostEqual(selected["normal"], 3.0)
         self.assertAlmostEqual(selected["friction"], 8.0)
         self.assertAlmostEqual(selected["total"], 11.0)
+        geometry = result["joint_contact_geometry"]["limby/12"]
+        self.assertEqual(geometry["joint_id"], 0)
+        self.assertEqual(geometry["qpos_address"], 0)
+        self.assertEqual(geometry["qvel_dof_address"], 0)
+        self.assertAlmostEqual(geometry["kappa_analytic"], -0.1)
+        self.assertAlmostEqual(geometry["kappa_mj_applyFT"], 0.0)
+        self.assertFalse(geometry["within_numerical_tolerance"])
+
+    def test_joint_contact_geometry_formula_matches_apply_ft_projection(self):
+        class Mujoco:
+            @staticmethod
+            def mj_applyFT(model, data, force, torque, point, body_id, target):
+                lever = np.asarray(point) - data.xanchor[0]
+                target[0] += np.dot(data.xaxis[0], np.cross(lever, force))
+
+        model = SimpleNamespace(
+            nv=1,
+            dof_jntid=np.asarray([0]),
+            jnt_qposadr=np.asarray([0]),
+            jnt_dofadr=np.asarray([0]),
+        )
+        data = SimpleNamespace(
+            qfrc_applied=np.asarray([0.0]),
+            qpos=np.asarray([0.2]),
+            qvel=np.asarray([-0.3]),
+            xanchor=np.asarray([[0.1, 0.2, 0.3]]),
+            xaxis=np.asarray([[0.0, 1.0, 0.0]]),
+        )
+        contact = SimpleNamespace(
+            frame=np.eye(3), pos=np.asarray([0.4, 0.2, 0.3]), dim=3
+        )
+        result = EVALUATOR.physical_contact_projection(
+            Mujoco, model, data, contact,
+            np.asarray([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            np.asarray([-0.6]), 0, 1, {"limby/12": 0},
+        )
+        geometry = result["joint_contact_geometry"]["limby/12"]
+        self.assertAlmostEqual(geometry["kappa_analytic"], -0.3)
+        self.assertAlmostEqual(geometry["kappa_mj_applyFT"], -0.3)
+        self.assertEqual(geometry["difference"], 0.0)
+        self.assertTrue(geometry["within_numerical_tolerance"])
 
     def test_physical_substep_output_keeps_no_contact_steps(self):
         records = [

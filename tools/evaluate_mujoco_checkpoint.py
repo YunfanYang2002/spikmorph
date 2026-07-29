@@ -36,6 +36,8 @@ JOINT_LIMIT_OUTPUT_FILENAMES = (
     "physical_vs_constraint_generalized.json",
     "selected_joint_physical_decomposition.json",
     "unit_force_projection.json",
+    "joint_contact_geometry.json",
+    "run.log",
 )
 
 
@@ -1047,6 +1049,46 @@ def physical_contact_projection(
     qfrc_unit_normal = _apply_ft_scratch(
         mujoco, model, data, unit_normal_world, torque_cf_zero, point, robot_body
     )
+    prescribed_unit_normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    prescribed_qfrc_unit_normal = _apply_ft_scratch(
+        mujoco, model, data, prescribed_unit_normal, torque_cf_zero, point,
+        robot_body,
+    )
+    joint_contact_geometry = {}
+    for name, dof in selected_dofs.items():
+        joint_id = int(model.dof_jntid[dof])
+        anchor = np.asarray(data.xanchor[joint_id], dtype=np.float64)
+        axis = np.asarray(data.xaxis[joint_id], dtype=np.float64)
+        lever_arm = point - anchor
+        moment_arm = np.cross(lever_arm, prescribed_unit_normal)
+        kappa_analytic = float(np.dot(axis, moment_arm))
+        kappa_mj_apply_ft = float(prescribed_qfrc_unit_normal[dof])
+        difference = kappa_analytic - kappa_mj_apply_ft
+        scale = max(1.0, abs(kappa_analytic), abs(kappa_mj_apply_ft))
+        tolerance = 1.0e-12 * scale + 1.0e-14
+        joint_contact_geometry[name] = {
+            "joint_id": joint_id,
+            "qpos_address": int(model.jnt_qposadr[joint_id]),
+            "qvel_dof_address": int(model.jnt_dofadr[joint_id]),
+            "qpos": float(data.qpos[int(model.jnt_qposadr[joint_id])]),
+            "qvel": float(data.qvel[int(model.jnt_dofadr[joint_id])]),
+            "joint_anchor_world": anchor.tolist(),
+            "joint_axis_world": axis.tolist(),
+            "contact_point_world": point.tolist(),
+            "lever_arm_world": lever_arm.tolist(),
+            "unit_normal_world": prescribed_unit_normal.tolist(),
+            "lever_arm_cross_unit_normal_world": moment_arm.tolist(),
+            "axis_norm": float(np.linalg.norm(axis)),
+            "axis_dot_lever_arm": float(np.dot(axis, lever_arm)),
+            "axis_dot_unit_normal": float(np.dot(axis, prescribed_unit_normal)),
+            "axis_dot_r_cross_unit_normal": kappa_analytic,
+            "kappa_analytic": kappa_analytic,
+            "kappa_mj_applyFT": kappa_mj_apply_ft,
+            "difference": difference,
+            "abs_difference": abs(difference),
+            "numerical_tolerance": tolerance,
+            "within_numerical_tolerance": bool(abs(difference) <= tolerance),
+        }
     friction_robot_world = robot_side_factor * force_world_friction
     friction_norm = float(np.linalg.norm(friction_robot_world))
     qfrc_unit_friction = None
@@ -1124,6 +1166,11 @@ def physical_contact_projection(
             unit_friction_world.tolist() if unit_friction_world is not None else None
         ),
         "qfrc_per_unit_normal_force": qfrc_unit_normal.tolist(),
+        "prescribed_unit_normal_world": prescribed_unit_normal.tolist(),
+        "qfrc_per_prescribed_unit_normal_force": (
+            prescribed_qfrc_unit_normal.tolist()
+        ),
+        "joint_contact_geometry": joint_contact_geometry,
         "qfrc_per_unit_friction_direction": (
             qfrc_unit_friction.tolist() if qfrc_unit_friction is not None else None
         ),
@@ -1759,6 +1806,7 @@ def build_physical_contact_projection_outputs(
     )
     selected = {}
     unit_projection = {}
+    joint_contact_geometry = {}
     frozen_old = {
         "limby/12": {
             "normal": 332.635590617929,
@@ -1832,6 +1880,22 @@ def build_physical_contact_projection_outputs(
                 ],
                 "interpretation": "point-force geometry/Jacobian coefficient, not a solver coefficient",
             }
+            geometry = projection["joint_contact_geometry"][joint_name]
+            joint_contact_geometry[joint_name] = {
+                "global_physics_step": 55,
+                "contact_index": contact["contact_index"],
+                "geom1_name": contact["geom1_name"],
+                "geom2_name": contact["geom2_name"],
+                "robot_body_id": projection[
+                    "robot_body_id_for_unit_projection"
+                ],
+                "runtime_fields": {
+                    "joint_anchor_world": "data.xanchor[joint_id]",
+                    "joint_axis_world": "data.xaxis[joint_id]",
+                    "contact_point_world": "mjContact.pos",
+                },
+                **geometry,
+            }
 
     validation_comparisons = [
         item for item in comparisons
@@ -1861,6 +1925,18 @@ def build_physical_contact_projection_outputs(
         for name in frozen_old
     )
     oracle_valid = all_sign_valid and all_total_valid and all_scratch_unchanged
+    geometry_available = all(
+        joint_contact_geometry.get(name) is not None for name in frozen_old
+    )
+    geometry_valid = geometry_available and all(
+        item["within_numerical_tolerance"]
+        and abs(item["axis_norm"] - 1.0) <= 1.0e-12
+        and item["unit_normal_world"] == [0.0, 0.0, 1.0]
+        for item in joint_contact_geometry.values()
+    )
+    joint_geometry_verdict = (
+        "READY" if oracle_valid and geometry_valid else "INSUFFICIENT_EVIDENCE"
+    )
     if oracle_valid and all_components_valid and selected_match:
         verdict = "CONFIRMED"
     elif oracle_valid and all_components_valid and selected_available:
@@ -1887,6 +1963,16 @@ def build_physical_contact_projection_outputs(
             "global_physics_step": 55,
             "selected": unit_projection,
         },
+        "joint_contact_geometry": {
+            "schema_version": "spikmorph-mujoco-joint-contact-geometry-v1",
+            "global_physics_step": 55,
+            "formula": "joint_axis_world dot (lever_arm_world cross unit_normal_world)",
+            "generalized_coordinate_sign": "MuJoCo runtime data.xaxis direction; no fitted sign",
+            "extra_mj_step_calls": 0,
+            "extra_mj_forward_calls": 0,
+            "selected": joint_contact_geometry,
+            "MUJOCO_JOINT_CONTACT_GEOMETRY": joint_geometry_verdict,
+        },
         "validation": {
             "physical_wrench_sign_valid": all_sign_valid,
             "physical_wrench_oracle_valid": oracle_valid,
@@ -1896,6 +1982,9 @@ def build_physical_contact_projection_outputs(
             "mujoco_component_decomposition": verdict,
             "extra_mj_step_calls": 0,
             "extra_mj_forward_calls": 0,
+            "joint_contact_geometry_available": geometry_available,
+            "joint_contact_geometry_within_numerical_tolerance": geometry_valid,
+            "MUJOCO_JOINT_CONTACT_GEOMETRY": joint_geometry_verdict,
         },
     }
 
@@ -2245,6 +2334,8 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
         "created_at": datetime.now().astimezone().isoformat(),
         "git_head": git_output("rev-parse", "HEAD"),
         "git_status_short": git_output("status", "--short").splitlines(),
+        "evaluator_source_path": str(Path(__file__).resolve()),
+        "evaluator_source_sha256": sha256(Path(__file__).resolve()),
         "config_path": str(paths["config"]),
         "config_sha256": sha256(paths["config"]),
         "checkpoint_path": str(paths["checkpoint"]),
@@ -2405,6 +2496,22 @@ def write_outputs(
         ) as stream:
             for record in oracle["records"]:
                 stream.write(json.dumps(record, **json_options) + "\n")
+        (output_dir / "run.log").write_text(
+            json.dumps(
+                {
+                    "created_at": metadata["created_at"],
+                    "git_head": metadata["git_head"],
+                    "evaluator_source_sha256": metadata[
+                        "evaluator_source_sha256"
+                    ],
+                    "record_count": len(oracle["records"]),
+                    "validation": oracle["validation"],
+                },
+                **json_options,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         if oracle.get("contact_summary") is not None:
             (output_dir / "contact_generalized_response_summary.json").write_text(
                 json.dumps(
@@ -2424,6 +2531,7 @@ def write_outputs(
                 ("physical_vs_constraint_generalized.json", "physical_vs_constraint_generalized"),
                 ("selected_joint_physical_decomposition.json", "selected_joint_physical_decomposition"),
                 ("unit_force_projection.json", "unit_force_projection"),
+                ("joint_contact_geometry.json", "joint_contact_geometry"),
             ):
                 (output_dir / name).write_text(
                     json.dumps(physical[key], indent=2, **json_options) + "\n",

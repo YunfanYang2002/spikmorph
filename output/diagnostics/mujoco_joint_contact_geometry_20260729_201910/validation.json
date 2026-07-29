@@ -1,0 +1,21 @@
+{
+  "schema_version": "spikmorph-mujoco-joint-contact-geometry-validation-v1",
+  "created_at": "2026-07-29T20:19:10+08:00",
+  "runtime_validation_executed": false,
+  "joint_contact_geometry_available": false,
+  "joint_contact_geometry_within_numerical_tolerance": false,
+  "extra_mj_step_calls": 0,
+  "extra_mj_forward_calls": 0,
+  "static_validation": {
+    "command": "python -B -m unittest tests.test_evaluate_mujoco_checkpoint",
+    "tests_run": 28,
+    "result": "OK"
+  },
+  "blocking_evidence": [
+    "Existing artifact output/diagnostics/mujoco_physical_contact_projection_20260729_195100 is absent from this workspace.",
+    "No reusable checkpoint or walker dataset for the formal evaluator was found in the repository or adjacent D:/CODES/master repositories.",
+    "The available C:/Python311/python.exe environment raises ModuleNotFoundError for mujoco."
+  ],
+  "fail_closed_reason": "Runtime xanchor, xaxis, mjContact.pos, and mj_applyFT values could not be observed; no XML-derived or frozen-coefficient substitute was used.",
+  "MUJOCO_JOINT_CONTACT_GEOMETRY": "INSUFFICIENT_EVIDENCE"
+}
