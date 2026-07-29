@@ -218,6 +218,7 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertEqual(args.joint_limit_probe_names, [])
         self.assertFalse(args.record_contact_generalized_response)
         self.assertEqual(args.contact_probe_body_names, [])
+        self.assertFalse(args.record_physical_contact_projection)
         self.assertIsNone(args.max_eval_steps)
 
     def test_joint_limit_substep_cli_is_opt_in(self):
@@ -294,6 +295,76 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         )
         self.assertEqual([item["efc_row"] for item in rows], [0, 1])
         np.testing.assert_allclose(generalized, [0.0, 4.0, -21.0])
+
+    def test_contact_frame_row_transform_roundtrip(self):
+        frame = np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+            ]
+        )
+        contact_vector = np.asarray([2.0, -3.0, 4.0])
+        world_vector = EVALUATOR.contact_frame_to_world(frame, contact_vector)
+        np.testing.assert_allclose(frame @ world_vector, contact_vector)
+        check = EVALUATOR.contact_frame_validation(frame)
+        self.assertLess(check["orthonormality_max_abs_error"], 1.0e-15)
+        self.assertAlmostEqual(check["determinant"], 1.0)
+
+    def test_physical_projection_is_additive_and_uses_scratch_target(self):
+        class Mujoco:
+            @staticmethod
+            def mj_applyFT(model, data, force, torque, point, body_id, target):
+                self.assertIsNot(target, data.qfrc_applied)
+                target += np.asarray(
+                    [force[0] + 2.0 * force[1], force[2]], dtype=np.float64
+                )
+
+        model = SimpleNamespace(nv=2)
+        data = SimpleNamespace(qfrc_applied=np.asarray([7.0, 8.0]))
+        contact = SimpleNamespace(
+            frame=np.eye(3), pos=np.asarray([0.1, 0.2, 0.3]), dim=3
+        )
+        before = data.qfrc_applied.copy()
+        result = EVALUATOR.physical_contact_projection(
+            Mujoco,
+            model,
+            data,
+            contact,
+            np.asarray([3.0, 4.0, 0.0, 0.0, 0.0, 0.0]),
+            np.asarray([11.0, 0.0]),
+            0,
+            1,
+            {"limby/12": 0, "limby/11": 1},
+        )
+        self.assertEqual(result["robot_side_sign"], 1)
+        self.assertTrue(result["physical_wrench_sign_valid"])
+        self.assertLess(result["component_reconstruction_max_abs_error"], 1e-15)
+        self.assertTrue(result["physical_component_reconstruction_valid"])
+        self.assertTrue(result["qfrc_applied_unchanged"])
+        np.testing.assert_array_equal(data.qfrc_applied, before)
+        selected = result["selected_joints"]["limby/12"]
+        self.assertAlmostEqual(selected["normal"], 3.0)
+        self.assertAlmostEqual(selected["friction"], 8.0)
+        self.assertAlmostEqual(selected["total"], 11.0)
+
+    def test_physical_substep_output_keeps_no_contact_steps(self):
+        records = [
+            {
+                "control_step": 1,
+                "physics_substep_in_control": substep,
+                "global_physics_step": substep + 1,
+                "simulation_time": 0.005 * (substep + 1),
+                "physical_contact_projection_enabled": True,
+                "contacts": [],
+            }
+            for substep in range(4)
+        ]
+        outputs = EVALUATOR.build_physical_contact_projection_outputs(
+            records,
+            {"floor_geom_id": 0},
+        )
+        self.assertEqual(len(outputs["records"]), 4)
 
     def test_contact_summary_uses_floor_geom_identity(self):
         mapping = {

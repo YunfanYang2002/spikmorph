@@ -31,6 +31,11 @@ JOINT_LIMIT_OUTPUT_FILENAMES = (
     "first_contact_and_limit_summary.json",
     "validation.json",
     "contact_generalized_response_summary.json",
+    "physical_contact_substeps.jsonl",
+    "contact_frame_validation.json",
+    "physical_vs_constraint_generalized.json",
+    "selected_joint_physical_decomposition.json",
+    "unit_force_projection.json",
 )
 
 
@@ -73,6 +78,11 @@ def parser() -> argparse.ArgumentParser:
         "--contact-probe-body-names",
         nargs="+",
         default=[],
+    )
+    result.add_argument(
+        "--record-physical-contact-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     return result
 
@@ -117,6 +127,9 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
     record_contact_response = bool(
         getattr(args, "record_contact_generalized_response", False)
     )
+    record_physical_projection = bool(
+        getattr(args, "record_physical_contact_projection", False)
+    )
     probe_names = list(getattr(args, "joint_limit_probe_names", []))
     if record_limit_substeps:
         if args.action_mode != "zero":
@@ -149,6 +162,10 @@ def validate_args(args: argparse.Namespace) -> dict[str, Path]:
             )
         if len(set(body_names)) != len(body_names):
             raise ValueError("--contact-probe-body-names must be unique")
+    if record_physical_projection and not record_limit_substeps:
+        raise ValueError(
+            "physical contact projection requires --record-joint-limit-substeps"
+        )
     checkpoint = require_file(Path(args.checkpoint), "checkpoint")
     walker_dir = Path(args.walker_dir).resolve()
     morphology_xml = require_file(
@@ -672,6 +689,7 @@ def build_joint_limit_probe_mapping(
     probe_names: Sequence[str],
     trajectory_metadata: dict[str, Any],
     contact_probe_body_names: Sequence[str] = (),
+    enable_contact_mapping: bool = False,
 ) -> dict[str, Any]:
     model = base_env.sim.model
     joint_names = _runtime_object_names(model, "joint", int(model.njnt))
@@ -718,7 +736,7 @@ def build_joint_limit_probe_mapping(
     floor_geom_ids = [
         index for index, name in enumerate(geom_names) if name == "floor/0"
     ]
-    if contact_probe_body_names and len(floor_geom_ids) != 1:
+    if (contact_probe_body_names or enable_contact_mapping) and len(floor_geom_ids) != 1:
         raise ValueError(
             f"expected one compiled floor geom named 'floor/0', found {len(floor_geom_ids)}"
         )
@@ -866,10 +884,258 @@ def capture_native_body_states(
     return result
 
 
+def contact_frame_to_world(frame_raw: Any, vector_contact: Any) -> Any:
+    """Transform a vector using mjContact.frame's world-axis rows."""
+    import numpy as np
+
+    frame = np.asarray(frame_raw, dtype=np.float64).reshape(3, 3)
+    return frame.T @ np.asarray(vector_contact, dtype=np.float64)
+
+
+def contact_frame_validation(frame_raw: Any) -> dict[str, Any]:
+    import numpy as np
+
+    frame = np.asarray(frame_raw, dtype=np.float64).reshape(3, 3)
+    identity_error = frame @ frame.T - np.eye(3, dtype=np.float64)
+    return {
+        "raw_rows": frame.reshape(-1).tolist(),
+        "normal_world": frame[0].tolist(),
+        "tangent1_world": frame[1].tolist(),
+        "tangent2_world": frame[2].tolist(),
+        "orthonormality_max_abs_error": float(np.max(np.abs(identity_error))),
+        "determinant": float(np.linalg.det(frame)),
+        "right_handed_determinant_error": float(abs(np.linalg.det(frame) - 1.0)),
+    }
+
+
+def vector_comparison(candidate: Any, reference: Any) -> dict[str, Any]:
+    import numpy as np
+
+    candidate = np.asarray(candidate, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    delta = candidate - reference
+    candidate_norm = float(np.linalg.norm(candidate))
+    reference_norm = float(np.linalg.norm(reference))
+    denominator = candidate_norm * reference_norm
+    return {
+        "max_abs_error": float(np.max(np.abs(delta))) if delta.size else 0.0,
+        "rms_error": float(np.sqrt(np.mean(delta * delta))) if delta.size else 0.0,
+        "candidate_norm": candidate_norm,
+        "reference_norm": reference_norm,
+        "norm_ratio": candidate_norm / reference_norm if reference_norm else None,
+        "cosine_similarity": (
+            float(np.dot(candidate, reference) / denominator)
+            if denominator
+            else None
+        ),
+    }
+
+
+def _apply_ft_scratch(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    force_world: Any,
+    torque_world: Any,
+    point_world: Any,
+    body_id: int,
+) -> Any:
+    import numpy as np
+
+    target = np.zeros(int(model.nv), dtype=np.float64)
+    if int(body_id) != 0:
+        mujoco.mj_applyFT(
+            model,
+            data,
+            np.asarray(force_world, dtype=np.float64),
+            np.asarray(torque_world, dtype=np.float64),
+            np.asarray(point_world, dtype=np.float64),
+            int(body_id),
+            target,
+        )
+    return target
+
+
+def apply_contact_pair_scratch(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    force_world_on_geom2: Any,
+    torque_world_on_geom2: Any,
+    point_world: Any,
+    body1: int,
+    body2: int,
+) -> Any:
+    """Apply equal/opposite contact wrench to scratch qfrc, never live qfrc_applied."""
+    result = _apply_ft_scratch(
+        mujoco, model, data, force_world_on_geom2, torque_world_on_geom2,
+        point_world, body2,
+    )
+    result += _apply_ft_scratch(
+        mujoco, model, data, -force_world_on_geom2, -torque_world_on_geom2,
+        point_world, body1,
+    )
+    return result
+
+
+def physical_contact_projection(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    contact: Any,
+    wrench_contact: Any,
+    constraint_generalized: Any,
+    body1: int,
+    body2: int,
+    selected_dofs: dict[str, int],
+) -> dict[str, Any]:
+    """Independent physical-wrench projection and full-nv sign validation."""
+    import numpy as np
+
+    frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+    wrench = np.asarray(wrench_contact, dtype=np.float64)
+    point = np.asarray(contact.pos, dtype=np.float64)
+    force_cf_normal = np.asarray([wrench[0], 0.0, 0.0])
+    force_cf_friction = np.asarray([0.0, wrench[1], wrench[2]])
+    torque_cf_zero = np.zeros(3, dtype=np.float64)
+    force_world_normal = contact_frame_to_world(frame, force_cf_normal)
+    force_world_friction = contact_frame_to_world(frame, force_cf_friction)
+    force_world_total = contact_frame_to_world(frame, wrench[:3])
+    torque_world_total = contact_frame_to_world(frame, wrench[3:])
+    qfrc_before = np.asarray(data.qfrc_applied, dtype=np.float64).copy()
+    sign_candidates = {}
+    candidate_vectors = {}
+    for sign in (1, -1):
+        projected = apply_contact_pair_scratch(
+            mujoco, model, data,
+            sign * force_world_total, sign * torque_world_total,
+            point, body1, body2,
+        )
+        candidate_vectors[sign] = projected
+        sign_candidates[str(sign)] = vector_comparison(
+            projected, constraint_generalized
+        )
+    selected_sign = min(
+        (1, -1), key=lambda sign: sign_candidates[str(sign)]["max_abs_error"]
+    )
+    selected_error = sign_candidates[str(selected_sign)]["max_abs_error"]
+    other_error = sign_candidates[str(-selected_sign)]["max_abs_error"]
+    reference_scale = max(1.0, float(np.max(np.abs(constraint_generalized))))
+    strict_tolerance = 1.0e-8 * reference_scale + 1.0e-10
+    sign_valid = bool(
+        selected_error <= strict_tolerance and other_error > strict_tolerance
+    )
+    sign = selected_sign
+    qfrc_normal = apply_contact_pair_scratch(
+        mujoco, model, data, sign * force_world_normal, sign * torque_cf_zero,
+        point, body1, body2,
+    )
+    qfrc_friction = apply_contact_pair_scratch(
+        mujoco, model, data, sign * force_world_friction, sign * torque_cf_zero,
+        point, body1, body2,
+    )
+    qfrc_total = candidate_vectors[sign]
+    component_delta = qfrc_normal + qfrc_friction - qfrc_total
+    torque_norm = float(np.linalg.norm(wrench[3:]))
+    component_error = float(np.max(np.abs(component_delta)))
+    qfrc_unchanged = bool(np.array_equal(qfrc_before, data.qfrc_applied))
+
+    # For a robot-floor contact, report point-force geometry on the robot side.
+    robot_body = body2 if body2 != 0 and body1 == 0 else body1
+    robot_side_factor = sign if robot_body == body2 else -sign
+    unit_normal_world = robot_side_factor * frame[0]
+    qfrc_unit_normal = _apply_ft_scratch(
+        mujoco, model, data, unit_normal_world, torque_cf_zero, point, robot_body
+    )
+    friction_robot_world = robot_side_factor * force_world_friction
+    friction_norm = float(np.linalg.norm(friction_robot_world))
+    qfrc_unit_friction = None
+    unit_friction_world = None
+    if friction_norm > 1.0e-12:
+        unit_friction_world = friction_robot_world / friction_norm
+        qfrc_unit_friction = _apply_ft_scratch(
+            mujoco, model, data, unit_friction_world, torque_cf_zero,
+            point, robot_body,
+        )
+    selected = {
+        name: {
+            "normal": float(qfrc_normal[dof]),
+            "friction": float(qfrc_friction[dof]),
+            "total": float(qfrc_total[dof]),
+            "constraint_rows_total": float(constraint_generalized[dof]),
+            "kappa_normal": float(qfrc_unit_normal[dof]),
+            "kappa_friction_direction": (
+                float(qfrc_unit_friction[dof])
+                if qfrc_unit_friction is not None else None
+            ),
+        }
+        for name, dof in selected_dofs.items()
+    }
+    return {
+        "frame_validation": contact_frame_validation(frame),
+        "force_contact_frame": wrench[:3].tolist(),
+        "torque_contact_frame": wrench[3:].tolist(),
+        "Fn": float(wrench[0]),
+        "Ft1": float(wrench[1]),
+        "Ft2": float(wrench[2]),
+        "friction_force_norm": float(np.linalg.norm(wrench[1:3])),
+        "contact_torque_norm": torque_norm,
+        "contact_frame_force_component_closure_max_abs_error": float(
+            np.max(np.abs(force_cf_normal + force_cf_friction - wrench[:3]))
+        ),
+        "world_frame_force_component_closure_max_abs_error": float(
+            np.max(np.abs(force_world_normal + force_world_friction - force_world_total))
+        ),
+        "unexpected_contact_torque": bool(int(contact.dim) == 3 and torque_norm > 1.0e-10),
+        "normal_force_world_unsigned": force_world_normal.tolist(),
+        "friction_force_world_unsigned": force_world_friction.tolist(),
+        "total_force_world_unsigned": force_world_total.tolist(),
+        "normal_torque_world_unsigned": torque_cf_zero.tolist(),
+        "friction_torque_world_unsigned": torque_cf_zero.tolist(),
+        "total_torque_world_unsigned": torque_world_total.tolist(),
+        "robot_side_sign": int(sign),
+        "normal_force_world_on_body2": (sign * force_world_normal).tolist(),
+        "friction_force_world_on_body2": (sign * force_world_friction).tolist(),
+        "total_force_world_on_body2": (sign * force_world_total).tolist(),
+        "normal_torque_world_on_body2": torque_cf_zero.tolist(),
+        "friction_torque_world_on_body2": torque_cf_zero.tolist(),
+        "total_torque_world_on_body2": (sign * torque_world_total).tolist(),
+        "normal_force_world_on_body1": (-sign * force_world_normal).tolist(),
+        "friction_force_world_on_body1": (-sign * force_world_friction).tolist(),
+        "total_force_world_on_body1": (-sign * force_world_total).tolist(),
+        "sign_candidates": sign_candidates,
+        "sign_strict_tolerance": strict_tolerance,
+        "physical_wrench_sign_valid": sign_valid,
+        "qfrc_normal": qfrc_normal.tolist(),
+        "qfrc_friction": qfrc_friction.tolist(),
+        "qfrc_total": qfrc_total.tolist(),
+        "qfrc_constraint_rows_contact": np.asarray(constraint_generalized).tolist(),
+        "component_reconstruction_max_abs_error": component_error,
+        "physical_component_reconstruction_valid": bool(
+            component_error <= strict_tolerance and torque_norm <= 1.0e-10
+        ),
+        "total_vs_constraint": vector_comparison(
+            qfrc_total, constraint_generalized
+        ),
+        "qfrc_applied_unchanged": qfrc_unchanged,
+        "robot_body_id_for_unit_projection": int(robot_body),
+        "unit_normal_world_robot_side": unit_normal_world.tolist(),
+        "unit_friction_world_robot_side": (
+            unit_friction_world.tolist() if unit_friction_world is not None else None
+        ),
+        "qfrc_per_unit_normal_force": qfrc_unit_normal.tolist(),
+        "qfrc_per_unit_friction_direction": (
+            qfrc_unit_friction.tolist() if qfrc_unit_friction is not None else None
+        ),
+        "selected_joints": selected,
+    }
+
+
 def capture_contact_response(
     sim: Any,
     mapping: dict[str, Any],
     tracker: FiniteTracker,
+    record_physical_projection: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """Read mjContact, mj_contactForce and each contact's EFC contribution."""
     import numpy as np
@@ -916,8 +1182,7 @@ def capture_contact_response(
         frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
         world_force_on_geom2 = frame.T @ wrench[0:3]
         world_torque_on_geom2 = frame.T @ wrench[3:6]
-        contacts.append(
-            {
+        contact_record = {
                 "contact_index": contact_index,
                 "geom1_id": geom1,
                 "geom1_name": mapping["geom_names"][geom1],
@@ -954,14 +1219,27 @@ def capture_contact_response(
                     or geom2 == mapping["floor_geom_id"]
                 ),
             }
-        )
+        if record_physical_projection:
+            contact_record["physical_projection"] = physical_contact_projection(
+                mujoco, raw_model, raw_data, contact, wrench,
+                np.asarray(generalized, dtype=np.float64), body1, body2, selected,
+            )
+        contacts.append(contact_record)
     return contacts, total_selected
 
 
 class JointLimitSubstepRecorder:
     """Observe each formal mj_step result without extra simulation calls."""
 
-    def __init__(self, sim: Any, frame_skip: int, mapping: dict[str, Any], tracker: FiniteTracker) -> None:
+    def __init__(
+        self,
+        sim: Any,
+        frame_skip: int,
+        mapping: dict[str, Any],
+        tracker: FiniteTracker,
+        record_contact_response: bool = False,
+        record_physical_projection: bool = False,
+    ) -> None:
         self.sim = sim
         self.frame_skip = int(frame_skip)
         self.mapping = mapping
@@ -971,6 +1249,8 @@ class JointLimitSubstepRecorder:
         self.episode = 0
         self.physics_substep = 0
         self.global_physics_step = 0
+        self.record_contact_response = bool(record_contact_response)
+        self.record_physical_projection = bool(record_physical_projection)
         self.body_snapshot_data = (
             make_body_kinematics_snapshot_data(sim)
             if mapping["contact_probe_bodies"]
@@ -1057,9 +1337,12 @@ class JointLimitSubstepRecorder:
                 floor_geom_id in (geom1, geom2)
                 and "limb/0" in (pair["body1_name"], pair["body2_name"])
             )
-        if self.mapping["contact_probe_bodies"]:
+        if self.record_contact_response or self.record_physical_projection:
             contacts, contact_generalized_totals = capture_contact_response(
-                self.sim, self.mapping, self.tracker
+                self.sim,
+                self.mapping,
+                self.tracker,
+                record_physical_projection=self.record_physical_projection,
             )
             floor_geom_id = self.mapping["floor_geom_id"]
             limb_floor_contact = any(
@@ -1151,6 +1434,7 @@ class JointLimitSubstepRecorder:
             ),
             "joints": joint_records, "nefc": nefc, "ncon": int(data.ncon),
             "contacts": contacts, "contains_limb_0_floor_0_contact": limb_floor_contact,
+            "physical_contact_projection_enabled": self.record_physical_projection,
             "sum_contact_generalized_force_selected_dofs": {
                 name: self.tracker.scalar(value)
                 for name, value in contact_generalized_totals.items()
@@ -1322,12 +1606,16 @@ def build_joint_limit_oracle_outputs(
         validation["global_55_contact_reconstruction"] = contact_summary.get(
             "global_55_contact_reconstruction"
         )
+    physical_outputs = build_physical_contact_projection_outputs(records, mapping)
+    if physical_outputs is not None:
+        validation.update(physical_outputs["validation"])
     return {
         "records": list(records),
         "mapping": mapping,
         "summary": summary,
         "validation": validation,
         "contact_summary": contact_summary,
+        "physical_outputs": physical_outputs,
     }
 
 
@@ -1413,6 +1701,202 @@ def build_contact_generalized_response_summary(
         "constraint_reconstruction": "sum each contact's dynamic rows from contact.efc_address using current cone type and contact.dim; accumulate J_row^T * efc_force",
         "window": window,
         "global_55_contact_reconstruction": reconstruction,
+    }
+
+
+def build_physical_contact_projection_outputs(
+    records: Sequence[dict[str, Any]], mapping: dict[str, Any]
+) -> dict[str, Any] | None:
+    physical_records = []
+    frame_checks = []
+    comparisons = []
+    for record in records:
+        if not record.get("physical_contact_projection_enabled", False):
+            continue
+        projected_contacts = [
+            contact for contact in record.get("contacts", [])
+            if "physical_projection" in contact
+        ]
+        physical_records.append({
+            "control_step": record["control_step"],
+            "physics_substep_in_control": record["physics_substep_in_control"],
+            "global_physics_step": record["global_physics_step"],
+            "simulation_time": record["simulation_time"],
+            "contacts": projected_contacts,
+        })
+        for contact in projected_contacts:
+            projection = contact["physical_projection"]
+            identity = {
+                "global_physics_step": record["global_physics_step"],
+                "contact_index": contact["contact_index"],
+                "geom1_name": contact["geom1_name"],
+                "geom2_name": contact["geom2_name"],
+            }
+            frame_checks.append({**identity, **projection["frame_validation"]})
+            comparisons.append({
+                **identity,
+                "robot_side_sign": projection["robot_side_sign"],
+                "physical_wrench_sign_valid": projection[
+                    "physical_wrench_sign_valid"
+                ],
+                "sign_candidates": projection["sign_candidates"],
+                "total_vs_constraint": projection["total_vs_constraint"],
+                "component_reconstruction_max_abs_error": projection[
+                    "component_reconstruction_max_abs_error"
+                ],
+                "physical_component_reconstruction_valid": projection[
+                    "physical_component_reconstruction_valid"
+                ],
+                "qfrc_applied_unchanged": projection["qfrc_applied_unchanged"],
+            })
+    if not physical_records:
+        return None
+
+    floor_geom_id = mapping["floor_geom_id"]
+    global_55 = next(
+        (record for record in physical_records if record["global_physics_step"] == 55),
+        None,
+    )
+    selected = {}
+    unit_projection = {}
+    frozen_old = {
+        "limby/12": {
+            "normal": 332.635590617929,
+            "friction": -240.195861797270,
+            "total": 92.439728820659,
+        },
+        "limby/11": {
+            "normal": 332.635590617929,
+            "friction": -240.195861797270,
+            "total": 92.439728820659,
+        },
+    }
+    if global_55 is not None:
+        for joint_name, body_name in (("limby/12", "limb/12"), ("limby/11", "limb/11")):
+            contact = next(
+                (
+                    item for item in global_55["contacts"]
+                    if floor_geom_id in (item["geom1_id"], item["geom2_id"])
+                    and body_name in (item["body1_name"], item["body2_name"])
+                ),
+                None,
+            )
+            if contact is None:
+                selected[joint_name] = None
+                unit_projection[joint_name] = None
+                continue
+            projection = contact["physical_projection"]
+            values = projection["selected_joints"][joint_name]
+            old = frozen_old[joint_name]
+            selected[joint_name] = {
+                "contact_index": contact["contact_index"],
+                "geom1_name": contact["geom1_name"],
+                "geom2_name": contact["geom2_name"],
+                "physical": {
+                    key: values[key] for key in ("normal", "friction", "total")
+                },
+                "frozen_previous_constraint_row_decomposition": old,
+                "difference_physical_minus_old": {
+                    key: values[key] - old[key]
+                    for key in ("normal", "friction", "total")
+                },
+                "oracle_gates": {
+                    "physical_wrench_sign_valid": projection[
+                        "physical_wrench_sign_valid"
+                    ],
+                    "physical_component_reconstruction_valid": projection[
+                        "physical_component_reconstruction_valid"
+                    ],
+                    "total_vs_constraint": projection["total_vs_constraint"],
+                },
+            }
+            unit_projection[joint_name] = {
+                "contact_index": contact["contact_index"],
+                "robot_body_id": projection["robot_body_id_for_unit_projection"],
+                "contact_position_world": contact["position_world"],
+                "unit_normal_world_robot_side": projection[
+                    "unit_normal_world_robot_side"
+                ],
+                "unit_friction_world_robot_side": projection[
+                    "unit_friction_world_robot_side"
+                ],
+                "qfrc_per_unit_normal_force": projection[
+                    "qfrc_per_unit_normal_force"
+                ],
+                "qfrc_per_unit_friction_direction": projection[
+                    "qfrc_per_unit_friction_direction"
+                ],
+                "kappa_normal": values["kappa_normal"],
+                "kappa_friction_direction": values[
+                    "kappa_friction_direction"
+                ],
+                "interpretation": "point-force geometry/Jacobian coefficient, not a solver coefficient",
+            }
+
+    validation_comparisons = [
+        item for item in comparisons
+        if item["global_physics_step"] == 55
+        and item["total_vs_constraint"]["reference_norm"] > 1.0e-12
+    ]
+    all_sign_valid = bool(validation_comparisons) and all(
+        item["physical_wrench_sign_valid"] for item in validation_comparisons
+    )
+    all_total_valid = bool(validation_comparisons) and all(
+        item["total_vs_constraint"]["max_abs_error"]
+        <= 1.0e-8 * max(1.0, item["total_vs_constraint"]["reference_norm"])
+        + 1.0e-10
+        for item in validation_comparisons
+    )
+    all_components_valid = bool(validation_comparisons) and all(
+        item["physical_component_reconstruction_valid"]
+        for item in validation_comparisons
+    )
+    all_scratch_unchanged = bool(validation_comparisons) and all(
+        item["qfrc_applied_unchanged"] for item in validation_comparisons
+    )
+    selected_available = all(selected.get(name) is not None for name in frozen_old)
+    selected_match = selected_available and all(
+        max(abs(value) for value in selected[name]["difference_physical_minus_old"].values())
+        <= 1.0e-6
+        for name in frozen_old
+    )
+    oracle_valid = all_sign_valid and all_total_valid and all_scratch_unchanged
+    if oracle_valid and all_components_valid and selected_match:
+        verdict = "CONFIRMED"
+    elif oracle_valid and all_components_valid and selected_available:
+        verdict = "REFUTED"
+    else:
+        verdict = "INSUFFICIENT_EVIDENCE"
+    return {
+        "records": physical_records,
+        "contact_frame_validation": {
+            "frame_storage": "three world-frame axes stored as rows: normal, tangent1, tangent2",
+            "checks": frame_checks,
+        },
+        "physical_vs_constraint_generalized": {
+            "comparison_scope": "full nv vector for each contact",
+            "comparisons": comparisons,
+        },
+        "selected_joint_physical_decomposition": {
+            "global_physics_step": 55,
+            "old_reference_provenance": "task-frozen previous pyramidal constraint-row decomposition; limby/11 specified symmetric to limby/12",
+            "selected": selected,
+            "mujoco_component_decomposition": verdict,
+        },
+        "unit_force_projection": {
+            "global_physics_step": 55,
+            "selected": unit_projection,
+        },
+        "validation": {
+            "physical_wrench_sign_valid": all_sign_valid,
+            "physical_wrench_oracle_valid": oracle_valid,
+            "physical_component_reconstruction_valid": all_components_valid,
+            "qfrc_applied_unchanged": all_scratch_unchanged,
+            "selected_joint_old_component_match": bool(selected_match),
+            "mujoco_component_decomposition": verdict,
+            "extra_mj_step_calls": 0,
+            "extra_mj_forward_calls": 0,
+        },
     }
 
 
@@ -1516,10 +2000,19 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                     if args.record_contact_generalized_response
                     else ()
                 ),
+                enable_contact_mapping=(
+                    args.record_contact_generalized_response
+                    or args.record_physical_contact_projection
+                ),
             )
             original_sim = base_env.sim
             joint_limit_recorder = JointLimitSubstepRecorder(
-                original_sim, base_env.frame_skip, joint_limit_mapping, tracker
+                original_sim,
+                base_env.frame_skip,
+                joint_limit_mapping,
+                tracker,
+                record_contact_response=args.record_contact_generalized_response,
+                record_physical_projection=args.record_physical_contact_projection,
             )
             joint_limit_proxy = JointLimitRecordingSimProxy(
                 original_sim, joint_limit_recorder
@@ -1853,6 +2346,18 @@ def evaluate(args: argparse.Namespace, paths: dict[str, Path]):
                 "extra_live_mj_forward_calls": 0,
                 "isolated_body_kinematics_mj_forward_calls_per_substep": 2,
             }
+        if args.record_physical_contact_projection:
+            metadata["physical_contact_projection_oracle"] = {
+                "enabled": True,
+                "contact_wrench_api": "mujoco.mj_contactForce",
+                "physical_projection_api": "mujoco.mj_applyFT",
+                "contact_point": "exact mjContact.pos",
+                "contact_frame_storage": "normal/tangent1/tangent2 world axes stored as rows",
+                "sign_selection": "one uniform contact-side sign selected by strict full-nv total reconstruction",
+                "scratch_target": "independent zero qfrc vectors; data.qfrc_applied is never passed to mj_applyFT",
+                "extra_mj_step_calls": 0,
+                "extra_mj_forward_calls": 0,
+            }
         summary["joint_limit_substep_record_count"] = len(
             joint_limit_recorder.records
         )
@@ -1907,6 +2412,23 @@ def write_outputs(
                 ) + "\n",
                 encoding="utf-8",
             )
+        physical = oracle.get("physical_outputs")
+        if physical is not None:
+            with (output_dir / "physical_contact_substeps.jsonl").open(
+                "x", encoding="utf-8", newline="\n"
+            ) as stream:
+                for record in physical["records"]:
+                    stream.write(json.dumps(record, **json_options) + "\n")
+            for name, key in (
+                ("contact_frame_validation.json", "contact_frame_validation"),
+                ("physical_vs_constraint_generalized.json", "physical_vs_constraint_generalized"),
+                ("selected_joint_physical_decomposition.json", "selected_joint_physical_decomposition"),
+                ("unit_force_projection.json", "unit_force_projection"),
+            ):
+                (output_dir / name).write_text(
+                    json.dumps(physical[key], indent=2, **json_options) + "\n",
+                    encoding="utf-8",
+                )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
