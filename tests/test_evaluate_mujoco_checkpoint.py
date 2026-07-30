@@ -311,6 +311,34 @@ class EvaluateMujocoCheckpointTests(unittest.TestCase):
         self.assertLess(check["orthonormality_max_abs_error"], 1.0e-15)
         self.assertAlmostEqual(check["determinant"], 1.0)
 
+    def test_contact_point_velocity_rigid_and_jacobian_paths_close(self):
+        class Mujoco:
+            @staticmethod
+            def mj_jac(model, data, jacp, jacr, point, body_id):
+                jacp[:] = np.asarray([[1.0], [0.0], [0.0]])
+
+            @staticmethod
+            def mj_jacBody(model, data, jacp, jacr, body_id):
+                jacp[:] = np.asarray([[2.0], [0.0], [0.0]])
+                jacr[:] = np.asarray([[0.0], [0.0], [1.0]])
+
+        model = SimpleNamespace(nv=1)
+        data = SimpleNamespace(
+            xpos=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+            xmat=np.asarray([np.eye(3), np.eye(3)]),
+        )
+        contact = SimpleNamespace(
+            pos=np.asarray([0.0, 1.0, 0.0]), frame=np.eye(3)
+        )
+        result = EVALUATOR.contact_point_velocity_diagnostics(
+            Mujoco, model, data, contact, 1, [2.0], [3.0]
+        )
+        self.assertLess(result["pre"]["rigid_vs_jacobian_max_abs_error"], 1e-15)
+        self.assertLess(result["post"]["rigid_vs_jacobian_max_abs_error"], 1e-15)
+        np.testing.assert_allclose(result["body_local_material_point"], [0.0, 1.0, 0.0])
+        self.assertEqual(result["extra_mj_step_calls"], 0)
+        self.assertEqual(result["extra_mj_forward_calls"], 0)
+
     def test_physical_projection_is_additive_and_uses_scratch_target(self):
         class Mujoco:
             @staticmethod

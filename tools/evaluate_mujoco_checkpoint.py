@@ -735,6 +735,18 @@ def build_joint_limit_probe_mapping(
                 f"expected one compiled body named {name!r}, found {len(matches)}"
             )
         body_probes.append({"body_name": name, "body_id": matches[0]})
+    physical_probe_bodies = []
+    if enable_contact_mapping:
+        for name in ("limb/11", "limb/12"):
+            matches = [
+                index for index, candidate in enumerate(body_names)
+                if candidate == name
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one compiled body named {name!r}, found {len(matches)}"
+                )
+            physical_probe_bodies.append({"body_name": name, "body_id": matches[0]})
     floor_geom_ids = [
         index for index, name in enumerate(geom_names) if name == "floor/0"
     ]
@@ -751,6 +763,7 @@ def build_joint_limit_probe_mapping(
         "body_names": body_names,
         "geom_names": geom_names,
         "contact_probe_bodies": body_probes,
+        "physical_probe_bodies": physical_probe_bodies,
         "floor_geom_id": floor_geom_ids[0] if floor_geom_ids else None,
         "floor_geom_name": "floor/0" if floor_geom_ids else None,
         "root_free_joint": trajectory_metadata["root_free_joint"],
@@ -907,6 +920,88 @@ def contact_frame_validation(frame_raw: Any) -> dict[str, Any]:
         "orthonormality_max_abs_error": float(np.max(np.abs(identity_error))),
         "determinant": float(np.linalg.det(frame)),
         "right_handed_determinant_error": float(abs(np.linalg.det(frame) - 1.0)),
+    }
+
+
+def live_body_state_from_jacobian(
+    sim: Any, bodies: Sequence[dict[str, Any]], qvel: Any, tracker: FiniteTracker
+) -> dict[str, dict[str, Any]]:
+    """Read synchronized live kinematics; no step or forward call."""
+    import numpy as np
+
+    mujoco, model, data = _native_model_data(sim)
+    velocity = np.asarray(qvel, dtype=np.float64)
+    result = {}
+    for item in bodies:
+        body_id = int(item["body_id"])
+        jacp = np.zeros((3, int(model.nv)), dtype=np.float64)
+        jacr = np.zeros((3, int(model.nv)), dtype=np.float64)
+        mujoco.mj_jacBody(model, data, jacp, jacr, body_id)
+        result[item["body_name"]] = {
+            "body_id": body_id,
+            "xpos_world": tracker.vector(data.xpos[body_id]),
+            "xquat_wxyz": tracker.vector(data.xquat[body_id]),
+            "linear_velocity_world_at_body_origin": tracker.vector(jacp @ velocity),
+            "angular_velocity_world": tracker.vector(jacr @ velocity),
+            "velocity_source": "mj_jacBody @ qvel on live synchronized kinematics",
+        }
+    return result
+
+
+def contact_point_velocity_diagnostics(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    contact: Any,
+    body_id: int,
+    pre_qvel: Any,
+    post_qvel: Any,
+) -> dict[str, Any]:
+    """Two-path velocity closure at the exact impact material point."""
+    import numpy as np
+
+    nv = int(model.nv)
+    point = np.asarray(contact.pos, dtype=np.float64)
+    frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+    pre_qvel = np.asarray(pre_qvel, dtype=np.float64)
+    post_qvel = np.asarray(post_qvel, dtype=np.float64)
+    point_jacp = np.zeros((3, nv), dtype=np.float64)
+    point_jacr = np.zeros((3, nv), dtype=np.float64)
+    body_jacp = np.zeros((3, nv), dtype=np.float64)
+    body_jacr = np.zeros((3, nv), dtype=np.float64)
+    mujoco.mj_jac(model, data, point_jacp, point_jacr, point, int(body_id))
+    mujoco.mj_jacBody(model, data, body_jacp, body_jacr, int(body_id))
+    body_origin = np.asarray(data.xpos[int(body_id)], dtype=np.float64)
+    rotation = np.asarray(data.xmat[int(body_id)], dtype=np.float64).reshape(3, 3)
+    local_point = rotation.T @ (point - body_origin)
+
+    def velocity(qvel: Any) -> dict[str, Any]:
+        jacobian_value = point_jacp @ qvel
+        linear_origin = body_jacp @ qvel
+        angular = body_jacr @ qvel
+        rigid_value = linear_origin + np.cross(angular, point - body_origin)
+        tangential = frame[1:3] @ jacobian_value
+        return {
+            "point_velocity_world_from_jacobian": jacobian_value.tolist(),
+            "point_velocity_world_from_rigid_body": rigid_value.tolist(),
+            "rigid_vs_jacobian_max_abs_error": float(
+                np.max(np.abs(rigid_value - jacobian_value))
+            ),
+            "tangential_velocity_contact_frame": tangential.tolist(),
+            "tangential_speed": float(np.linalg.norm(tangential)),
+            "body_origin_linear_velocity_world": linear_origin.tolist(),
+            "body_angular_velocity_world": angular.tolist(),
+        }
+
+    return {
+        "body_id": int(body_id),
+        "contact_point_world": point.tolist(),
+        "body_local_material_point": local_point.tolist(),
+        "pre": velocity(pre_qvel),
+        "post": velocity(post_qvel),
+        "geometry_phase": "formal post-mj_step contact configuration used by the solver; pre/post differ only by qvel",
+        "extra_mj_step_calls": 0,
+        "extra_mj_forward_calls": 0,
     }
 
 
@@ -1183,6 +1278,7 @@ def capture_contact_response(
     mapping: dict[str, Any],
     tracker: FiniteTracker,
     record_physical_projection: bool = False,
+    pre_qvel: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """Read mjContact, mj_contactForce and each contact's EFC contribution."""
     import numpy as np
@@ -1271,6 +1367,18 @@ def capture_contact_response(
                 mujoco, raw_model, raw_data, contact, wrench,
                 np.asarray(generalized, dtype=np.float64), body1, body2, selected,
             )
+            if pre_qvel is None:
+                raise RuntimeError("physical projection requires pre-step qvel")
+            robot_body = body2 if body1 == 0 else body1
+            contact_record["point_velocity"] = contact_point_velocity_diagnostics(
+                mujoco,
+                raw_model,
+                raw_data,
+                contact,
+                robot_body,
+                pre_qvel,
+                raw_data.qvel,
+            )
         contacts.append(contact_record)
     return contacts, total_selected
 
@@ -1330,6 +1438,7 @@ class JointLimitSubstepRecorder:
 
     def capture_pre_step(self) -> dict[str, Any]:
         data = self.sim.data
+        physical_probe_bodies = self.mapping.get("physical_probe_bodies", [])
         return {
             "simulation_time": self.tracker.scalar(data.time),
             "root": self._state(),
@@ -1349,6 +1458,20 @@ class JointLimitSubstepRecorder:
                 )
                 if self.body_snapshot_data is not None
                 else {}
+            ),
+            "full_qpos": (
+                self.tracker.vector(data.qpos)
+                if self.record_physical_projection else None
+            ),
+            "full_qvel": (
+                self.tracker.vector(data.qvel)
+                if self.record_physical_projection else None
+            ),
+            "physical_probe_bodies": (
+                live_body_state_from_jacobian(
+                    self.sim, physical_probe_bodies, data.qvel, self.tracker
+                )
+                if self.record_physical_projection else {}
             ),
         }
 
@@ -1390,6 +1513,7 @@ class JointLimitSubstepRecorder:
                 self.mapping,
                 self.tracker,
                 record_physical_projection=self.record_physical_projection,
+                pre_qvel=pre["full_qvel"],
             )
             floor_geom_id = self.mapping["floor_geom_id"]
             limb_floor_contact = any(
@@ -1478,6 +1602,35 @@ class JointLimitSubstepRecorder:
                 )
                 if self.body_snapshot_data is not None
                 else {}
+            ),
+            "pre_step_full_qpos": pre["full_qpos"],
+            "pre_step_full_qvel": pre["full_qvel"],
+            "post_step_full_qpos": (
+                self.tracker.vector(data.qpos)
+                if self.record_physical_projection else None
+            ),
+            "post_step_full_qvel": (
+                self.tracker.vector(data.qvel)
+                if self.record_physical_projection else None
+            ),
+            "pre_step_physical_probe_bodies": pre["physical_probe_bodies"],
+            "post_step_physical_probe_bodies": (
+                live_body_state_from_jacobian(
+                    self.sim,
+                    self.mapping.get("physical_probe_bodies", []),
+                    data.qvel,
+                    self.tracker,
+                )
+                if self.record_physical_projection else {}
+            ),
+            "solver_configuration_physical_probe_bodies_pre_velocity": (
+                live_body_state_from_jacobian(
+                    self.sim,
+                    self.mapping.get("physical_probe_bodies", []),
+                    pre["full_qvel"],
+                    self.tracker,
+                )
+                if self.record_physical_projection else {}
             ),
             "joints": joint_records, "nefc": nefc, "ncon": int(data.ncon),
             "contacts": contacts, "contains_limb_0_floor_0_contact": limb_floor_contact,
@@ -1769,6 +1922,19 @@ def build_physical_contact_projection_outputs(
             "physics_substep_in_control": record["physics_substep_in_control"],
             "global_physics_step": record["global_physics_step"],
             "simulation_time": record["simulation_time"],
+            "pre_step_full_qpos": record.get("pre_step_full_qpos"),
+            "pre_step_full_qvel": record.get("pre_step_full_qvel"),
+            "post_step_full_qpos": record.get("post_step_full_qpos"),
+            "post_step_full_qvel": record.get("post_step_full_qvel"),
+            "pre_step_physical_probe_bodies": record.get(
+                "pre_step_physical_probe_bodies", {}
+            ),
+            "post_step_physical_probe_bodies": record.get(
+                "post_step_physical_probe_bodies", {}
+            ),
+            "solver_configuration_physical_probe_bodies_pre_velocity": record.get(
+                "solver_configuration_physical_probe_bodies_pre_velocity", {}
+            ),
             "contacts": projected_contacts,
         })
         for contact in projected_contacts:
