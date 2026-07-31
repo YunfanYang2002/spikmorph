@@ -30,6 +30,14 @@ CONDITIONS = (
     ("condition_distal_mu_1p4", 1.4),
 )
 SELECTED = (("limb/11", "limby/11"), ("limb/12", "limby/12"))
+MJ_MIN_MU = 1.0e-5
+MJ_MIN_MU_SOURCE = "MuJoCo mjMINMU"
+MINIMUM_FRICTION_FORCE_TOLERANCE_FACTOR = 1.05
+MINIMUM_FRICTION_GENERALIZED_TOLERANCE_FACTOR = 2.0
+VALID_RUNTIME_SELECTIONS = {
+    "USES_EXPLICIT_PAIR",
+    "USES_EXPLICIT_PAIR_CLAMPED_TO_MJMINMU",
+}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -234,10 +242,15 @@ def max_abs_difference(left: Any, right: Any) -> float:
     return float(np.max(np.abs(np.asarray(left, dtype=float) - np.asarray(right, dtype=float))))
 
 
+def runtime_expected_mu(target_mu: float) -> float:
+    return max(float(target_mu), MJ_MIN_MU)
+
+
 def validate_condition_gates(
     manifest: dict[str, Any], baseline: dict[str, Any]
 ) -> dict[str, Any]:
     mu = float(manifest["mu"])
+    effective_mu = runtime_expected_mu(mu)
     injection = manifest.get("final_xml_injection") or {}
     calls = injection.get("calls", [])
     dom_valid = bool(calls) and all(
@@ -261,39 +274,85 @@ def validate_condition_gates(
             selected[geom] = matches[0] if len(matches) == 1 else None
         limb0_matches = [contact for contact in contacts if pair_matches(contact, "limb/0")]
         limb0 = limb0_matches[0] if len(limb0_matches) == 1 else None
-        runtime_valid = all(
+        runtime_common_valid = all(
             contact is not None
             and int(contact["dim"]) == int(baseline["dim"])
-            and max_abs_difference(contact["friction"][:2], [mu, mu]) <= 1e-12
+            and max_abs_difference(contact["friction"][:2], [effective_mu, effective_mu]) <= 1e-12
             and max_abs_difference(contact["friction"][2:5], baseline["friction"][2:5]) <= 1e-12
             and max_abs_difference(contact["solref"], baseline["solref"]) <= 1e-12
             and max_abs_difference(contact["solimp"], baseline["solimp"]) <= 1e-12
             and abs(float(contact["includemargin"]) - float(baseline["includemargin"])) <= 1e-12
             for contact in selected.values()
         )
-        runtime_valid &= (
+        runtime_common_valid &= (
             limb0 is not None
             and max_abs_difference(limb0["friction"][:2], [0.7, 0.7]) <= 1e-12
         )
+        runtime_valid = runtime_common_valid
+    selection = "INSUFFICIENT_EVIDENCE"
+    runtime_values = [
+        contact["friction"][:2] for contact in selected.values()
+        if contact is not None
+    ]
+    if len(runtime_values) == len(SELECTED):
+        if all(max_abs_difference(value, [effective_mu, effective_mu]) <= 1e-12 for value in runtime_values):
+            selection = (
+                "USES_EXPLICIT_PAIR_CLAMPED_TO_MJMINMU"
+                if mu == 0.0 else "USES_EXPLICIT_PAIR"
+            )
+        elif mu != 0.7 and all(
+            max_abs_difference(value, [0.7, 0.7]) <= 1e-12
+            for value in runtime_values
+        ):
+            selection = "USES_GEOM_COMBINATION"
     mu_zero_response_valid = True
+    minimum_proxy_checks = {}
     if mu == 0.0:
+        for geom, joint in SELECTED:
+            contact = selected.get(geom)
+            projection = contact["physical_projection"] if contact else None
+            fn = abs(float(projection["Fn"])) if projection else 0.0
+            ft = abs(float(projection["friction_force_norm"])) if projection else None
+            normal_generalized = abs(float(projection["selected_joints"][joint]["normal"])) if projection else 0.0
+            friction_generalized = abs(float(projection["selected_joints"][joint]["friction"])) if projection else None
+            force_ratio = ft / fn if ft is not None and fn else None
+            generalized_ratio = (
+                friction_generalized / normal_generalized
+                if friction_generalized is not None and normal_generalized else None
+            )
+            minimum_proxy_checks[geom] = {
+                "runtime_effective_mu": effective_mu,
+                "Ft_over_Fn": force_ratio,
+                "force_ratio_limit": effective_mu * MINIMUM_FRICTION_FORCE_TOLERANCE_FACTOR,
+                "friction_over_normal_generalized": generalized_ratio,
+                "generalized_ratio_limit": effective_mu * MINIMUM_FRICTION_GENERALIZED_TOLERANCE_FACTOR,
+                "valid": (
+                    force_ratio is not None
+                    and generalized_ratio is not None
+                    and force_ratio <= effective_mu * MINIMUM_FRICTION_FORCE_TOLERANCE_FACTOR
+                    and generalized_ratio <= effective_mu * MINIMUM_FRICTION_GENERALIZED_TOLERANCE_FACTOR
+                ),
+            }
         mu_zero_response_valid = all(
-            contact is not None
-            and abs(float(contact["physical_projection"]["friction_force_norm"])) <= 1e-9
-            and abs(float(contact["physical_projection"]["selected_joints"][joint]["friction"])) <= 1e-9
-            for (geom, joint), contact in zip(SELECTED, selected.values())
+            item["valid"] for item in minimum_proxy_checks.values()
         )
         runtime_valid &= mu_zero_response_valid
     return {
         "condition": manifest["condition"],
         "target_mu": mu,
+        "compiled_pair_target_mu": mu,
+        "runtime_contact_effective_mu": effective_mu,
+        "runtime_mu_clamped_by_mjminmu": mu < MJ_MIN_MU,
+        "mjminmu": MJ_MIN_MU,
+        "mjminmu_source": MJ_MIN_MU_SOURCE,
+        "normal_only_counterfactual_type": (
+            "MUJOCO_MINIMUM_FRICTION_PROXY" if mu == 0.0 else None
+        ),
         "final_full_xml_pair_dom_valid": dom_valid,
         "final_compiled_pair_status": (
             "PRESENT_WITH_TARGET_VALUES" if compiled_valid else "MISSING_OR_WRONG"
         ),
-        "runtime_contact_pair_selection": (
-            "USES_EXPLICIT_PAIR" if runtime_valid else "PAIR_COMPILED_BUT_NOT_SELECTED"
-        ),
+        "runtime_contact_pair_selection": selection,
         "selected_runtime_contacts": selected,
         "limb_0_runtime_contact": limb0,
         "limb_0_production_contact_unchanged": (
@@ -301,8 +360,12 @@ def validate_condition_gates(
             and max_abs_difference(limb0["friction"][:2], [0.7, 0.7]) <= 1e-12
         ),
         "mu_zero_friction_response_valid": mu_zero_response_valid,
+        "minimum_friction_proxy_checks": minimum_proxy_checks,
         "wrapper_restored": wrapper_restored,
-        "condition_gate_valid": dom_valid and compiled_valid and runtime_valid and wrapper_restored,
+        "condition_gate_valid": (
+            dom_valid and compiled_valid and runtime_valid
+            and selection in VALID_RUNTIME_SELECTIONS and wrapper_restored
+        ),
     }
 
 
@@ -373,6 +436,7 @@ def analyze(
     condition_valid = True
     for name, condition in data.items():
         mu = float(condition["mu"])
+        effective_mu = runtime_expected_mu(mu)
         contacts = condition["global55"]["contacts"]
         selected_validation = {}
         selected_response = {}
@@ -385,7 +449,7 @@ def analyze(
             contact = matches[0]
             friction = [float(value) for value in contact["friction"]]
             valid = int(contact["dim"]) == 3 and max(
-                abs(friction[0] - mu), abs(friction[1] - mu)
+                abs(friction[0] - effective_mu), abs(friction[1] - effective_mu)
             ) <= 1e-12 and max(
                 abs(friction[index] - baseline["friction"][index])
                 for index in range(2, 5)
@@ -412,9 +476,11 @@ def analyze(
                 "Ft_norm": projection["friction_force_norm"],
                 "Ft_over_Fn": projection["friction_force_norm"] / projection["Fn"],
                 "Ft_over_mu_Fn": (
-                    projection["friction_force_norm"] / (mu * projection["Fn"])
-                    if mu > 0 else None
+                    projection["friction_force_norm"] / (effective_mu * projection["Fn"])
+                    if effective_mu > 0 else None
                 ),
+                "target_mu": mu,
+                "runtime_effective_mu": effective_mu,
                 "pre_tangential_speed": velocity["pre"]["tangential_speed"],
                 "post_tangential_speed": velocity["post"]["tangential_speed"],
                 "point_velocity": velocity,
@@ -428,14 +494,24 @@ def analyze(
         ) <= 1e-12
         condition_valid &= limb0_valid
         pair_validation[name] = {
-            "target_mu": mu, "selected": selected_validation,
+            "target_mu": mu,
+            "runtime_effective_mu": effective_mu,
+            "runtime_mu_clamped_by_mjminmu": mu < MJ_MIN_MU,
+            "normal_only_counterfactual_type": (
+                "MUJOCO_MINIMUM_FRICTION_PROXY" if mu == 0.0 else None
+            ),
+            "selected": selected_validation,
             "limb_0_floor": limb0[0] if len(limb0) == 1 else None,
             "limb_0_floor_source_friction_preserved": limb0_valid,
             "condition_valid": all(
                 value.get("valid", False) for value in selected_validation.values()
             ) and limb0_valid,
         }
-        responses[name] = {"mu": mu, "selected": selected_response}
+        responses[name] = {
+            "target_mu": mu,
+            "runtime_effective_mu": effective_mu,
+            "selected": selected_response,
+        }
 
     limb12 = {
         name: response["selected"].get("limb/12")
@@ -492,6 +568,9 @@ def analyze(
         "mu_response": responses,
         "point_velocity_mapping_valid": point_velocity_valid,
         "force_regime": {
+            "normal_only_counterfactual_type": "MUJOCO_MINIMUM_FRICTION_PROXY",
+            "mjminmu": MJ_MIN_MU,
+            "mjminmu_source": MJ_MIN_MU_SOURCE,
             "ratios": ratios,
             "limb12_post_slip_vs_mu": {
                 name: value["post_tangential_speed"] for name, value in limb12.items()
@@ -504,6 +583,8 @@ def analyze(
             "mujoco_global55_friction_force_regime": regime,
         },
         "cross_backend": {
+            "normal_only_counterfactual_type": "MUJOCO_MINIMUM_FRICTION_PROXY",
+            "mujoco_minimum_friction_proxy_effective_mu": MJ_MIN_MU,
             "isaac_reference": isaac,
             "mujoco_mu0_post_slip": mujoco_mu0,
             "mujoco_mu0p7_post_slip": mujoco_mu07,
@@ -602,7 +683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json(output_root / "runtime_pair_selection.json", {
         "conditions": condition_gates,
         "all_conditions_use_explicit_pair": all(
-            item["runtime_contact_pair_selection"] == "USES_EXPLICIT_PAIR"
+            item["runtime_contact_pair_selection"] in VALID_RUNTIME_SELECTIONS
             for item in condition_gates
         ),
     })
@@ -633,9 +714,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for item in condition_gates
         ),
         "runtime_pair_gates_valid": all(
-            item["runtime_contact_pair_selection"] == "USES_EXPLICIT_PAIR"
+            item["runtime_contact_pair_selection"] in VALID_RUNTIME_SELECTIONS
             for item in condition_gates
         ),
+        "mjminmu": MJ_MIN_MU,
+        "mjminmu_source": MJ_MIN_MU_SOURCE,
+        "normal_only_counterfactual_type": "MUJOCO_MINIMUM_FRICTION_PROXY",
         "loader_wrappers_restored": all(item["wrapper_restored"] for item in condition_gates),
     }
     validation["mujoco_distal_friction_bracket"] = (
@@ -653,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "MUJOCO_GLOBAL55_FRICTION_FORCE_REGIME": reports["force_regime"]["mujoco_global55_friction_force_regime"],
         "CROSS_BACKEND_FRICTION_DEMAND_MISMATCH": reports["cross_backend"]["cross_backend_friction_demand_mismatch"],
         "MUJOCO_DISTAL_FRICTION_BRACKET": validation["mujoco_distal_friction_bracket"],
+        "NORMAL_ONLY_COUNTERFACTUAL_TYPE": "MUJOCO_MINIMUM_FRICTION_PROXY",
     }, indent=2))
     return 0 if validation["mujoco_distal_friction_bracket"] == "VALIDATED" else 2
 
