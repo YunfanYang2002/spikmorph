@@ -1,8 +1,7 @@
-"""Run a four-condition, temporary-MJCF distal friction bracket.
+"""Run a four-condition final-task-XML distal friction bracket.
 
-This helper never edits the source XML.  It creates explicit contact-pair
-overrides under ./tmp, invokes the existing read-only MuJoCo evaluator, and
-reduces the four physical-contact artifacts into parity reports.
+This helper never edits the source XML.  A diagnostics-only loader wrapper
+injects explicit pairs after task XML assembly and immediately before compile.
 """
 
 from __future__ import annotations
@@ -164,11 +163,16 @@ def run_condition(
     walker = temporary_root / name / "walker"
     xml_path = walker / "xml" / f"{MORPHOLOGY}.xml"
     metadata_path = walker / "metadata" / f"{MORPHOLOGY}.json"
-    xml_manifest = write_temporary_xml(source_xml, xml_path, mu, baseline)
+    xml_path.parent.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(source_xml, xml_path)
     metadata_path.parent.mkdir(parents=True, exist_ok=False)
     shutil.copy2(metadata, metadata_path)
     condition_output = output_root / name
     condition_output.mkdir(parents=True, exist_ok=False)
+    pair_spec = temporary_root / name / "pair_spec.json"
+    write_json(pair_spec, baseline)
+    injection_audit = condition_output / "final_xml_injection_audit.json"
+    final_xml = condition_output / "final_task_xml_after_injection.xml"
     evaluator_args = [
         "tools/evaluate_mujoco_checkpoint.py",
         "--checkpoint", str(checkpoint),
@@ -185,15 +189,17 @@ def run_condition(
         "--joint-limit-probe-names", "limby/12", "limby/11",
         "--record-physical-contact-projection",
     ]
-    shim = (
-        "import numpy as np; "
-        "np.bool=bool if 'bool' not in np.__dict__ else np.bool; "
-        "import runpy,sys; "
-        f"sys.argv={evaluator_args!r}; "
-        "runpy.run_path('tools/evaluate_mujoco_checkpoint.py',run_name='__main__')"
-    )
     completed = subprocess.run(
-        [sys.executable, "-c", shim],
+        [
+            sys.executable,
+            "tools/evaluate_mujoco_checkpoint_with_final_pairs.py",
+            "--target-mu", str(mu),
+            "--pair-spec", str(pair_spec),
+            "--audit-output", str(injection_audit),
+            "--final-xml-output", str(final_xml),
+            "--",
+            *evaluator_args[1:],
+        ],
         cwd=REPO_ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -203,11 +209,20 @@ def run_condition(
     (condition_output / "evaluator.log").write_text(
         completed.stdout, encoding="utf-8"
     )
+    injection = (
+        json.loads(injection_audit.read_text(encoding="utf-8"))
+        if injection_audit.is_file() else None
+    )
     return {
-        **xml_manifest,
         "condition": name,
+        "mu": float(mu),
         "temporary_xml": str(xml_path),
         "temporary_xml_sha256": sha256(xml_path),
+        "source_morphology_copy_unmodified": sha256(xml_path) == sha256(source_xml),
+        "pair_spec": str(pair_spec),
+        "final_xml_injection_audit": str(injection_audit),
+        "final_xml_after_injection": str(final_xml),
+        "final_xml_injection": injection,
         "output_dir": str(condition_output),
         "return_code": int(completed.returncode),
     }
@@ -217,6 +232,78 @@ def max_abs_difference(left: Any, right: Any) -> float:
     import numpy as np
 
     return float(np.max(np.abs(np.asarray(left, dtype=float) - np.asarray(right, dtype=float))))
+
+
+def validate_condition_gates(
+    manifest: dict[str, Any], baseline: dict[str, Any]
+) -> dict[str, Any]:
+    mu = float(manifest["mu"])
+    injection = manifest.get("final_xml_injection") or {}
+    calls = injection.get("calls", [])
+    dom_valid = bool(calls) and all(
+        call["dom"]["final_full_xml_pair_dom_valid"] for call in calls
+    )
+    compiled_valid = bool(calls) and all(
+        call["final_compiled_pair_status"] == "PRESENT_WITH_TARGET_VALUES"
+        for call in calls
+    )
+    wrapper_restored = injection.get("wrapper_restored") is True
+    records_path = Path(manifest["output_dir"]) / "physical_contact_substeps.jsonl"
+    selected = {}
+    limb0 = None
+    runtime_valid = False
+    if records_path.is_file():
+        records = load_jsonl(records_path)
+        contact_record = global_record(records, 55)
+        contacts = contact_record["contacts"]
+        for geom, _ in SELECTED:
+            matches = [contact for contact in contacts if pair_matches(contact, geom)]
+            selected[geom] = matches[0] if len(matches) == 1 else None
+        limb0_matches = [contact for contact in contacts if pair_matches(contact, "limb/0")]
+        limb0 = limb0_matches[0] if len(limb0_matches) == 1 else None
+        runtime_valid = all(
+            contact is not None
+            and int(contact["dim"]) == int(baseline["dim"])
+            and max_abs_difference(contact["friction"][:2], [mu, mu]) <= 1e-12
+            and max_abs_difference(contact["friction"][2:5], baseline["friction"][2:5]) <= 1e-12
+            and max_abs_difference(contact["solref"], baseline["solref"]) <= 1e-12
+            and max_abs_difference(contact["solimp"], baseline["solimp"]) <= 1e-12
+            and abs(float(contact["includemargin"]) - float(baseline["includemargin"])) <= 1e-12
+            for contact in selected.values()
+        )
+        runtime_valid &= (
+            limb0 is not None
+            and max_abs_difference(limb0["friction"][:2], [0.7, 0.7]) <= 1e-12
+        )
+    mu_zero_response_valid = True
+    if mu == 0.0:
+        mu_zero_response_valid = all(
+            contact is not None
+            and abs(float(contact["physical_projection"]["friction_force_norm"])) <= 1e-9
+            and abs(float(contact["physical_projection"]["selected_joints"][joint]["friction"])) <= 1e-9
+            for (geom, joint), contact in zip(SELECTED, selected.values())
+        )
+        runtime_valid &= mu_zero_response_valid
+    return {
+        "condition": manifest["condition"],
+        "target_mu": mu,
+        "final_full_xml_pair_dom_valid": dom_valid,
+        "final_compiled_pair_status": (
+            "PRESENT_WITH_TARGET_VALUES" if compiled_valid else "MISSING_OR_WRONG"
+        ),
+        "runtime_contact_pair_selection": (
+            "USES_EXPLICIT_PAIR" if runtime_valid else "PAIR_COMPILED_BUT_NOT_SELECTED"
+        ),
+        "selected_runtime_contacts": selected,
+        "limb_0_runtime_contact": limb0,
+        "limb_0_production_contact_unchanged": (
+            limb0 is not None
+            and max_abs_difference(limb0["friction"][:2], [0.7, 0.7]) <= 1e-12
+        ),
+        "mu_zero_friction_response_valid": mu_zero_response_valid,
+        "wrapper_restored": wrapper_restored,
+        "condition_gate_valid": dom_valid and compiled_valid and runtime_valid and wrapper_restored,
+    }
 
 
 def flatten_body_state(state: dict[str, Any]) -> list[float]:
@@ -470,6 +557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     source_hash_before = sha256(source_xml)
     baseline = baseline_pair_parameters(existing_oracle)
     manifests = []
+    condition_gates = []
     for name, mu in CONDITIONS:
         manifest = run_condition(
             name, mu, source_xml, metadata, checkpoint, output_root,
@@ -479,6 +567,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if manifest["return_code"] != 0:
             write_json(output_root / "temporary_xml_manifest.json", manifests)
             return manifest["return_code"]
+        gate = validate_condition_gates(manifest, baseline)
+        condition_gates.append(gate)
+        write_json(Path(manifest["output_dir"]) / "condition_gate.json", gate)
+        if not gate["condition_gate_valid"]:
+            write_json(output_root / "final_xml_injection_audit.json", {
+                "conditions": [item.get("final_xml_injection") for item in manifests]
+            })
+            write_json(output_root / "compiled_pair_validation.json", {
+                "conditions": condition_gates
+            })
+            write_json(output_root / "runtime_pair_selection.json", {
+                "conditions": condition_gates
+            })
+            return 3
     reports = analyze(manifests, baseline)
     write_json(output_root / "temporary_xml_manifest.json", {
         "source_xml": str(source_xml),
@@ -486,6 +588,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "source_xml_sha256_after": sha256(source_xml),
         "baseline_runtime_pair_parameters": baseline,
         "conditions": manifests,
+    })
+    write_json(output_root / "final_xml_injection_audit.json", {
+        "conditions": [item["final_xml_injection"] for item in manifests]
+    })
+    write_json(output_root / "compiled_pair_validation.json", {
+        "conditions": condition_gates,
+        "all_conditions_present_with_target_values": all(
+            item["final_compiled_pair_status"] == "PRESENT_WITH_TARGET_VALUES"
+            for item in condition_gates
+        ),
+    })
+    write_json(output_root / "runtime_pair_selection.json", {
+        "conditions": condition_gates,
+        "all_conditions_use_explicit_pair": all(
+            item["runtime_contact_pair_selection"] == "USES_EXPLICIT_PAIR"
+            for item in condition_gates
+        ),
     })
     for filename, key in (
         ("runtime_pair_friction_validation.json", "runtime_pair_validation"),
@@ -506,14 +625,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         "condition_return_codes": {
             item["condition"]: item["return_code"] for item in manifests
         },
+        "final_full_xml_pair_dom_valid": all(
+            item["final_full_xml_pair_dom_valid"] for item in condition_gates
+        ),
+        "compiled_pair_gates_valid": all(
+            item["final_compiled_pair_status"] == "PRESENT_WITH_TARGET_VALUES"
+            for item in condition_gates
+        ),
+        "runtime_pair_gates_valid": all(
+            item["runtime_contact_pair_selection"] == "USES_EXPLICIT_PAIR"
+            for item in condition_gates
+        ),
+        "loader_wrappers_restored": all(item["wrapper_restored"] for item in condition_gates),
     }
+    validation["mujoco_distal_friction_bracket"] = (
+        "VALIDATED"
+        if all(
+            value is True
+            for key, value in validation.items()
+            if key not in ("condition_return_codes",)
+        )
+        else "INSUFFICIENT_EVIDENCE"
+    )
     write_json(output_root / "validation.json", validation)
     print(json.dumps({
         "output_dir": str(output_root),
         "MUJOCO_GLOBAL55_FRICTION_FORCE_REGIME": reports["force_regime"]["mujoco_global55_friction_force_regime"],
         "CROSS_BACKEND_FRICTION_DEMAND_MISMATCH": reports["cross_backend"]["cross_backend_friction_demand_mismatch"],
+        "MUJOCO_DISTAL_FRICTION_BRACKET": validation["mujoco_distal_friction_bracket"],
     }, indent=2))
-    return 0 if all(validation.values()) else 2
+    return 0 if validation["mujoco_distal_friction_bracket"] == "VALIDATED" else 2
 
 
 if __name__ == "__main__":

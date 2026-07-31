@@ -9,11 +9,11 @@ existing_oracle="$repo/output/diagnostics/mujoco_physical_contact_projection_202
 cd "$repo"
 
 stamp="$(date +%Y%m%d_%H%M%S)"
-out="$repo/output/diagnostics/mujoco_distal_friction_mu_bracket_${stamp}"
-temporary_root="$repo/tmp/mujoco_distal_friction_mu_bracket_${stamp}"
-zip_path="$repo/tmp/mujoco_distal_friction_mu_bracket_${stamp}.zip"
-staging_log="$repo/tmp/mujoco_distal_friction_mu_bracket_${stamp}.run.log"
-identity_before="$repo/tmp/mujoco_distal_friction_mu_bracket_${stamp}.identity_before.txt"
+out="$repo/output/diagnostics/mujoco_distal_friction_mu_bracket_final_xml_${stamp}"
+temporary_root="$repo/tmp/mujoco_distal_friction_mu_bracket_final_xml_${stamp}"
+zip_path="$repo/tmp/mujoco_distal_friction_mu_bracket_final_xml_${stamp}.zip"
+staging_log="$repo/tmp/mujoco_distal_friction_mu_bracket_final_xml_${stamp}.run.log"
+identity_before="$repo/tmp/mujoco_distal_friction_mu_bracket_final_xml_${stamp}.identity_before.txt"
 
 mkdir -p "$repo/tmp"
 

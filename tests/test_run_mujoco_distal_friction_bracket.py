@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -73,6 +74,46 @@ class MujocoDistalFrictionBracketTests(unittest.TestCase):
         contact = {"geom1_name": "floor/0", "geom2_name": "limb/12"}
         self.assertTrue(BRACKET.pair_matches(contact, "limb/12"))
         self.assertFalse(BRACKET.pair_matches(contact, "limb/0"))
+
+    def test_runtime_gate_requires_explicit_selected_and_preserves_limb0(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            contacts = []
+            for geom, joint in (("limb/11", "limby/11"), ("limb/12", "limby/12")):
+                contacts.append({
+                    "geom1_name": geom, "geom2_name": "floor/0", "dim": 3,
+                    "friction": [0.0, 0.0, 0.1, 0.01, 0.02],
+                    "solref": [0.02, 1.0],
+                    "solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+                    "includemargin": 0.0,
+                    "physical_projection": {
+                        "friction_force_norm": 0.0,
+                        "selected_joints": {joint: {"friction": 0.0}},
+                    },
+                })
+            contacts.append({
+                "geom1_name": "limb/0", "geom2_name": "floor/0", "dim": 3,
+                "friction": [0.7, 0.7, 0.1, 0.01, 0.02],
+            })
+            (output / "physical_contact_substeps.jsonl").write_text(
+                json.dumps({"global_physics_step": 55, "contacts": contacts}) + "\n",
+                encoding="utf-8",
+            )
+            manifest = {
+                "condition": "condition_distal_mu_0", "mu": 0.0,
+                "output_dir": str(output),
+                "final_xml_injection": {
+                    "wrapper_restored": True,
+                    "calls": [{
+                        "dom": {"final_full_xml_pair_dom_valid": True},
+                        "final_compiled_pair_status": "PRESENT_WITH_TARGET_VALUES",
+                    }],
+                },
+            }
+            gate = BRACKET.validate_condition_gates(manifest, self.baseline())
+            self.assertTrue(gate["condition_gate_valid"])
+            self.assertEqual(gate["runtime_contact_pair_selection"], "USES_EXPLICIT_PAIR")
+            self.assertTrue(gate["limb_0_production_contact_unchanged"])
 
 
 if __name__ == "__main__":
