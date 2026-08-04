@@ -1,0 +1,4 @@
+TOPLEVEL=/home/yyf/Workspace/Code/spikmorph
+HEAD=b842c4eb66c2f48c8e7bb7a3b621bad6a438a672
+BRANCH=main
+WALKER_DIR_FROM_FROZEN_TRAINING_MANIFEST=/home/yyf/Workspace/Code/metamorph-isaac/output/unimals_100/train

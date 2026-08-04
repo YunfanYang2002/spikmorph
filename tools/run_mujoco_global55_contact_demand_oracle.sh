@@ -5,19 +5,20 @@ python_bin="/home/yyf/miniconda3/envs/spikmorph/bin/python"
 batch="$repo/output/diagnostics/mujoco_control_51k_20260727_091638"
 job="$batch/jobs/job_000_seed1409_lr0p00015"
 checkpoint="$job/Unimal-v0.pt"
-existing_oracle="$repo/output/diagnostics/mujoco_physical_contact_projection_20260729_195100"
+existing_oracle="$repo/output/diagnostics/mujoco_global55_contact_demand_oracle_20260801_184228"
 morphology="floor-1409-0-3-01-15-56-55"
 
 cd "$repo"
 
 walker_dir="$($python_bin -c "import json,pathlib; p=pathlib.Path('$batch/manifest.json'); print(json.loads(p.read_text(encoding='utf-8'))['source_audit']['walker_dir'])" 2>/dev/null)"
 stamp="$(date +%Y%m%d_%H%M%S)"
-out="$repo/output/diagnostics/mujoco_global55_contact_demand_oracle_${stamp}"
-zip_path="$repo/tmp/mujoco_global55_contact_demand_oracle_${stamp}.zip"
-staging_log="$repo/tmp/mujoco_global55_contact_demand_oracle_${stamp}.run.log"
-identity_before="$repo/tmp/mujoco_global55_contact_demand_oracle_${stamp}.identity_before.txt"
-status_before="$repo/tmp/mujoco_global55_contact_demand_oracle_${stamp}.status_before.txt"
-hashes_before="$repo/tmp/mujoco_global55_contact_demand_oracle_${stamp}.hashes_before.sha256"
+prefix="mujoco_global55_contact_demand_oracle_corrected_${stamp}"
+out="$repo/output/diagnostics/$prefix"
+zip_path="$repo/tmp/${prefix}.zip"
+staging_log="$repo/tmp/${prefix}.run.log"
+identity_before="$repo/tmp/${prefix}.identity_before.txt"
+status_before="$repo/tmp/${prefix}.status_before.txt"
+hashes_before="$repo/tmp/${prefix}.hashes_before.sha256"
 xml="$walker_dir/xml/${morphology}.xml"
 metadata="$walker_dir/metadata/${morphology}.json"
 
@@ -55,8 +56,4 @@ sha256sum "$xml" "$metadata" "$checkpoint" \
 
 "$python_bin" -c "import json,pathlib; p=pathlib.Path('$out/validation.json'); v=json.loads(p.read_text(encoding='utf-8')) if p.is_file() else {}; v['formal_probe_return_code']=int('$probe_rc'); p.write_text(json.dumps(v,indent=2,sort_keys=True)+'\n',encoding='utf-8')"
 
-"$python_bin" -c "from pathlib import Path; import zipfile; out=Path('$out').resolve(); z=Path('$zip_path').resolve(); z.parent.mkdir(parents=True,exist_ok=True); a=zipfile.ZipFile(z,'x',zipfile.ZIP_DEFLATED); [a.write(p,p.relative_to(out.parent)) for p in sorted(out.rglob('*')) if p.is_file()]; a.close()"
-
-"$python_bin" -c "from pathlib import Path; import hashlib,zipfile; z=Path('$zip_path').resolve(); a=zipfile.ZipFile(z); bad=a.testzip(); names=a.namelist(); a.close(); print('ZIP_VERIFY=' + ('PASS' if bad is None else 'FAIL:' + str(bad))); print('ZIP_FILE_COUNT=' + str(len(names))); print('ZIP_SHA256=' + hashlib.sha256(z.read_bytes()).hexdigest())"
-
-printf 'UPLOAD_THIS_ZIP=%s\n' "$zip_path"
+"$python_bin" -c "from pathlib import Path; from tools.analyze_mujoco_global55_contact_demand import package_artifact; r=package_artifact(Path('$out'), Path('$zip_path')); print('ZIP_VERIFY=' + str(r['ZIP_VERIFY'])); print('ZIP_SHA256=' + str(r['ZIP_SHA256'])); print('UPLOAD_THIS_ZIP=' + str(r['UPLOAD_THIS_ZIP']))"

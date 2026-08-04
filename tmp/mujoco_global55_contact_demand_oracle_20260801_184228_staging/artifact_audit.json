@@ -1,0 +1,632 @@
+{
+  "schema_version": "spikmorph-mujoco-global55-artifact-audit-v1",
+  "artifact_source_dir": "D:\\CODES\\master\\spikmorph\\output\\diagnostics\\mujoco_global55_contact_demand_oracle_20260801_184228",
+  "repository_gate": {
+    "requested_top_level": "/home/yyf/Workspace/Code/spikmorph",
+    "current_checkout_top_level": "D:/CODES/master/spikmorph",
+    "source_metadata_uses_requested_linux_checkout": true,
+    "git_head": "b842c4eb66c2f48c8e7bb7a3b621bad6a438a672",
+    "git_status_short": [
+      "?? output/diagnostics/mujoco_global55_contact_demand_oracle_20260801_184228/"
+    ]
+  },
+  "identity": {
+    "expected": {
+      "morphology": "floor-1409-0-3-01-15-56-55",
+      "source_xml_sha256": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0",
+      "global_physics_step": 55
+    },
+    "observed": {
+      "morphology": "floor-1409-0-3-01-15-56-55",
+      "source_xml_sha256": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0",
+      "global_physics_step": 55,
+      "mujoco_version": "3.8.1"
+    },
+    "match": true
+  },
+  "required_file_resolution": {
+    "metadata.json": "metadata.json",
+    "validation.json": "validation.json",
+    "comparison.json": "comparison.json",
+    "global55_pre_state.json": "global55_pre_state.json",
+    "global55_post_state.json": "global55_post_state.json",
+    "global55_contacts.json": "global55_contacts.json",
+    "global55_mass_matrix.json": "global55_mass_matrix.json",
+    "global55_physical_jacobians.json": "global55_physical_jacobians.json",
+    "global55_delassus_matrix.json": "global55_delassus_matrix.json",
+    "global55_effective_mass_budget.json": "global55_effective_mass_budget.json",
+    "global55_solver_rows.json": "global55_solver_rows.json",
+    "global55_post_solve_closure.json": "global55_effective_mass_budget.json#/post_solve_closure",
+    "global55_regression.json": "global55_regression.json",
+    "isaac_fixed_reference.json": "isaac_fixed_reference.json"
+  },
+  "missing_files": [],
+  "json_validation": {
+    "comparison.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_contacts.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_delassus_matrix.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_effective_mass_budget.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_mass_matrix.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_physical_jacobians.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_post_state.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_pre_state.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_regression.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "global55_solver_rows.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "isaac_fixed_reference.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "metadata.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    },
+    "validation.json": {
+      "parse": "PASS",
+      "all_numeric_values_finite": true
+    }
+  },
+  "all_required_json_parse": true,
+  "all_json_numeric_values_finite": true,
+  "state": {
+    "pre_tangential_speed": 0.5561601192334747,
+    "post_tangential_speed": 0.1713507113360872,
+    "contact_point": [
+      -0.3764172718907103,
+      0.4933041473040569,
+      0.9983369391544866
+    ],
+    "normal_direction": [
+      -0.0,
+      -0.0,
+      1.0
+    ],
+    "tangent_directions": [
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        -1.0,
+        0.0,
+        -0.0
+      ]
+    ],
+    "active_contact_set": [
+      {
+        "contact_index": 0,
+        "robot_body_name": "limb/0",
+        "ground_body_name": "world",
+        "robot_geom": "limb/0",
+        "ground_geom": "floor/0"
+      },
+      {
+        "contact_index": 1,
+        "robot_body_name": "limb/12",
+        "ground_body_name": "world",
+        "robot_geom": "limb/12",
+        "ground_geom": "floor/0"
+      },
+      {
+        "contact_index": 2,
+        "robot_body_name": "limb/11",
+        "ground_body_name": "world",
+        "robot_geom": "limb/11",
+        "ground_geom": "floor/0"
+      }
+    ],
+    "contact_body_names": [
+      [
+        "limb/0",
+        "world"
+      ],
+      [
+        "limb/12",
+        "world"
+      ],
+      [
+        "limb/11",
+        "world"
+      ]
+    ]
+  },
+  "mass_and_jacobian": {
+    "generalized_mass_matrix_shape": [
+      19,
+      19
+    ],
+    "generalized_coordinate_order": null,
+    "generalized_coordinate_order_status": "NOT_DECLARED_IN_ARTIFACT",
+    "mass_matrix_symmetry_error": 0.0,
+    "mass_matrix_minimum_eigenvalue": 0.5644555253258744,
+    "mass_matrix_condition_number": 106.40904453861411,
+    "physical_jacobian_shape": [
+      9,
+      19
+    ],
+    "per_contact_physical_jacobian_shapes": [
+      [
+        3,
+        19
+      ],
+      [
+        3,
+        19
+      ],
+      [
+        3,
+        19
+      ]
+    ],
+    "jacobian_column_order": null,
+    "jacobian_column_order_status": "NOT_DECLARED_IN_ARTIFACT",
+    "point_convention": "mujoco.mj_jac at exact mjContact.pos on robot body relative to static world",
+    "LINK_COM_body_origin_convention": null,
+    "LINK_COM_body_origin_convention_status": "NOT_EXPLICITLY_DECLARED",
+    "point_velocity_mapping_valid": true
+  },
+  "delassus_decomposition": {
+    "W_phys_shape": [
+      9,
+      9
+    ],
+    "W_phys": [
+      [
+        0.11020731422532912,
+        3.286572789592443e-17,
+        -0.05820014768640137,
+        -0.0233005029084642,
+        -0.0011286867801120538,
+        -0.017837154432100325,
+        -0.023300502908464207,
+        0.001128686780112062,
+        -0.017837154432100336
+      ],
+      [
+        3.667841032018754e-17,
+        0.439340988233042,
+        1.1340020974039964e-18,
+        -0.010657707291104046,
+        0.0314188023500018,
+        -0.014762302772367104,
+        0.01065770729110403,
+        0.03141880235000176,
+        0.014762302772367073
+      ],
+      [
+        -0.05820014768640137,
+        -1.3420657466664668e-17,
+        0.46165471459178054,
+        0.01533538749600748,
+        -0.01363743312584352,
+        0.016872467518550902,
+        0.01533538749600748,
+        0.01363743312584352,
+        0.016872467518550954
+      ],
+      [
+        -0.02330050290846424,
+        -0.01065770729110403,
+        0.015335387496007456,
+        0.3757175633987276,
+        -0.0037074769509853837,
+        0.18757752859852503,
+        0.012915476117622114,
+        0.009774399535909707,
+        0.00022262210122186228
+      ],
+      [
+        -0.0011286867801120395,
+        0.03141880235000182,
+        -0.013637433125843566,
+        -0.003707476950985396,
+        0.3856158015338132,
+        -0.03380906231809608,
+        -0.009774399535909696,
+        0.01834891002572936,
+        0.02770765491433299
+      ],
+      [
+        -0.017837154432100353,
+        -0.014762302772367092,
+        0.016872467518550895,
+        0.18757752859852503,
+        -0.033809062318096106,
+        0.24171038332176806,
+        0.00022262210122185833,
+        -0.027707654914333035,
+        -0.0022084451719005943
+      ],
+      [
+        -0.02330050290846424,
+        0.010657707291104032,
+        0.015335387496007546,
+        0.012915476117622131,
+        -0.009774399535909715,
+        0.00022262210122185128,
+        0.3757175633987275,
+        0.003707476950985371,
+        0.18757752859852492
+      ],
+      [
+        0.0011286867801120544,
+        0.031418802350001794,
+        0.013637433125843559,
+        0.009774399535909703,
+        0.018348910025729376,
+        -0.027707654914333038,
+        0.00370747695098537,
+        0.385615801533813,
+        0.03380906231809607
+      ],
+      [
+        -0.017837154432100336,
+        0.014762302772367081,
+        0.016872467518550965,
+        0.0002226221012218598,
+        0.027707654914333003,
+        -0.002208445171900599,
+        0.18757752859852495,
+        0.0338090623180961,
+        0.24171038332176786
+      ]
+    ],
+    "W_nn_shape": [
+      3,
+      3
+    ],
+    "W_nn": [
+      [
+        0.11020731422532912,
+        -0.0233005029084642,
+        -0.023300502908464207
+      ],
+      [
+        -0.02330050290846424,
+        0.3757175633987276,
+        0.012915476117622114
+      ],
+      [
+        -0.02330050290846424,
+        0.012915476117622131,
+        0.3757175633987275
+      ]
+    ],
+    "W_tn_shape": [
+      6,
+      3
+    ],
+    "W_tn": [
+      [
+        3.667841032018754e-17,
+        -0.010657707291104046,
+        0.01065770729110403
+      ],
+      [
+        -0.05820014768640137,
+        0.01533538749600748,
+        0.01533538749600748
+      ],
+      [
+        -0.0011286867801120395,
+        -0.003707476950985396,
+        -0.009774399535909696
+      ],
+      [
+        -0.017837154432100353,
+        0.18757752859852503,
+        0.00022262210122185833
+      ],
+      [
+        0.0011286867801120544,
+        0.009774399535909703,
+        0.00370747695098537
+      ],
+      [
+        -0.017837154432100336,
+        0.0002226221012218598,
+        0.18757752859852495
+      ]
+    ],
+    "W_tt_shape": [
+      6,
+      6
+    ],
+    "W_tt": [
+      [
+        0.439340988233042,
+        1.1340020974039964e-18,
+        0.0314188023500018,
+        -0.014762302772367104,
+        0.03141880235000176,
+        0.014762302772367073
+      ],
+      [
+        -1.3420657466664668e-17,
+        0.46165471459178054,
+        -0.01363743312584352,
+        0.016872467518550902,
+        0.01363743312584352,
+        0.016872467518550954
+      ],
+      [
+        0.03141880235000182,
+        -0.013637433125843566,
+        0.3856158015338132,
+        -0.03380906231809608,
+        0.01834891002572936,
+        0.02770765491433299
+      ],
+      [
+        -0.014762302772367092,
+        0.016872467518550895,
+        -0.033809062318096106,
+        0.24171038332176806,
+        -0.027707654914333035,
+        -0.0022084451719005943
+      ],
+      [
+        0.031418802350001794,
+        0.013637433125843559,
+        0.018348910025729376,
+        -0.027707654914333038,
+        0.385615801533813,
+        0.03380906231809607
+      ],
+      [
+        0.014762302772367081,
+        0.016872467518550965,
+        0.027707654914333003,
+        -0.002208445171900599,
+        0.0338090623180961,
+        0.24171038332176786
+      ]
+    ],
+    "ranks": {
+      "W_phys": 9,
+      "W_nn": 3,
+      "W_tn": 3,
+      "W_tt": 6
+    },
+    "condition_numbers": {
+      "W_phys": 5.562903201322487,
+      "W_nn": 3.690086773605162,
+      "W_tt": 2.160529946203669
+    },
+    "symmetry_max_abs_error": 6.591949208711867e-17,
+    "minimum_eigenvalue": 0.09748329805614235,
+    "solve_residuals": {
+      "mass_linear_solve": {
+        "condition_number": 106.40904453861411,
+        "method": "numpy.linalg.solve",
+        "rank": 19,
+        "residual_l2": 1.6667069388053672e-15,
+        "residual_max_abs": 7.395138450644556e-16,
+        "shape": [
+          19,
+          19
+        ]
+      },
+      "global_sticking_solve": {
+        "condition_number": 2.160529946203671,
+        "method": "numpy.linalg.solve",
+        "rank": 6,
+        "residual_l2": 1.1530228181435186e-16,
+        "residual_max_abs": 1.1102230246251565e-16,
+        "shape": [
+          6,
+          6
+        ]
+      },
+      "limb12_uncoupled_sticking_solve": {
+        "condition_number": 1.6790135662382906,
+        "method": "numpy.linalg.solve",
+        "rank": 2,
+        "residual_l2": 0.0,
+        "residual_max_abs": 0.0,
+        "shape": [
+          2,
+          2
+        ]
+      }
+    }
+  },
+  "limb_12_budget": {
+    "directional_effective_mass": 4.24255881411363,
+    "uncoupled_sticking_demand": 2.367645508602578,
+    "normal_conditioned_sticking_demand": 2.540619084288334,
+    "actual_normal_impulse": 6.345240278967453,
+    "actual_friction_impulse": 3.3247363600666735,
+    "friction_cap": 4.441668195277217,
+    "normal_coupling_tangential_delta_v_norm": 1.1586136329605792,
+    "other_contact_tangential_delta_v_norm": 0.09942758873335861
+  },
+  "post_solve_closure": {
+    "actual_path": "global55_effective_mass_budget.json#/post_solve_closure",
+    "CONTACT_IMPULSE_VELOCITY_CLOSURE": "FAIL",
+    "all_dynamics_relative_l2": 0.5321658350677093,
+    "all_dynamics_residual": [
+      -0.04546145938790184,
+      -2.017785996948802e-15,
+      -0.001243045726964917,
+      0.9295361845594983,
+      -1.1280648720800228,
+      -0.4692023759521138,
+      0.9295361845594936,
+      1.1280648720800244,
+      -0.46920237595211484
+    ],
+    "constraint_mass_solve": {
+      "condition_number": 106.40904453861411,
+      "method": "numpy.linalg.solve",
+      "rank": 19,
+      "residual_l2": 5.350467102275973e-13,
+      "residual_max_abs": 4.547473508864641e-13,
+      "shape": [
+        19,
+        19
+      ]
+    },
+    "contact_only_relative_l2": 0.5196114027767804,
+    "contact_only_residual": [
+      -0.09895213656933508,
+      -2.0424496599303305e-15,
+      0.004640473936430037,
+      0.8730596958719887,
+      -1.1323364343654334,
+      -0.44552785138805623,
+      0.8730596958719834,
+      1.132336434365435,
+      -0.4455278513880574
+    ],
+    "observed_delta_v_contact": [
+      -0.057130177249461296,
+      -1.8342828428131137e-15,
+      -0.0018036520843324327,
+      2.6668270792401736,
+      -1.0975988146653657,
+      -0.08403118324823455,
+      2.6668270792401696,
+      1.0975988146653677,
+      -0.08403118324823544
+    ],
+    "predicted_delta_v_from_floor_contact_impulses": [
+      0.04182195931987378,
+      2.0816681711721685e-16,
+      -0.0064441260207624695,
+      1.7937673833681849,
+      0.034737619700067696,
+      0.3614966681398217,
+      1.7937673833681862,
+      -0.03473761970006718,
+      0.36149666813982195
+    ],
+    "predicted_delta_v_from_qacc_smooth_and_all_constraints": [
+      -0.011668717861559456,
+      1.8350315413568817e-16,
+      -0.0005606063573675157,
+      1.7372908946806753,
+      0.03046605741465714,
+      0.38517119270387923,
+      1.737290894680676,
+      -0.030466057414656682,
+      0.3851711927038794
+    ]
+  },
+  "sanity_checks": {
+    "directional_effective_mass_kg": {
+      "reference": 4.2425588141,
+      "actual": 4.24255881411363,
+      "absolute_error": 1.3629986028718122e-11
+    },
+    "uncoupled_sticking_impulse_norm": {
+      "reference": 2.3676455086,
+      "actual": 2.367645508602578,
+      "absolute_error": 2.5779378631796135e-12
+    },
+    "global_normal_conditioned_sticking_impulse_norm": {
+      "reference": 2.5406190843,
+      "actual": 2.540619084288334,
+      "absolute_error": 1.1665779453551295e-11
+    },
+    "actual_normal_impulse": {
+      "reference": 6.345240279,
+      "actual": 6.345240278967453,
+      "absolute_error": 3.254729818991109e-11
+    },
+    "actual_tangential_impulse_norm": {
+      "reference": 3.3247363601,
+      "actual": 3.3247363600666735,
+      "absolute_error": 3.332667475319795e-11
+    },
+    "pre_tangential_speed": {
+      "reference": 0.5561601192,
+      "actual": 0.5561601192334747,
+      "absolute_error": 3.3474778504682945e-11
+    },
+    "post_tangential_speed": {
+      "reference": 0.1713507113,
+      "actual": 0.1713507113360872,
+      "absolute_error": 3.608718879277717e-11
+    }
+  },
+  "source_validation_readback": {
+    "DOMINANT_FRICTION_IMPULSE_GAP_DRIVER": "MIXED",
+    "GLOBAL55_SOLVER_CAPTURE_PHASE": "AFTER_MJ_STEP_WITH_SOLVER_DATA_STILL_VALID",
+    "MUJOCO_GLOBAL55_DEMAND_DECOMPOSITION": "PARTIAL",
+    "MUJOCO_GLOBAL55_FRICTION_REGIME": "COUPLED_MULTI_CONTACT",
+    "MUJOCO_GLOBAL55_LIMB11_PRE_TANGENTIAL_SPEED": 0.5561601192334747,
+    "MUJOCO_GLOBAL55_LIMB12_PRE_TANGENTIAL_SPEED": 0.5561601192334749,
+    "MUJOCO_GLOBAL55_ORACLE_VALID": true,
+    "MUJOCO_GLOBAL55_REGRESSION": "PASS",
+    "POINT_VELOCITY_MAPPING_VALID": true,
+    "all_numerical_outputs_finite": true,
+    "delassus_matrix_valid": true,
+    "exactly_120_formal_substeps": true,
+    "expected_record_count": 120,
+    "extra_live_mj_forward_calls": 0,
+    "extra_physics_steps": 0,
+    "formal_data_mutated_by_probe": false,
+    "formal_probe_return_code": 0,
+    "hashes_after": {
+      "checkpoint": "cdf53f3e427a5a1c081ddd4d78230574fd694a5cefd97b30184a3762d9943d03",
+      "existing_oracle_validation": "dd3ca8bad5114704665462928e290dac6bddc9ae6be246293046c04534007f93",
+      "morphology_xml": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0"
+    },
+    "hashes_before": {
+      "checkpoint": "cdf53f3e427a5a1c081ddd4d78230574fd694a5cefd97b30184a3762d9943d03",
+      "existing_oracle_validation": "dd3ca8bad5114704665462928e290dac6bddc9ae6be246293046c04534007f93",
+      "morphology_xml": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0"
+    },
+    "mass_matrix_valid": true,
+    "nonfinite_json_policy": "serialize non-finite diagnostics as null",
+    "record_count": 120,
+    "record_count_valid": true,
+    "source_hashes_unchanged": true
+  },
+  "missing_fields": [
+    "generalized coordinate order",
+    "physical Jacobian column order",
+    "explicit LINK_COM/body-origin convention"
+  ],
+  "invalid_arrays": [],
+  "classifications": {
+    "MUJOCO_GLOBAL55_ARTIFACT_IDENTITY": "PASS",
+    "MUJOCO_GLOBAL55_EXACT_MATRIX_AVAILABLE": "YES",
+    "MUJOCO_GLOBAL55_EXACT_JACOBIAN_AVAILABLE": "YES",
+    "MUJOCO_GLOBAL55_EXACT_DELASSUS_AVAILABLE": "YES",
+    "MUJOCO_GLOBAL55_CONTACT_BUDGET_AVAILABLE": "YES",
+    "MUJOCO_GLOBAL55_ARTIFACT_READBACK_VALID": "NO",
+    "SIMULATION_RERUN": "REQUIRED"
+  }
+}

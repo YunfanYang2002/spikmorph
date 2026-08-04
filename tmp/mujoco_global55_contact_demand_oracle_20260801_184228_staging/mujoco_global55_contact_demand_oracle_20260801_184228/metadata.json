@@ -1,0 +1,23 @@
+{
+  "EXTRA_MJ_FORWARD_CALLS_ON_FORMAL_DATA": 0,
+  "EXTRA_PHYSICS_STEPS": 0,
+  "FORMAL_DATA_MUTATED_BY_PROBE": false,
+  "action_mode": "zero",
+  "backend": "mujoco",
+  "capture_phase": "AFTER_MJ_STEP_WITH_SOLVER_DATA_STILL_VALID",
+  "capture_phase_detail": "pre generalized state saved immediately before the sole live mj_step; contact/efc/qM and solver force arrays read immediately after that same mj_step before any next simulation call",
+  "checkpoint": "/home/yyf/Workspace/Code/spikmorph/output/diagnostics/mujoco_control_51k_20260727_091638/jobs/job_000_seed1409_lr0p00015/Unimal-v0.pt",
+  "checkpoint_sha256": "cdf53f3e427a5a1c081ddd4d78230574fd694a5cefd97b30184a3762d9943d03",
+  "control_steps": 30,
+  "created_at": "2026-08-01T18:42:31.428488+08:00",
+  "existing_reference_oracle": "/home/yyf/Workspace/Code/spikmorph/output/diagnostics/mujoco_physical_contact_projection_20260729_195100",
+  "jacobian": "mujoco.mj_jac at exact mjContact.pos on robot body relative to static world",
+  "morphology": "floor-1409-0-3-01-15-56-55",
+  "morphology_xml": "/home/yyf/Workspace/Code/metamorph-isaac/output/unimals_100/train/xml/floor-1409-0-3-01-15-56-55.xml",
+  "morphology_xml_sha256": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0",
+  "mujoco_version": "3.8.1",
+  "physical_basis": "right-handed rows [normal force direction on robot, tangent1, tangent2]",
+  "physics_dt": 0.0050000000000000044,
+  "physics_substeps": 120,
+  "reset_noise_scale": 0.0
+}

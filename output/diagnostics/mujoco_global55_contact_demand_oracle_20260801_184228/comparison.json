@@ -1,0 +1,305 @@
+{
+  "MUJOCO_GLOBAL55_LIMB11_PRE_TANGENTIAL_SPEED": 0.5561601192334747,
+  "MUJOCO_GLOBAL55_LIMB12_PRE_TANGENTIAL_SPEED": 0.5561601192334749,
+  "interpretation": {
+    "DOMINANT_FRICTION_IMPULSE_GAP_DRIVER": "MIXED",
+    "MUJOCO_GLOBAL55_DEMAND_DECOMPOSITION": "PARTIAL",
+    "MUJOCO_GLOBAL55_FRICTION_REGIME": "COUPLED_MULTI_CONTACT",
+    "actual_over_friction_cap": 0.7485332568519715,
+    "actual_over_normal_conditioned_rigid_demand": 1.308632364697041,
+    "driver_signals": [
+      "NORMAL_TANGENTIAL_COUPLING",
+      "MULTI_CONTACT_COUPLING"
+    ],
+    "normal_coupling_velocity_ratio": 2.08323752979166,
+    "other_contact_tangent_velocity_ratio": 0.17877511402722335,
+    "positive_solver_regularization_rows": true
+  },
+  "isaac_fixed_reference": {
+    "actual_friction_impulse_N_s": 1.8164226398028622,
+    "actual_normal_impulse_N_s": 5.117247619628906,
+    "apparent_directional_mass_kg": 3.9189994935896055,
+    "apparent_sticking_demand_N_s": 1.9037494498107959,
+    "backend": "isaac",
+    "body": "limb/12",
+    "global_physics_step": 55,
+    "post_tangential_speed_m_per_s": 0.023172343566941596,
+    "pre_tangential_speed_m_per_s": 0.5088208518817131,
+    "semantics": "fixed comparison values; apparent metrics are not exact J M^-1 J^T metrics"
+  },
+  "mujoco": {
+    "W_tn_other_floor_contacts": [
+      [
+        -0.0011286867801120395,
+        -0.009774399535909696
+      ],
+      [
+        -0.017837154432100353,
+        0.00022262210122185833
+      ]
+    ],
+    "W_tn_own": [
+      [
+        -0.003707476950985396
+      ],
+      [
+        0.18757752859852503
+      ]
+    ],
+    "W_tt_local": [
+      [
+        0.3856158015338132,
+        -0.03380906231809608
+      ],
+      [
+        -0.033809062318096106,
+        0.24171038332176806
+      ]
+    ],
+    "actual_normal_impulse": 6.345240278967453,
+    "actual_tangential_impulse": [
+      0.2817184097958504,
+      -3.312779286570642
+    ],
+    "actual_tangential_impulse_norm": 3.3247363600666735,
+    "contact_index_in_floor_stack": 1,
+    "cross_contact_tangent_block_frobenius_norm": 0.05960465147613108,
+    "delta_v_t_from_all_floor_normals": [
+      -0.0878464141594795,
+      1.1552785629455058
+    ],
+    "delta_v_t_from_other_actual_tangential_impulses": [
+      -0.09805299788647563,
+      0.01647589168466178
+    ],
+    "delta_v_t_from_other_floor_normals": [
+      -0.06432158207674352,
+      -0.034945926947024426
+    ],
+    "delta_v_t_from_own_normal": [
+      -0.023524832082735977,
+      1.1902244898925303
+    ],
+    "directional_effective_mass_kg": 4.24255881411363,
+    "directional_inverse_effective_mass_1_per_kg": 0.23570680898360713,
+    "friction_cap_mu_pn": 4.441668195277217,
+    "global_normal_conditioned_sticking_impulse": [
+      0.38174655097660065,
+      -2.5117752491549803
+    ],
+    "global_normal_conditioned_sticking_impulse_norm": 2.540619084288334,
+    "joint": "limby/12",
+    "pre_tangential_speed": 0.5561601192334749,
+    "pre_tangential_velocity": [
+      -0.06709699822797885,
+      -0.5520978817696981
+    ],
+    "slip_direction": [
+      -0.12064331099550069,
+      -0.992695920970789
+    ],
+    "solver_rows": [
+      {
+        "J_row": [
+          0.0,
+          -0.7,
+          1.0,
+          0.2350209838078342,
+          1.587887307045395,
+          1.0889458247360349,
+          0.0,
+          0.0,
+          1.5384162689394776,
+          0.32694799618216075,
+          -0.8342583270942464,
+          1.025528916495497,
+          0.7373375279697025,
+          0.2530372569346315,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_D": 59.2942949154971,
+        "efc_KBIP": [
+          0.507543847395163,
+          0.19646279523272117,
+          -0.7422576932999483,
+          0.0
+        ],
+        "efc_KBIP_components": {
+          "B": 105.26315789473685,
+          "K": 2770.083102493075,
+          "impedance": 0.95,
+          "impedance_derivative": 0.0
+        },
+        "efc_R": 0.016865028944608312,
+        "efc_aref": 345.2340101816756,
+        "efc_diagApprox": 0.32043554994755763,
+        "efc_force": 121.02435698724642,
+        "efc_id": 1,
+        "efc_row": 6,
+        "efc_state": 1,
+        "efc_type": 6,
+        "efc_vel": -3.20398066735524
+      },
+      {
+        "J_row": [
+          0.0,
+          0.7,
+          1.0,
+          0.7432075144419685,
+          1.587887307045395,
+          -1.2323790637238683,
+          0.0,
+          0.0,
+          1.5384162689394776,
+          0.6348429435982548,
+          0.7519460005499036,
+          1.0856574048667678,
+          0.7816525083831283,
+          0.27119126081041744,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_D": 59.2942949154971,
+        "efc_KBIP": [
+          0.0,
+          0.16226017662119602,
+          0.30411091632713444,
+          0.0
+        ],
+        "efc_KBIP_components": {
+          "B": 105.26315789473685,
+          "K": 2770.083102493075,
+          "impedance": 0.95,
+          "impedance_derivative": 0.0
+        },
+        "efc_R": 0.016865028944608312,
+        "efc_aref": 355.1219888679041,
+        "efc_diagApprox": 0.32043554994755763,
+        "efc_force": 201.51533121463225,
+        "efc_id": 1,
+        "efc_row": 7,
+        "efc_state": 1,
+        "efc_type": 6,
+        "efc_vel": -3.297916464874411
+      },
+      {
+        "J_row": [
+          -0.7,
+          0.0,
+          1.0,
+          0.539315882770643,
+          2.0076747627728806,
+          0.2706633548935142,
+          0.0,
+          0.0,
+          1.9531261238088589,
+          0.5610617279504819,
+          -0.04967449696284248,
+          1.3762569425265423,
+          1.0473385418861492,
+          0.5166566240281031,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_D": 59.2942949154971,
+        "efc_KBIP": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_KBIP_components": {
+          "B": 105.26315789473685,
+          "K": 2770.083102493075,
+          "impedance": 0.95,
+          "impedance_derivative": 0.0
+        },
+        "efc_R": 0.016865028944608312,
+        "efc_aref": 390.85889607624125,
+        "efc_diagApprox": 0.32043554994755763,
+        "efc_force": 0.0,
+        "efc_id": 1,
+        "efc_row": 8,
+        "efc_state": 1,
+        "efc_type": 6,
+        "efc_vel": -3.637417083353614
+      },
+      {
+        "J_row": [
+          0.7,
+          0.0,
+          1.0,
+          0.4389126154791598,
+          1.1680998513179093,
+          -0.4140965938813476,
+          0.0,
+          0.0,
+          1.1237064140700963,
+          0.4007292118299336,
+          -0.032637829581500306,
+          0.7349293788357225,
+          0.4716514944666817,
+          0.007571893716945888,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_D": 59.2942949154971,
+        "efc_KBIP": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "efc_KBIP_components": {
+          "B": 105.26315789473685,
+          "K": 2770.083102493075,
+          "impedance": 0.95,
+          "impedance_derivative": 0.0
+        },
+        "efc_R": 0.016865028944608312,
+        "efc_aref": 309.4971029733384,
+        "efc_diagApprox": 0.32043554994755763,
+        "efc_force": 946.508367591612,
+        "efc_id": 1,
+        "efc_row": 9,
+        "efc_state": 1,
+        "efc_type": 6,
+        "efc_vel": -2.8644800488760365
+      }
+    ],
+    "uncoupled_sticking_impulse": [
+      0.37890861548013344,
+      2.337129332219526
+    ],
+    "uncoupled_sticking_impulse_norm": 2.367645508602578,
+    "uncoupled_sticking_solve": {
+      "condition_number": 1.6790135662382906,
+      "method": "numpy.linalg.solve",
+      "rank": 2,
+      "residual_l2": 0.0,
+      "residual_max_abs": 0.0,
+      "shape": [
+        2,
+        2
+      ]
+    },
+    "v_t_after_all_floor_normals": [
+      -0.15494341238745835,
+      0.6031806811758077
+    ]
+  },
+  "warning": "Isaac apparent mass/demand values are not exact Delassus metrics"
+}

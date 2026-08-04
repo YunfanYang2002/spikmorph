@@ -1,0 +1,112 @@
+{
+  "schema_version": "spikmorph-package-manifest-v1",
+  "source_artifact_directory": "D:\\CODES\\master\\spikmorph\\output\\diagnostics\\mujoco_global55_contact_demand_oracle_20260801_184228",
+  "member_hash_scope": "all ZIP members except package_manifest.json itself; complete ZIP including manifest is covered by external .zip.sha256",
+  "members": [
+    {
+      "relative_path": "artifact_audit.json",
+      "size": 18347,
+      "sha256": "e20b4e9350ff703b74b4fda65bd22c100446a6f65044396a41e43e7236b98634"
+    },
+    {
+      "relative_path": "git_head.txt",
+      "size": 42,
+      "sha256": "3459e8c8b659bc8b3fb8174e2e4d4ceaa6efb031a80f10b82757d3b919730181"
+    },
+    {
+      "relative_path": "git_status_short.txt",
+      "size": 78,
+      "sha256": "c6130b9be7fdc31055ebfe89ff798d91b953425d9074d62590c89bc4118b29ce"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/comparison.json",
+      "size": 8060,
+      "sha256": "fba92ac0823899fbbcd3710ec0270d964cac1017f37733d2f1b101777e7bcc03"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/git_head.txt",
+      "size": 209,
+      "sha256": "9f8a40a89ebbf03d8f94905bd08c5e6c5107ee2affc9c11bb66edbcd30f57ce8"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/git_status_short.txt",
+      "size": 10216,
+      "sha256": "d86ae9f1757f7f40596226895ed24cc49c4816283608b9aa5568c5903cce0d04"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_contacts.json",
+      "size": 68466,
+      "sha256": "24cdd4e48f920e8c533f43e1f858678f15a15c26b8530b1a6f10d145627a9459"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_delassus_matrix.json",
+      "size": 4771,
+      "sha256": "4a494afc42b262bcc1e247509f89ce77fff1060d94b57598b3c9b0d101775a75"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_effective_mass_budget.json",
+      "size": 20334,
+      "sha256": "00fc81b2e1a96db1dfa2ad896cb58a4f06f3d3af13dcc2c4b5c9fc37bb5e8b3f"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_mass_matrix.json",
+      "size": 8932,
+      "sha256": "61cc45dde4e857528c0523d146112a44de4b3c718d861f12919a57e320b97d49"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_physical_jacobians.json",
+      "size": 15414,
+      "sha256": "85993725a6fa18a6b890b79dc166fd2a79c23deb25be1725184e362fa8285fbb"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_post_state.json",
+      "size": 1091,
+      "sha256": "e5dcc612eff99c835f441deffa7c096477b342ae3825e98161e811634f6df926"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_pre_state.json",
+      "size": 3967,
+      "sha256": "ad54150a370379fc26c9c30a6228e327bb86dce61d4da44e86ec538775b1fcdb"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_regression.json",
+      "size": 1979,
+      "sha256": "91b09a6ac7f55202a301b733b6537cecc26d6b909391cffce256dda842718f44"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/global55_solver_rows.json",
+      "size": 14716,
+      "sha256": "7f4d1e9cc661ddac682951eca0d1175e8c24fbcca30dacb75beb1e737c4e6704"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/hashes_after.sha256",
+      "size": 756,
+      "sha256": "f88a7e45114c4fefe500d3eec1d28db9a9ee50cd05a8e7ba7f434bd838ffa5d7"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/hashes_before.sha256",
+      "size": 756,
+      "sha256": "f88a7e45114c4fefe500d3eec1d28db9a9ee50cd05a8e7ba7f434bd838ffa5d7"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/isaac_fixed_reference.json",
+      "size": 490,
+      "sha256": "9cb74351b39cdfe31ff2c85727d4c3a83ccf8d41778823384962ac101d64d2ff"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/metadata.json",
+      "size": 1476,
+      "sha256": "a69ca942ebdac7103febfaf81ff048fb39dcfecc818befc0f2994f4cc7653326"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/run.log",
+      "size": 872,
+      "sha256": "54985934055fd010a0ea5839884ea07d3667830607b8c2c563195eab7e9c41d3"
+    },
+    {
+      "relative_path": "mujoco_global55_contact_demand_oracle_20260801_184228/validation.json",
+      "size": 1583,
+      "sha256": "128aa4d9e38cafb4fc1012c2b8e1697f3f66ed963c42c82853c8e4cdb79a8635"
+    }
+  ]
+}

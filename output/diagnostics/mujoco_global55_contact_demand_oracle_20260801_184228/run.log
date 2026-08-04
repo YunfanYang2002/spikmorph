@@ -1,0 +1,14 @@
+/home/yyf/miniconda3/envs/spikmorph/lib/python3.10/site-packages/gym/spaces/box.py:49: RuntimeWarning: invalid value encountered in cast
+  self.low = self.low.astype(self.dtype)
+/home/yyf/miniconda3/envs/spikmorph/lib/python3.10/site-packages/gym/spaces/box.py:50: RuntimeWarning: invalid value encountered in cast
+  self.high = self.high.astype(self.dtype)
+{
+  "output_dir": "/home/yyf/Workspace/Code/spikmorph/output/diagnostics/mujoco_global55_contact_demand_oracle_20260801_184228",
+  "MUJOCO_GLOBAL55_ORACLE_VALID": true,
+  "MUJOCO_GLOBAL55_REGRESSION": "PASS",
+  "MUJOCO_GLOBAL55_FRICTION_REGIME": "COUPLED_MULTI_CONTACT",
+  "MUJOCO_GLOBAL55_LIMB12_PRE_TANGENTIAL_SPEED": 0.5561601192334749,
+  "MUJOCO_GLOBAL55_LIMB11_PRE_TANGENTIAL_SPEED": 0.5561601192334747,
+  "MUJOCO_GLOBAL55_DEMAND_DECOMPOSITION": "PARTIAL",
+  "DOMINANT_FRICTION_IMPULSE_GAP_DRIVER": "MIXED"
+}

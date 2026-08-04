@@ -1,0 +1,12 @@
+{
+  "actual_friction_impulse_N_s": 1.8164226398028622,
+  "actual_normal_impulse_N_s": 5.117247619628906,
+  "apparent_directional_mass_kg": 3.9189994935896055,
+  "apparent_sticking_demand_N_s": 1.9037494498107959,
+  "backend": "isaac",
+  "body": "limb/12",
+  "global_physics_step": 55,
+  "post_tangential_speed_m_per_s": 0.023172343566941596,
+  "pre_tangential_speed_m_per_s": 0.5088208518817131,
+  "semantics": "fixed comparison values; apparent metrics are not exact J M^-1 J^T metrics"
+}

@@ -1,0 +1,69 @@
+{
+  "MUJOCO_GLOBAL55_REGRESSION": "PASS",
+  "limb/11": {
+    "absolute_error": {
+      "Fn": 4.547473508864641e-13,
+      "Ft_norm": 3.410605131648481e-13,
+      "friction_generalized": 2.842170943040401e-14,
+      "normal_generalized": 1.1368683772161603e-13,
+      "total_generalized": 1.4210854715202004e-13
+    },
+    "checks": {
+      "Fn": true,
+      "Ft_norm": true,
+      "friction_generalized": true,
+      "normal_generalized": true,
+      "total_generalized": true
+    },
+    "expected": {
+      "Fn": 1269.0480557934907,
+      "Ft_norm": 664.9472720133347,
+      "friction_generalized": -240.19586179726988,
+      "normal_generalized": 332.6355906179289,
+      "total_generalized": 92.43972882065904
+    },
+    "joint": "limby/11",
+    "observed": {
+      "Fn": 1269.0480557934911,
+      "Ft_norm": 664.947272013335,
+      "friction_generalized": -240.19586179726986,
+      "normal_generalized": 332.63559061792904,
+      "total_generalized": 92.43972882065918
+    },
+    "valid": true
+  },
+  "limb/12": {
+    "absolute_error": {
+      "Fn": 0.0,
+      "Ft_norm": 0.0,
+      "friction_generalized": 1.1368683772161603e-13,
+      "normal_generalized": -5.684341886080802e-14,
+      "total_generalized": 4.263256414560601e-14
+    },
+    "checks": {
+      "Fn": true,
+      "Ft_norm": true,
+      "friction_generalized": true,
+      "normal_generalized": true,
+      "total_generalized": true
+    },
+    "expected": {
+      "Fn": 1269.0480557934907,
+      "Ft_norm": 664.9472720133347,
+      "friction_generalized": -240.19586179727,
+      "normal_generalized": 332.635590617929,
+      "total_generalized": 92.439728820659
+    },
+    "joint": "limby/12",
+    "observed": {
+      "Fn": 1269.0480557934907,
+      "Ft_norm": 664.9472720133347,
+      "friction_generalized": -240.19586179726988,
+      "normal_generalized": 332.6355906179289,
+      "total_generalized": 92.43972882065904
+    },
+    "valid": true
+  },
+  "tolerance_atol": 1e-09,
+  "tolerance_rtol": 1e-09
+}

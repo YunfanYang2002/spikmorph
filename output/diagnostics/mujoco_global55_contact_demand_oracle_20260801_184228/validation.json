@@ -1,0 +1,34 @@
+{
+  "DOMINANT_FRICTION_IMPULSE_GAP_DRIVER": "MIXED",
+  "GLOBAL55_SOLVER_CAPTURE_PHASE": "AFTER_MJ_STEP_WITH_SOLVER_DATA_STILL_VALID",
+  "MUJOCO_GLOBAL55_DEMAND_DECOMPOSITION": "PARTIAL",
+  "MUJOCO_GLOBAL55_FRICTION_REGIME": "COUPLED_MULTI_CONTACT",
+  "MUJOCO_GLOBAL55_LIMB11_PRE_TANGENTIAL_SPEED": 0.5561601192334747,
+  "MUJOCO_GLOBAL55_LIMB12_PRE_TANGENTIAL_SPEED": 0.5561601192334749,
+  "MUJOCO_GLOBAL55_ORACLE_VALID": true,
+  "MUJOCO_GLOBAL55_REGRESSION": "PASS",
+  "POINT_VELOCITY_MAPPING_VALID": true,
+  "all_numerical_outputs_finite": true,
+  "delassus_matrix_valid": true,
+  "exactly_120_formal_substeps": true,
+  "expected_record_count": 120,
+  "extra_live_mj_forward_calls": 0,
+  "extra_physics_steps": 0,
+  "formal_data_mutated_by_probe": false,
+  "formal_probe_return_code": 0,
+  "hashes_after": {
+    "checkpoint": "cdf53f3e427a5a1c081ddd4d78230574fd694a5cefd97b30184a3762d9943d03",
+    "existing_oracle_validation": "dd3ca8bad5114704665462928e290dac6bddc9ae6be246293046c04534007f93",
+    "morphology_xml": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0"
+  },
+  "hashes_before": {
+    "checkpoint": "cdf53f3e427a5a1c081ddd4d78230574fd694a5cefd97b30184a3762d9943d03",
+    "existing_oracle_validation": "dd3ca8bad5114704665462928e290dac6bddc9ae6be246293046c04534007f93",
+    "morphology_xml": "da2156e9be4b706a34599a32bc8f3f1a2037fa8ecfb44042bc22e1740e9382a0"
+  },
+  "mass_matrix_valid": true,
+  "nonfinite_json_policy": "serialize non-finite diagnostics as null",
+  "record_count": 120,
+  "record_count_valid": true,
+  "source_hashes_unchanged": true
+}
