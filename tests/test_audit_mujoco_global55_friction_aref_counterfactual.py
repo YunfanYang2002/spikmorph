@@ -116,6 +116,16 @@ class ArefCounterfactualTests(unittest.TestCase):
         self.assertNotIn("model.opt.impratio =", source)
         self.assertNotIn("model.opt.solver =", source)
 
+    def test_optional_empty_constraint_arrays_are_skipped(self):
+        empty = type("Data", (), {"efc_b": np.zeros(0), "efc_AR": np.zeros(0)})()
+        self.assertIsNone(AUDIT._optional_constraint_row_value(empty, "efc_b", 2))
+        self.assertIsNone(AUDIT._optional_constraint_row_value(empty, "efc_AR", 2))
+
+    def test_optional_constraint_row_arrays_are_read_when_indexable(self):
+        data = type("Data", (), {"efc_b": np.asarray([1.0, 2.0, 3.0]), "efc_AR": np.asarray([[4.0], [5.0], [6.0]])})()
+        self.assertEqual(AUDIT._optional_constraint_row_value(data, "efc_b", 2), 3.0)
+        np.testing.assert_allclose(AUDIT._optional_constraint_row_value(data, "efc_AR", 1), [5.0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -192,6 +192,17 @@ def _array(data: Any, name: str) -> np.ndarray | None:
     return None if value is None else np.asarray(value, dtype=np.float64).copy()
 
 
+def _optional_constraint_row_value(data: Any, name: str, row_id: int) -> Any | None:
+    """Read optional row storage only when the binding exposes a usable array."""
+    values = getattr(data, name, None)
+    if values is None:
+        return None
+    array = np.asarray(values)
+    if array.ndim == 0 or row_id < 0 or row_id >= array.shape[0]:
+        return None
+    return array[row_id].copy()
+
+
 def _enum_name(mujoco: Any, enum_type: Any, value: int) -> str:
     try:
         return enum_type(int(value)).name
@@ -457,9 +468,9 @@ def capture_after_integration(
         for row in contact["solver_rows"]:
             row_id = int(row["efc_row"])
             for name in ("efc_b", "efc_AR"):
-                values = getattr(solver_data, name, None)
-                if values is not None:
-                    row[name] = np.asarray(values)[row_id].copy()
+                value = _optional_constraint_row_value(solver_data, name, row_id)
+                if value is not None:
+                    row[name] = value
     return capture
 
 
