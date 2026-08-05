@@ -4,6 +4,7 @@
 
 - 新增固定 global55 的 pyramidal friction `efc_aref` 单因素反事实诊断工具：从同一 pre-state staged forward，按 row geometry 拟合 normal/tangent reference-acceleration 分量，仅缩放切向分量，并输出 solver-excess、invariant、baseline/restore、step closure 与无条件 ZIP artifact。
 - 新增对应单元测试，覆盖 staged pipeline、四行几何分解、非均匀摩擦系数、scale=0 激活、shared physical demand、分类与 ZIP 校验；未运行训练或 sweep。
+- 修正 pre-constraint decomposition 不应读取尚未完成 solver 的 physical wrench sign；现在先用 contact metadata/J-row 完成几何分解，仅在 `mj_fwdConstraint` 后读取 `mj_contactForce`。
 
 ## 2026-08-04
 

@@ -777,22 +777,64 @@ def _load_reference(path: Path) -> dict[str, Any]:
     return cone_helper.load_reference(path)
 
 
-def _extract_decompositions(data: Any, mujoco: Any, model: Any, mapping: dict[str, Any], snapshot: Any) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
-    staged = data
-    capture = capture_after_integration(mujoco, model, staged, snapshot, mapping)
+def _extract_decompositions(
+    data: Any,
+    mujoco: Any,
+    model: Any,
+    mapping: dict[str, Any],
+    snapshot: Any,
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    """Extract row geometry before solving without reading physical wrench signs."""
+    del snapshot
+    probe_sim = SimpleNamespace(
+        _sim=SimpleNamespace(_model=model, _data=data), model=model, data=data
+    )
+    probe_contacts, _ = oracle.evaluator.capture_contact_response(
+        probe_sim,
+        mapping,
+        oracle.evaluator.FiniteTracker(),
+        record_physical_projection=False,
+    )
+    floor_id = int(mapping["floor_geom_id"])
     decompositions = {}
-    for contact in capture["contacts"]:
+    decomposition_contacts = []
+    for contact in probe_contacts:
+        if floor_id not in (int(contact["geom1_id"]), int(contact["geom2_id"])):
+            continue
         if len(contact["efc_rows"]) != 4 or int(contact["dim"]) != 3:
             continue
         rows = [int(row) for row in contact["efc_rows"]]
-        jac = np.vstack([oracle.dense_constraint_row(staged, row, int(staged.nefc), int(model.nv)) for row in rows])
-        aref = np.asarray([staged.efc_aref[row] for row in rows], dtype=np.float64)
+        jac = np.vstack([oracle.dense_constraint_row(data, row, int(data.nefc), int(model.nv)) for row in rows])
+        aref = np.asarray([data.efc_aref[row] for row in rows], dtype=np.float64)
+        body1, body2 = int(contact["body1_id"]), int(contact["body2_id"])
+        robot_body = body2 if body1 == 0 else body1
+        robot_side_factor = 1 if robot_body == body2 else -1
+        frame = np.asarray(contact["contact_frame_world_rows"], dtype=np.float64).reshape(3, 3)
+        basis = oracle.physical_basis(frame, robot_side_factor)
         decompositions[int(contact["contact_index"])] = decompose_pyramidal_contact_aref(
-            rows, jac, aref, _contact_basis_from_capture(contact), contact["friction"], contact["contact_index"], contact["robot_body_name"]
+            rows,
+            jac,
+            aref,
+            basis,
+            contact["friction"],
+            contact["contact_index"],
+            mapping["body_names"][robot_body],
         )
+        decomposition_contacts.append({
+            "contact_index": contact["contact_index"],
+            "pair": [contact["geom1_name"], contact["geom2_name"]],
+            "row_ids": rows,
+            "dim": int(contact["dim"]),
+            "basis_source": "contact.frame plus body ordering; no physical wrench projection before constraint solve",
+        })
     if not decompositions:
         raise RuntimeError("no active pyramidal floor contact with four edge rows")
-    return decompositions, capture
+    return decompositions, {
+        "contacts": decomposition_contacts,
+        "physical_projection_called": False,
+        "constraint_solve_called": False,
+        "reason": "pre-constraint geometry-only extraction",
+    }
 
 
 def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
@@ -824,7 +866,10 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     decomposition, decomposition_capture = _extract_decompositions(decomposition_data, mujoco, model, mapping, snapshot)
     for item in decomposition.values():
         item.pop("fitted_components", None)
-    oracle.write_json(output / "friction_aref_decomposition.json", {"contacts": decomposition})
+    oracle.write_json(output / "friction_aref_decomposition.json", {
+        "contacts": decomposition,
+        "preconstraint_geometry_probe": decomposition_capture,
+    })
 
     conditions: dict[str, dict[str, Any]] = {}
     condition_aref: dict[str, dict[int, Any]] = {}
