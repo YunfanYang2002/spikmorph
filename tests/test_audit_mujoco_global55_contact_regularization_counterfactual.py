@@ -115,6 +115,60 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         self.assertEqual(report["ISLAND_MIRROR_REQUIRED"], "YES")
         self.assertFalse(report["counterfactual_ready"])
 
+    def test_island_mirror_source_path_is_ready_only_with_reciprocal_maps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "island_constraint.c").write_text(
+                """
+                void mj_makeConstraint(Model* m, Data* d) {
+                  d->efc_R[0] = 1.0; d->efc_D[0] = 1.0;
+                  d->iefc_R[0] = d->efc_R[0]; d->iefc_D[0] = d->efc_D[0];
+                }
+                void mj_projectConstraint(Model* m, Data* d) {
+                  d->efc_R[0] = d->efc_R[0]; d->efc_D[0] = d->efc_D[0];
+                  d->efc_AR[0] = d->efc_R[0];
+                  d->map_efc2iefc[0] = 0;
+                  d->map_iefc2efc[0] = 0;
+                }
+                void mj_fwdConstraint(Model* m, Data* d) {
+                  consume(d->iefc_R); consume(d->iefc_D); consume(d->efc_AR);
+                }
+                """,
+                encoding="utf-8",
+            )
+            report = AUDIT.audit_source_consumption(
+                root,
+                function_symbols={
+                    "mj_makeConstraint": True,
+                    "mj_projectConstraint": True,
+                    "mj_fwdConstraint": True,
+                },
+                exposed_fields={
+                    "efc_R": {"available": True},
+                    "efc_D": {"available": True},
+                    "efc_AR": {"available": True},
+                },
+            )
+        self.assertEqual(report["ISLAND_MIRROR_REQUIRED"], "YES")
+        self.assertEqual(report["island_update_path"], "PROVEN_BY_SOURCE")
+        self.assertTrue(report["counterfactual_ready"])
+
+    def test_island_mirror_mapping_updates_only_selected_rows(self):
+        data = SimpleNamespace(
+            nefc=3,
+            nisland=1,
+            map_efc2iefc=np.asarray([2, 0, 1]),
+            map_iefc2efc=np.asarray([1, 2, 0]),
+            iefc_R=np.asarray([10.0, 20.0, 30.0]),
+            iefc_D=np.asarray([0.1, 0.05, 1.0 / 30.0]),
+        )
+        state = AUDIT._island_regularization_state(data, [1])
+        self.assertEqual(state["selected_iefc_rows"], [0])
+        update = AUDIT._sync_island_regularization(data, [1], [2.0], [0.5])
+        self.assertTrue(update["updated"])
+        np.testing.assert_allclose(data.iefc_R, [2.0, 20.0, 30.0])
+        np.testing.assert_allclose(data.iefc_D, [0.5, 0.05, 1.0 / 30.0])
+
     def test_baseline_reciprocal_gate_passes_and_rejects_bad_D(self):
         snapshot = {"efc_R": np.asarray([0.5, 0.25]), "efc_D": np.asarray([2.0, 4.0])}
         report = AUDIT._rd_gate(snapshot, [0, 1])

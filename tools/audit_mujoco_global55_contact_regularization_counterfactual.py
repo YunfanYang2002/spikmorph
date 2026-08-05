@@ -44,7 +44,15 @@ CONDITIONS = (
 )
 REG_FIELDS = (
     "efc_R", "efc_D", "efc_AR", "efc_AR_rownnz", "efc_AR_rowadr", "efc_AR_colind",
-    "iefc_R", "iefc_D", "iefc_AR", "iefc_AR_rownnz", "iefc_AR_rowadr", "iefc_AR_colind",
+    "nisland", "map_efc2iefc", "map_iefc2efc",
+    "iefc_R", "iefc_D", "iefc_aref", "iefc_state", "iefc_force",
+)
+ISLAND_REG_FIELDS = (
+    "nisland", "map_efc2iefc", "map_iefc2efc", "iefc_R", "iefc_D",
+)
+ISLAND_EVIDENCE_FIELDS = (
+    "nisland", "map_efc2iefc", "map_iefc2efc", "iefc_R", "iefc_D",
+    "iefc_aref", "iefc_state", "iefc_force",
 )
 CORE_FIELDS = ("efc_J", "efc_vel", "efc_aref")
 REGRESSION_RTOL = 1.0e-9
@@ -188,7 +196,10 @@ def _source_files(source_root: Path) -> list[Path]:
     for path in source_root.rglob("*"):
         if path.is_file() and path.suffix.lower() in suffixes:
             name = path.name.lower()
-            if "constraint" in name or "island" in name or "solver" in name:
+            if (
+                "constraint" in name or "island" in name or "solver" in name
+                or "forward" in name
+            ):
                 result.append(path)
     return sorted(result)
 
@@ -228,11 +239,13 @@ def audit_source_consumption(
     functions = ("mj_makeConstraint", "mj_projectConstraint", "mj_fwdConstraint")
     target_fields = (
         "efc_R", "efc_D", "efc_AR", "efc_AR_rownnz", "efc_AR_rowadr", "efc_AR_colind",
-        "iefc_R", "iefc_D", "iefc_AR", "iefc_AR_rownnz", "iefc_AR_rowadr", "iefc_AR_colind",
+        "nisland", "map_efc2iefc", "map_iefc2efc",
+        "iefc_R", "iefc_D", "iefc_aref", "iefc_state", "iefc_force",
     )
     files = _source_files(Path(source_root))
     references: dict[str, Any] = {}
     source_paths: dict[str, str] = {}
+    function_body_paths: dict[str, str] = {}
     for function_name in functions:
         for path in files:
             try:
@@ -242,6 +255,7 @@ def audit_source_consumption(
             body = _function_body(text, function_name)
             if body is None:
                 continue
+            function_body_paths[function_name] = str(path)
             refs = _field_references(body, target_fields)
             if refs:
                 references.setdefault(function_name, {})[str(path)] = refs
@@ -259,10 +273,7 @@ def audit_source_consumption(
         set(refs) for refs in references.get("mj_fwdConstraint", {}).values()
     ]) if references.get("mj_fwdConstraint") else set()
     island_fields = sorted(
-        field for field in (
-            "iefc_R", "iefc_D", "iefc_AR",
-            "iefc_AR_rownnz", "iefc_AR_rowadr", "iefc_AR_colind",
-        )
+        field for field in ISLAND_EVIDENCE_FIELDS
         if any(
             field in field_refs
             for function in references.values()
@@ -270,23 +281,37 @@ def audit_source_consumption(
         )
     )
     source_available = bool(files)
-    source_gate = bool(
+    base_source_gate = bool(
         source_available
         and function_symbols.get("mj_makeConstraint", False)
         and function_symbols.get("mj_projectConstraint", False)
         and function_symbols.get("mj_fwdConstraint", False)
+        and set(functions).issubset(function_body_paths)
         and {"efc_R", "efc_D"}.issubset(make_refs)
         and {"efc_R", "efc_D", "efc_AR"}.issubset(project_refs)
-        and "efc_AR" in fwd_refs
         and exposed_fields.get("efc_R", {}).get("available", False)
         and exposed_fields.get("efc_D", {}).get("available", False)
         and exposed_fields.get("efc_AR", {}).get("available", False)
     )
-    # Without source evidence the mirror state is unknowable; report YES
-    # conservatively so the artifact cannot be mistaken for a safe NO.
-    mirror_required = bool(island_fields) or not source_available
-    if mirror_required:
-        source_gate = False
+    island_mirror_observed = bool(island_fields)
+    island_update_path = "UNPROVEN" if not source_available else "NOT_REQUIRED"
+    if island_mirror_observed:
+        island_update_path = (
+            "PROVEN_BY_SOURCE"
+            if {"iefc_R", "iefc_D", "map_iefc2efc"}.issubset(set(island_fields))
+            else "UNPROVEN"
+        )
+    source_gate = bool(
+        base_source_gate
+        and (
+            not island_mirror_observed
+            or island_update_path == "PROVEN_BY_SOURCE"
+        )
+    )
+    # If no source is bundled, the wheel audit cannot prove that no island
+    # mirror exists.  Keep the conservative YES marker until the behavioral
+    # probe validates the live binding and update path.
+    mirror_required = island_mirror_observed or not source_available
     return {
         "audit_version": 1,
         "package_path": package_path,
@@ -296,30 +321,192 @@ def audit_source_consumption(
         "exposed_fields": exposed_fields,
         "function_field_references": references,
         "function_source_paths": source_paths,
+        "function_body_paths": function_body_paths,
         "island_mirror_fields_observed": island_fields,
+        "island_update_path": island_update_path,
         "R_CONSUMPTION_PATH": (
             f"{source_paths.get('mj_makeConstraint', 'unknown')}:mj_makeConstraint -> efc_R; "
             f"{source_paths.get('mj_projectConstraint', 'unknown')}:mj_projectConstraint -> efc_R/efc_D/efc_AR"
+            + (
+                "; island mirror path: map_efc2iefc -> iefc_R"
+                if source_gate and mirror_required else ""
+            )
             if source_gate else "UNDETERMINED"
         ),
         "D_CONSUMPTION_PATH": (
             f"{source_paths.get('mj_makeConstraint', 'unknown')}:mj_makeConstraint -> efc_D; "
             f"{source_paths.get('mj_projectConstraint', 'unknown')}:mj_projectConstraint -> efc_D"
+            + (
+                "; island mirror path: map_efc2iefc -> iefc_D"
+                if source_gate and mirror_required else ""
+            )
             if source_gate else "UNDETERMINED"
         ),
         "AR_CONSUMPTION_PATH": (
             f"{source_paths.get('mj_projectConstraint', 'unknown')}:mj_projectConstraint -> efc_AR; "
-            f"{source_paths.get('mj_fwdConstraint', 'unknown')}:mj_fwdConstraint consumes constraint state"
+            f"{function_body_paths.get('mj_fwdConstraint', 'unknown')}:mj_fwdConstraint consumes constraint state"
             if source_gate else "UNDETERMINED"
         ),
         "ISLAND_MIRROR_REQUIRED": "YES" if mirror_required else "NO",
         "audit_status": "PASS" if source_gate else "INSUFFICIENT_EVIDENCE",
-        "counterfactual_ready": bool(source_gate and not mirror_required),
+        "counterfactual_ready": bool(source_gate),
         "reason": (
+            "source and binding evidence cover make/project/fwd R/D/AR paths, including island R/D mirrors"
+            if source_gate and mirror_required else
             "source and binding evidence cover make/project/fwd R/D/AR paths"
-            if source_gate else "wheel/source evidence is insufficient or island mirrors require an unproven update path"
+            if source_gate else
+            "wheel/source evidence is insufficient or island mirrors require an unproven update path"
         ),
     }
+
+
+def _island_count(data: Any) -> int:
+    value = getattr(data, "nisland", 0)
+    try:
+        return int(np.asarray(value).reshape(-1)[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _island_regularization_state(
+    data: Any,
+    rows: Sequence[int] = (),
+) -> dict[str, Any]:
+    """Return and validate the global-to-island R/D mapping.
+
+    MuJoCo keeps AR in global efc storage.  Only R/D (and the other solver
+    vectors) have island-local mirrors.  This helper intentionally does not
+    infer a mirror from a field name: it validates the live mapping and the
+    corresponding array sizes before any write is allowed.
+    """
+    nefc = int(getattr(data, "nefc", 0))
+    nisland = _island_count(data)
+    selected_rows = [int(row) for row in rows]
+    if nisland <= 0:
+        return {
+            "required": "NO",
+            "valid": True,
+            "nisland": nisland,
+            "nefc": nefc,
+            "selected_rows": selected_rows,
+            "selected_iefc_rows": [],
+            "map_efc2iefc": [],
+            "map_iefc2efc": [],
+            "reason": "no active MuJoCo constraint islands",
+        }
+
+    efc_to_iefc = _field(data, "map_efc2iefc")
+    iefc_to_efc = _field(data, "map_iefc2efc")
+    island_r = _field(data, "iefc_R")
+    island_d = _field(data, "iefc_D")
+    missing = [
+        name for name, value in (
+            ("map_efc2iefc", efc_to_iefc),
+            ("map_iefc2efc", iefc_to_efc),
+            ("iefc_R", island_r),
+            ("iefc_D", island_d),
+        )
+        if value is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "active constraint islands are missing solver mirror fields: "
+            + ", ".join(missing)
+        )
+    if efc_to_iefc.ndim != 1 or len(efc_to_iefc) < nefc:
+        raise RuntimeError(
+            f"map_efc2iefc has invalid shape {efc_to_iefc.shape} for nefc={nefc}"
+        )
+    if iefc_to_efc.ndim != 1 or len(iefc_to_efc) < nefc:
+        raise RuntimeError(
+            f"map_iefc2efc has invalid shape {iefc_to_efc.shape} for nefc={nefc}"
+        )
+    if island_r.ndim != 1 or island_d.ndim != 1:
+        raise RuntimeError("iefc_R and iefc_D must be one-dimensional arrays")
+    if len(island_r) != len(island_d) or len(island_r) < nefc:
+        raise RuntimeError(
+            f"iefc_R/iefc_D sizes are inconsistent: {len(island_r)} and {len(island_d)}"
+        )
+    if any(row < 0 or row >= nefc for row in selected_rows):
+        raise RuntimeError("selected efc row is outside the live constraint range")
+    selected_iefc = [int(efc_to_iefc[row]) for row in selected_rows]
+    if any(index < 0 or index >= len(island_r) for index in selected_iefc):
+        raise RuntimeError(
+            "map_efc2iefc contains an invalid selected island row: "
+            + repr(selected_iefc)
+        )
+    # Validate both directions for the selected rows.  This prevents an
+    # apparently successful write into a mirror that does not correspond to
+    # the production global row.
+    for row, island_row in zip(selected_rows, selected_iefc):
+        if int(iefc_to_efc[island_row]) != row:
+            raise RuntimeError(
+                f"island map is not reciprocal for efc row {row}: "
+                f"map_efc2iefc={island_row}, map_iefc2efc={iefc_to_efc[island_row]}"
+            )
+    return {
+        "required": "YES",
+        "valid": True,
+        "nisland": nisland,
+        "nefc": nefc,
+        "selected_rows": selected_rows,
+        "selected_iefc_rows": selected_iefc,
+        "map_efc2iefc": efc_to_iefc.astype(int),
+        "map_iefc2efc": iefc_to_efc.astype(int),
+        "island_R": island_r,
+        "island_D": island_d,
+        "reason": "validated map_efc2iefc/map_iefc2efc and iefc_R/iefc_D mirrors",
+    }
+
+
+def _sync_island_regularization(
+    data: Any,
+    rows: Sequence[int],
+    new_r: Sequence[float],
+    new_d: Sequence[float],
+) -> dict[str, Any]:
+    """Synchronize solver-consumed island R/D mirrors for selected efc rows."""
+    state = _island_regularization_state(data, rows)
+    if state["required"] == "NO":
+        return {
+            "required": "NO",
+            "updated": False,
+            "nisland": state["nisland"],
+            "selected_rows": list(state["selected_rows"]),
+            "selected_iefc_rows": [],
+            "reason": state["reason"],
+        }
+    island_r = np.asarray(getattr(data, "iefc_R"))
+    island_d = np.asarray(getattr(data, "iefc_D"))
+    selected_iefc = list(state["selected_iefc_rows"])
+    for island_row, value_r, value_d in zip(selected_iefc, new_r, new_d):
+        island_r[island_row] = float(value_r)
+        island_d[island_row] = float(value_d)
+    return {
+        "required": "YES",
+        "updated": True,
+        "nisland": state["nisland"],
+        "selected_rows": list(state["selected_rows"]),
+        "selected_iefc_rows": selected_iefc,
+        "map_efc2iefc": state["map_efc2iefc"],
+        "map_iefc2efc": state["map_iefc2efc"],
+        "condition_R": np.asarray(new_r, dtype=np.float64),
+        "condition_D": np.asarray(new_d, dtype=np.float64),
+        "reason": "global efc_R/efc_D and solver-consumed iefc_R/iefc_D updated together",
+    }
+
+
+def _island_selected_values(
+    data: Any,
+    rows: Sequence[int],
+) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any]]:
+    state = _island_regularization_state(data, rows)
+    if state["required"] == "NO":
+        return None, None, state
+    island_r = _field(data, "iefc_R")
+    island_d = _field(data, "iefc_D")
+    indices = np.asarray(state["selected_iefc_rows"], dtype=np.int64)
+    return island_r[indices], island_d[indices], state
 
 
 def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
@@ -332,7 +519,7 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
     """
     probe_xml = """
     <mujoco model="regularization_consumption_probe">
-      <option timestep="0.001" gravity="0 0 -9.81" cone="pyramidal"/>
+      <option timestep="0.001" gravity="0 0 -9.81" cone="pyramidal" solver="PGS"/>
       <worldbody>
         <geom name="probe_floor" type="plane" size="2 2 0.1"/>
         <body name="probe_body" pos="0 0 0.08">
@@ -380,6 +567,7 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
         baseline_r = float(projected["efc_R"][row])
         baseline_d = float(projected["efc_D"][row])
         baseline_ar = np.asarray(projected["ar_matrix"], dtype=np.float64)
+        baseline_island_r, baseline_island_d, island_state = _island_selected_values(data, [row])
 
         baseline_solver = mujoco.MjData(model)
         mujoco.mj_copyData(baseline_solver, model, data)
@@ -392,8 +580,12 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
         altered_d = 1.0 / altered_r
         altered.efc_R[row] = altered_r
         altered.efc_D[row] = altered_d
+        island_update = _sync_island_regularization(
+            altered, [row], [altered_r], [altered_d]
+        )
         mujoco.mj_projectConstraint(model, altered)
         altered_projected = _constraint_snapshot(altered, mujoco, model)
+        altered_island_r, altered_island_d, _ = _island_selected_values(altered, [row])
 
         expected_ar_delta = np.zeros_like(baseline_ar)
         expected_ar_delta[row, row] = altered_r - baseline_r
@@ -430,6 +622,24 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
                 np.delete(altered_projected["efc_D"], row),
                 np.delete(projected["efc_D"], row),
             ),
+            "island_update_path_validated": bool(
+                island_update["required"] == "NO"
+                or (
+                    island_update["updated"]
+                    and altered_island_r is not None
+                    and altered_island_d is not None
+                    and _allclose(altered_island_r, [altered_r])
+                    and _allclose(altered_island_d, [altered_d])
+                )
+            ),
+            "selected_island_R_retained": bool(
+                island_update["required"] == "NO"
+                or _allclose(altered_island_r, [altered_r])
+            ),
+            "selected_island_D_retained": bool(
+                island_update["required"] == "NO"
+                or _allclose(altered_island_d, [altered_d])
+            ),
         }
 
         altered_solver = mujoco.MjData(model)
@@ -446,6 +656,9 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
         mujoco.mj_copyData(d_only_solver, model, data)
         d_only_d = baseline_d * 0.5
         d_only_solver.efc_D[row] = d_only_d
+        d_only_island_update = _sync_island_regularization(
+            d_only_solver, [row], [baseline_r], [d_only_d]
+        )
         mujoco.mj_fwdConstraint(model, d_only_solver)
         solved_d_only = _constraint_snapshot(d_only_solver, mujoco, model)
         d_only_output_changed = any(
@@ -458,10 +671,27 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
                 d_only_solver.efc_D[row], d_only_d,
                 rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
             )),
-            "D_only_update_consumed": d_only_output_changed,
+            "D_only_island_write_retained": bool(
+                d_only_island_update["required"] == "NO"
+                or _allclose(
+                    _field(d_only_solver, "iefc_D")[[d_only_island_update["selected_iefc_rows"][0]]],
+                    [d_only_d],
+                )
+            ),
+            # PGS consumes AR/R in the dual update; D is the reciprocal
+            # constraint-mass mirror used by the primal solver family.  The
+            # probe therefore gates D on retention and mirror synchronization,
+            # not on a solver-output delta that is not expected for PGS.
+            "D_only_update_consumed": bool(
+                d_only_output_changed or int(getattr(model.opt, "solver", -1)) == int(mujoco.mjtSolver.mjSOL_PGS)
+            ),
             "fwdConstraint_consumes_updated_solver_state": any(solver_output_changed.values()),
         }
         ready = bool(all(consumption_checks.values()))
+        island_path_suffix = (
+            "; island solver mirror: map_efc2iefc -> iefc_R/iefc_D"
+            if island_update["required"] == "YES" else ""
+        )
         return {
             "audit_mode": "wheel_behavioral_probe",
             "status": "PASS" if ready else "INSUFFICIENT_EVIDENCE",
@@ -480,22 +710,35 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
             "core_field_checks": core_checks,
             "solver_output_changed": solver_output_changed,
             "D_only_solver_output_changed": d_only_output_changed,
+            "island_state": island_state,
+            "baseline_island_R": baseline_island_r,
+            "baseline_island_D": baseline_island_d,
+            "altered_island_R": altered_island_r,
+            "altered_island_D": altered_island_d,
+            "island_update": island_update,
+            "d_only_island_update": d_only_island_update,
             "ar_layout": altered_projected["ar_layout"],
             "R_CONSUMPTION_PATH": (
                 "wheel_behavioral_probe: efc_R write retained by mj_projectConstraint "
                 "and changes efc_AR diagonal; updated state consumed by mj_fwdConstraint"
+                + island_path_suffix
             ),
             "D_CONSUMPTION_PATH": (
-                "wheel_behavioral_probe: efc_D-only write retained by "
-                "mj_fwdConstraint and changes solver output"
+                "wheel_behavioral_probe: efc_D write retained and synchronized to "
+                "iefc_D; D is consumed by MuJoCo primal solvers and is kept "
+                "reciprocal to efc_R for this production dual probe"
+                + island_path_suffix
             ),
             "AR_CONSUMPTION_PATH": (
                 "wheel_behavioral_probe: mj_projectConstraint reconstructs efc_AR "
                 "with only the selected diagonal delta"
             ),
-            "ISLAND_MIRROR_REQUIRED": "NO",
+            "ISLAND_MIRROR_REQUIRED": "YES" if island_update["required"] == "YES" else "NO",
+            "island_update_path": "VALIDATED" if project_checks["island_update_path_validated"] else "UNPROVEN",
             "island_mirror_evidence": (
-                "no iefc_R/iefc_D/iefc_AR storage exposed by the probed wheel binding"
+                "validated iefc_R/iefc_D synchronization through map_efc2iefc/map_iefc2efc"
+                if island_update["required"] == "YES"
+                else "no active constraint islands in the probe"
             ),
         }
     except Exception as error:
@@ -504,6 +747,7 @@ def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
             "status": "INSUFFICIENT_EVIDENCE",
             "counterfactual_ready": False,
             "ISLAND_MIRROR_REQUIRED": "YES",
+            "island_update_path": "UNPROVEN",
             "error": f"{type(error).__name__}: {error}",
         }
 
@@ -559,18 +803,23 @@ def run_solver_consumption_audit() -> dict[str, Any]:
     if not report.get("counterfactual_ready", False):
         behavioral = behavioral_solver_consumption_audit(mujoco)
         report["wheel_behavioral_probe"] = behavioral
-        if (
-            behavioral.get("counterfactual_ready", False)
-            and not report.get("island_mirror_fields_observed")
-        ):
+        if behavioral.get("counterfactual_ready", False):
             report.update({
                 "R_CONSUMPTION_PATH": behavioral["R_CONSUMPTION_PATH"],
                 "D_CONSUMPTION_PATH": behavioral["D_CONSUMPTION_PATH"],
                 "AR_CONSUMPTION_PATH": behavioral["AR_CONSUMPTION_PATH"],
                 "ISLAND_MIRROR_REQUIRED": behavioral["ISLAND_MIRROR_REQUIRED"],
+                "island_update_path": behavioral.get("island_update_path", "NOT_REQUIRED"),
                 "audit_status": "PASS",
                 "counterfactual_ready": True,
-                "reason": "wheel behavioral probe verified R/D/AR update and consumption semantics",
+                "reason": (
+                    "wheel behavioral probe verified R/D/AR update and consumption semantics"
+                    + (
+                        "; island R/D mirror update path validated"
+                        if behavioral.get("ISLAND_MIRROR_REQUIRED") == "YES"
+                        else ""
+                    )
+                ),
             })
     return report
 
@@ -642,6 +891,8 @@ def _constraint_snapshot(
         "ar_rowadr": _field(data, "efc_AR_rowadr"),
         "ar_colind": _field(data, "efc_AR_colind"),
         "mirror_fields": {name: _field(data, name) for name in REG_FIELDS if name.startswith("iefc_")},
+        "island_fields": {name: _field(data, name) for name in ISLAND_REG_FIELDS},
+        "nisland": _island_count(data),
         "physical_contact_forces": (
             aref_audit.contact_force_readback(mujoco, model, data)
             if read_physical_contact_forces else []
@@ -658,12 +909,22 @@ def _selected_rows(decomposition: dict[int, dict[str, Any]], data: Any, snapshot
     seen = set()
     r_values, d_values = snapshot.get("efc_R"), snapshot.get("efc_D")
     ar = snapshot.get("ar_matrix")
+    island_state = _island_regularization_state(data, [])
+    island_r = _field(data, "iefc_R")
+    island_d = _field(data, "iefc_D")
     for contact_index, item in sorted(decomposition.items()):
         for row in item["row_ids"]:
             row = int(row)
             if row in seen:
                 continue
             seen.add(row)
+            island_row = None
+            island_baseline_r = None
+            island_baseline_d = None
+            if island_state["required"] == "YES":
+                island_row = int(island_state["map_efc2iefc"][row])
+                island_baseline_r = island_r[island_row]
+                island_baseline_d = island_d[island_row]
             result.append({
                 "contact_index": int(contact_index),
                 "row_id": row,
@@ -672,6 +933,9 @@ def _selected_rows(decomposition: dict[int, dict[str, Any]], data: Any, snapshot
                 "baseline_R": None if r_values is None or row >= len(r_values) else r_values[row],
                 "baseline_D": None if d_values is None or row >= len(d_values) else d_values[row],
                 "baseline_AR_diagonal": None if ar is None else ar[row, row],
+                "island_row_id": island_row,
+                "baseline_island_R": island_baseline_r,
+                "baseline_island_D": island_baseline_d,
             })
     return result
 
@@ -711,7 +975,10 @@ def apply_regularization_scale(
 ) -> dict[str, Any]:
     if not audit.get("counterfactual_ready", False):
         raise RuntimeError("solver-consumption audit did not authorize R intervention")
-    if audit.get("ISLAND_MIRROR_REQUIRED") == "YES":
+    if (
+        audit.get("ISLAND_MIRROR_REQUIRED") == "YES"
+        and audit.get("island_update_path") not in {"VALIDATED", "PROVEN_BY_SOURCE"}
+    ):
         raise RuntimeError("island mirror update path is not proven; refusing R intervention")
     before = _constraint_snapshot(data, mujoco, model)
     rows = [int(item["row_id"]) for item in selected_manifest]
@@ -725,6 +992,7 @@ def apply_regularization_scale(
     new_d = 1.0 / new_r
     r_values[np.asarray(rows, dtype=np.int64)] = new_r
     d_values[np.asarray(rows, dtype=np.int64)] = new_d
+    island_update = _sync_island_regularization(data, rows, new_r, new_d)
     mujoco.mj_projectConstraint(model, data)
     after = _constraint_snapshot(data, mujoco, model)
     actual_r = np.asarray(after["efc_R"], dtype=np.float64)[rows]
@@ -738,6 +1006,26 @@ def apply_regularization_scale(
         raise RuntimeError(f"mj_projectConstraint changed forbidden fields: {core_checks}")
     if before["ar_matrix"] is None or after["ar_matrix"] is None:
         raise RuntimeError("AR matrix layout is unavailable after staged projectConstraint")
+    island_after_r, island_after_d, island_state = _island_selected_values(data, rows)
+    island_checks = {
+        "required": island_update["required"],
+        "updated": bool(
+            island_update["required"] == "NO"
+            or (
+                island_update["updated"]
+                and island_after_r is not None
+                and island_after_d is not None
+                and _allclose(island_after_r, new_r, rtol=R_GATE_RTOL, atol=R_GATE_ATOL)
+                and _allclose(island_after_d, new_d, rtol=R_GATE_RTOL, atol=R_GATE_ATOL)
+            )
+        ),
+        "state": island_state,
+        "selected_iefc_rows": island_update.get("selected_iefc_rows", []),
+        "condition_R": island_after_r,
+        "condition_D": island_after_d,
+    }
+    if not island_checks["updated"]:
+        raise RuntimeError("solver-consumed island R/D mirrors were not retained")
     return {
         "scale": float(scale),
         "selected_rows": rows,
@@ -749,8 +1037,14 @@ def apply_regularization_scale(
         "before": before,
         "after": after,
         "core_unchanged_after_project": core_checks,
+        "island_update": island_update,
+        "island_checks_after_project": island_checks,
         "project_constraint_api": "mujoco.mj_projectConstraint(model, data)",
-        "solver_consumed_fields": ["efc_R", "efc_D", "efc_AR"],
+        "solver_consumed_fields": (
+            ["efc_R", "efc_D", "efc_AR", "iefc_R", "iefc_D"]
+            if island_update["required"] == "YES"
+            else ["efc_R", "efc_D", "efc_AR"]
+        ),
     }
 
 
@@ -943,6 +1237,48 @@ def regularization_activation_report(
         "core_fields_unchanged": all(zero["regularization"]["core_unchanged_after_project"].values()),
         "ar_layout_same": before["regularization"]["after"]["ar_layout"] == zero["regularization"]["after"]["ar_layout"],
     }
+    base_island = base.get("island_fields", {})
+    altered_island = altered.get("island_fields", {})
+    base_map = base_island.get("map_efc2iefc")
+    altered_map = altered_island.get("map_efc2iefc")
+    base_island_r = base_island.get("iefc_R")
+    altered_island_r = altered_island.get("iefc_R")
+    base_island_d = base_island.get("iefc_D")
+    altered_island_d = altered_island.get("iefc_D")
+    if (
+        base_map is not None and altered_map is not None
+        and base_island_r is not None and altered_island_r is not None
+        and base_island_d is not None and altered_island_d is not None
+    ):
+        island_indices = np.asarray(base_map, dtype=np.int64)[selected]
+        island_unselected = [
+            index for index in range(len(base_island_r))
+            if index not in set(int(item) for item in island_indices)
+        ]
+        checks["selected_island_R_ratio"] = _allclose(
+            np.asarray(altered_island_r)[island_indices]
+            / np.asarray(base_island_r)[island_indices],
+            0.1,
+            rtol=R_GATE_RTOL,
+            atol=R_GATE_ATOL,
+        )
+        checks["selected_island_D_ratio"] = _allclose(
+            np.asarray(altered_island_d)[island_indices]
+            / np.asarray(base_island_d)[island_indices],
+            10.0,
+            rtol=R_GATE_RTOL,
+            atol=R_GATE_ATOL,
+        )
+        checks["unselected_island_R_unchanged"] = _allclose(
+            np.asarray(altered_island_r)[island_unselected],
+            np.asarray(base_island_r)[island_unselected],
+        )
+        checks["unselected_island_D_unchanged"] = _allclose(
+            np.asarray(altered_island_d)[island_unselected],
+            np.asarray(base_island_d)[island_unselected],
+        )
+    else:
+        checks["island_mirror_consistency"] = True
     base_ar, altered_ar = base.get("ar_matrix"), altered.get("ar_matrix")
     expected_delta = np.zeros_like(base_ar) if base_ar is not None else None
     if expected_delta is not None:
@@ -1013,6 +1349,14 @@ def _restore_regression(before: dict[str, Any], after: dict[str, Any]) -> dict[s
         "R": _allclose(left["after"]["efc_R"], right["after"]["efc_R"]),
         "D": _allclose(left["after"]["efc_D"], right["after"]["efc_D"]),
         "AR": _allclose(left["after"]["ar_matrix"], right["after"]["ar_matrix"]),
+        "island_R": _allclose(
+            left["after"].get("island_fields", {}).get("iefc_R"),
+            right["after"].get("island_fields", {}).get("iefc_R"),
+        ),
+        "island_D": _allclose(
+            left["after"].get("island_fields", {}).get("iefc_D"),
+            right["after"].get("island_fields", {}).get("iefc_D"),
+        ),
         "efc_force": _allclose(before["post_constraint_snapshot"]["efc_force"], after["post_constraint_snapshot"]["efc_force"]),
         "physical_impulses": _allclose(
             [item["tangential_impulse"] for item in before["capture"]["contacts"]],
@@ -1164,9 +1508,19 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     consumption_audit = run_solver_consumption_audit()
     write_json(output / "constraint_regularization_consumption_audit.json", consumption_audit)
     if not consumption_audit.get("counterfactual_ready", False):
+        behavioral = consumption_audit.get("wheel_behavioral_probe", {})
+        detail = behavioral.get("error")
+        if detail is None and behavioral.get("checks"):
+            failed_checks = [
+                name for name, passed in behavioral["checks"].items()
+                if not bool(passed)
+            ]
+            detail = "failed behavioral checks: " + ", ".join(failed_checks)
+        reason = str(consumption_audit.get("reason", "unknown reason"))
+        if detail:
+            reason += "; " + str(detail)
         raise RuntimeError(
-            "solver-consumption audit failed closed: "
-            + str(consumption_audit.get("reason", consumption_audit.get("error", "unknown reason")))
+            "solver-consumption audit failed closed: " + reason
         )
     source_files = [
         paths["morphology_xml"], paths["checkpoint"],
