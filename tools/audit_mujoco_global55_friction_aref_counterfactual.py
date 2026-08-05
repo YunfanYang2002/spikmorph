@@ -201,6 +201,27 @@ def _allclose(left: Any, right: Any, rtol: float = REGRESSION_RTOL, atol: float 
     return bool(np.allclose(np.asarray(left), np.asarray(right), rtol=rtol, atol=atol))
 
 
+def _json_normalize(value: Any) -> Any:
+    """Normalize numpy scalars before delegating to the shared JSON writer."""
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return [_json_normalize(item) for item in value.tolist()]
+    if isinstance(value, dict):
+        return {key: _json_normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_normalize(item) for item in value]
+    return value
+
+
+def write_json(path: Path, payload: Any) -> None:
+    oracle.write_json(path, _json_normalize(payload))
+
+
 def _array(data: Any, name: str) -> np.ndarray | None:
     value = getattr(data, name, None)
     return None if value is None else np.asarray(value, dtype=np.float64).copy()
@@ -851,7 +872,7 @@ def custom_pipeline_one_step_regression(
     checks = {
         "post_qpos": _allclose(staged.qpos, full.qpos),
         "post_qvel": _allclose(staged.qvel, full.qvel),
-        "post_time": np.isclose(float(staged.time), float(full.time), rtol=REGRESSION_RTOL, atol=REGRESSION_ATOL),
+        "post_time": bool(np.isclose(float(staged.time), float(full.time), rtol=REGRESSION_RTOL, atol=REGRESSION_ATOL)),
     }
     staged_capture = capture_after_integration(mujoco, model, staged, snapshot, mapping)
     full_capture = capture_after_integration(mujoco, model, full, snapshot, mapping)
@@ -881,7 +902,7 @@ def write_condition(output: Path, condition: dict[str, Any]) -> None:
         ("solver_excess.json", condition["excess"]),
         ("one_step_result.json", {"post_qpos": capture["post_state"]["qpos"], "post_qvel": capture["post_state"]["qvel"], "target_post_slip": condition["excess"]["post_slip"], "custom_integration_count": 1}),
     ):
-        oracle.write_json(target / filename, payload)
+        write_json(target / filename, payload)
 
 
 def write_git_identity(output: Path) -> None:
@@ -973,8 +994,8 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     mujoco, model, snapshot = recorder.raw_mujoco, recorder.raw_model, recorder.global55_snapshot
     if mujoco is None or model is None or snapshot is None:
         raise RuntimeError("global55 replay did not provide native model/data/snapshot")
-    oracle.write_json(output / "global55_pre_state_snapshot.json", state_input_snapshot(snapshot))
-    oracle.write_json(output / "state_copy_manifest.json", {**state_copy_manifest(snapshot), "formal_snapshot_copy_evidence": recorder.snapshot_copy_evidence})
+    write_json(output / "global55_pre_state_snapshot.json", state_input_snapshot(snapshot))
+    write_json(output / "state_copy_manifest.json", {**state_copy_manifest(snapshot), "formal_snapshot_copy_evidence": recorder.snapshot_copy_evidence})
     production_cone = int(mujoco.mjtCone.mjCONE_PYRAMIDAL)
     if int(model.opt.cone) != production_cone:
         raise RuntimeError("production model cone is not mjCONE_PYRAMIDAL")
@@ -987,7 +1008,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     decomposition, decomposition_capture = _extract_decompositions(decomposition_data, mujoco, model, mapping, snapshot)
     for item in decomposition.values():
         item.pop("fitted_components", None)
-    oracle.write_json(output / "friction_aref_decomposition.json", {
+    write_json(output / "friction_aref_decomposition.json", {
         "contacts": decomposition,
         "preconstraint_geometry_probe": decomposition_capture,
     })
@@ -1005,21 +1026,21 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         condition["capture"]["decomposition"] = decomposition
 
     activation = aref_activation(decomposition, condition_aref)
-    oracle.write_json(output / "aref_counterfactual_activation.json", activation)
+    write_json(output / "aref_counterfactual_activation.json", activation)
     invariant = invariant_validation(conditions)
-    oracle.write_json(output / "counterfactual_invariant_validation.json", invariant)
+    write_json(output / "counterfactual_invariant_validation.json", invariant)
     reference = _load_reference(paths["corrected_oracle"])
     baseline = baseline_regression(conditions["aref_scale_1_before"], reference)
     restore = restore_regression(conditions["aref_scale_1_before"], conditions["aref_scale_1_after_restore"])
-    oracle.write_json(output / "baseline_regression.json", baseline)
-    oracle.write_json(output / "restore_regression.json", restore)
+    write_json(output / "baseline_regression.json", baseline)
+    write_json(output / "restore_regression.json", restore)
     staged_baseline = _constraint_array_report(
         conditions["aref_scale_1_before"]["post_constraint_arrays"],
         _full_forward_constraint_arrays(mujoco, model, snapshot),
     )
-    oracle.write_json(output / "staged_pipeline_baseline_regression.json", staged_baseline)
+    write_json(output / "staged_pipeline_baseline_regression.json", staged_baseline)
     custom_step = custom_pipeline_one_step_regression(mujoco, model, snapshot, mapping, decomposition)
-    oracle.write_json(output / "custom_pipeline_one_step_regression.json", custom_step)
+    write_json(output / "custom_pipeline_one_step_regression.json", custom_step)
 
     hashes_after = {str(path): oracle.sha256(path) for path in source_files}
     source_unchanged = hashes_before == hashes_after
@@ -1041,7 +1062,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     comparison["actual_friction_impulse_change"] = np.asarray(conditions["aref_scale_0"]["excess"]["actual_tangent_impulse_vector"]) - np.asarray(conditions["aref_scale_1_before"]["excess"]["actual_tangent_impulse_vector"])
     comparison["rigid_demand_change_from_normal_impulse_change"] = np.asarray(conditions["aref_scale_0"]["excess"]["rigid_demand_vector"]) - np.asarray(conditions["aref_scale_1_before"]["excess"]["rigid_demand_vector"])
     comparison["solver_excess_change"] = np.asarray(conditions["aref_scale_0"]["excess"]["solver_excess_vector"]) - np.asarray(conditions["aref_scale_1_before"]["excess"]["solver_excess_vector"])
-    oracle.write_json(output / "aref_counterfactual_comparison.json", comparison)
+    write_json(output / "aref_counterfactual_comparison.json", comparison)
     metadata = {
         "created_at": datetime.now().astimezone().isoformat(), "backend": "mujoco", "mujoco_version": getattr(mujoco, "__version__", None),
         "morphology": MORPHOLOGY, "morphology_xml": str(paths["morphology_xml"]), "morphology_xml_sha256": hashes_before[str(paths["morphology_xml"])],
@@ -1066,7 +1087,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     summary["baseline_solver_excess_Ns"] = conditions["aref_scale_1_before"]["excess"]["solver_excess_norm"]
     summary["zero_aref_solver_excess_Ns"] = conditions["aref_scale_0"]["excess"]["solver_excess_norm"]
     for filename, payload in (("metadata.json", metadata), ("validation.json", validation), ("summary.json", summary), ("source_purity.json", {"hashes_before": hashes_before, "hashes_after": hashes_after, "source_hashes_unchanged": source_unchanged, "formal_data_mutated_by_probe": False})):
-        oracle.write_json(output / filename, payload)
+        write_json(output / filename, payload)
     return validation
 
 
@@ -1108,9 +1129,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(trace, file=sys.stderr, end="")
                 (output / "traceback.txt").write_text(trace, encoding="utf-8")
                 failure = failure_payload(error)
-                oracle.write_json(output / "failure_context.json", {"error": str(error), "traceback_file": "traceback.txt", "partial_conditions": [str(path) for path in sorted((output / "conditions").glob("*") if (output / "conditions").is_dir() else [])]})
-                oracle.write_json(output / "validation.json", failure)
-                oracle.write_json(output / "summary.json", failure)
+                write_json(output / "failure_context.json", {"error": str(error), "traceback_file": "traceback.txt", "partial_conditions": [str(path) for path in sorted((output / "conditions").glob("*") if (output / "conditions").is_dir() else [])]})
+                write_json(output / "validation.json", failure)
+                write_json(output / "summary.json", failure)
                 return_code = 2
         package = _package(output, zip_path)
         print(f"ZIP_VERIFY={package['ZIP_VERIFY']}")
@@ -1128,9 +1149,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         (output / "run.log").write_text(trace, encoding="utf-8")
         (output / "traceback.txt").write_text(trace, encoding="utf-8")
         failure = failure_payload(error)
-        oracle.write_json(output / "failure_context.json", {"error": str(error), "traceback_file": "traceback.txt"})
-        oracle.write_json(output / "validation.json", failure)
-        oracle.write_json(output / "summary.json", failure)
+        write_json(output / "failure_context.json", {"error": str(error), "traceback_file": "traceback.txt"})
+        write_json(output / "validation.json", failure)
+        write_json(output / "summary.json", failure)
         package = _package(output, zip_path)
         print(f"ZIP_VERIFY={package['ZIP_VERIFY']}")
         print(f"ZIP_SHA256={package['ZIP_SHA256']}")

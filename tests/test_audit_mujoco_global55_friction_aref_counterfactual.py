@@ -161,6 +161,12 @@ class ArefCounterfactualTests(unittest.TestCase):
         self.assertEqual(AUDIT._optional_constraint_row_value(data, "efc_b", 2), 3.0)
         np.testing.assert_allclose(AUDIT._optional_constraint_row_value(data, "efc_AR", 1), [5.0])
 
+    def test_json_writer_normalizes_numpy_bool_and_scalars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload.json"
+            AUDIT.write_json(path, {"check": np.bool_(True), "value": np.float64(1.25)})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"check": True, "value": 1.25})
+
 
 if __name__ == "__main__":
     unittest.main()
