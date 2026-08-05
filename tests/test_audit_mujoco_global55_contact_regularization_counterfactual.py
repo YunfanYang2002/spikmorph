@@ -25,6 +25,9 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class RegularizationCounterfactualTests(unittest.TestCase):
+    def test_numpy_bool_compatibility_alias_is_installed_before_replay_helpers(self):
+        self.assertIs(np.bool, np.bool_)
+
     def test_source_consumption_audit_requires_function_and_field_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

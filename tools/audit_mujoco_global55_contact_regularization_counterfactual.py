@@ -23,6 +23,12 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+# Older Gym/experiment dependencies still reference the removed NumPy 1.x
+# alias during import.  Install the compatibility alias before importing the
+# replay helpers; the current tool does not otherwise use ``np.bool``.
+if "bool" not in np.__dict__:
+    np.bool = np.bool_
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
