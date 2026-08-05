@@ -65,6 +65,41 @@ class ArefCounterfactualTests(unittest.TestCase):
         self.assertEqual(report["MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER"], "FRICTION_REFERENCE_ACCELERATION_DOMINANT")
         self.assertEqual(report["NEXT_ACTION"], "NO_ADDITIONAL_SOLVER_COUNTERFACTUAL_REQUIRED")
 
+    def test_solver_excess_schema_has_canonical_and_compatibility_names(self):
+        capture = {
+            "contacts": [{
+                "tangential_impulse": [3.0, 4.0],
+                "normal_impulse": 6.0,
+                "friction": [0.5, 0.5, 0.5],
+                "pre_tangential_velocity": [1.0, 0.0],
+                "post_tangential_velocity": [0.5, 0.0],
+            }],
+        }
+        demand = {"limb_12_contact_index": 0, "limb_12_tangent_impulse_2d": [0.0, 4.0]}
+        excess = AUDIT.compute_solver_excess(capture, demand)
+        self.assertTrue(AUDIT.validate_excess_schema(excess)["valid"])
+        np.testing.assert_allclose(excess["actual_tangent_impulse"], excess["actual_tangent_impulse_vector"])
+        np.testing.assert_allclose(excess["rigid_demand_impulse"], excess["rigid_demand_vector"])
+
+    def test_restore_regression_uses_canonical_schema_without_keyerror(self):
+        row = {"efc_row": 0, "efc_type": 6, "efc_id": 1, "efc_aref": 2.0, "efc_R": 0.1, "efc_D": 0.2, "efc_diagApprox": 0.3, "efc_vel": 0.4, "efc_force": 1.0}
+        contact = {"geom1_name": "limb/12", "geom2_name": "floor/0", "point_world": [0.0, 0.0, 0.0], "physical_basis_world_rows": np.eye(3), "normal_impulse": 6.0, "solver_rows": [row]}
+        def condition():
+            return {
+                "capture": {"mass_matrix": np.eye(2), "J_phys": np.ones((3, 2)), "W_phys": np.eye(3), "contacts": [contact.copy()]},
+                "excess": {"actual_tangent_impulse_vector": [3.0, 4.0], "actual_tangent_impulse_norm": 5.0, "rigid_demand_vector": [0.0, 4.0], "rigid_demand_norm": 4.0, "solver_excess_norm": 1.0, "solver_excess_vector": [3.0, 0.0], "solver_excess_vector_norm": 3.0, "normal_impulse": 6.0, "friction_cap": 3.0, "friction_cap_utilisation": 5.0 / 3.0, "pre_slip": [1.0, 0.0], "post_slip": [0.1, 0.0]},
+            }
+        report = AUDIT.restore_regression(condition(), condition())
+        self.assertEqual(report["AREF_RESTORE_REPRODUCTION"], "PASS")
+        changed = condition()
+        changed["excess"]["actual_tangent_impulse_vector"] = [3.1, 4.0]
+        self.assertEqual(AUDIT.restore_regression(condition(), changed)["AREF_RESTORE_REPRODUCTION"], "FAIL")
+
+    def test_incomplete_restore_schema_fails_closed_without_keyerror(self):
+        report = AUDIT.restore_regression({"capture": {}, "excess": {}}, {"capture": {}, "excess": {}})
+        self.assertEqual(report["AREF_RESTORE_REPRODUCTION"], "FAIL")
+        self.assertFalse(report["checks"]["excess_schema"])
+
     def test_isolation_reports_only_allowed_aref_effects(self):
         self.assertIn("efc_R", AUDIT.invariant_validation.__code__.co_consts)
         self.assertIn("friction tangent component of efc_aref", MODULE_PATH.read_text(encoding="utf-8"))

@@ -49,6 +49,20 @@ REGRESSION_ATOL = 1.0e-9
 AREF_RTOL = 1.0e-10
 AREF_ATOL = 1.0e-11
 ROOT_LINEAR_COLUMNS = (0, 1, 2)
+EXCESS_REQUIRED_FIELDS = (
+    "actual_tangent_impulse_vector",
+    "actual_tangent_impulse_norm",
+    "rigid_demand_vector",
+    "rigid_demand_norm",
+    "solver_excess_norm",
+    "solver_excess_vector",
+    "solver_excess_vector_norm",
+    "normal_impulse",
+    "friction_cap",
+    "friction_cap_utilisation",
+    "pre_slip",
+    "post_slip",
+)
 
 
 class Tee:
@@ -517,7 +531,7 @@ def compute_solver_excess(
     cosine = float(np.dot(actual, rigid) / denominator) if denominator else None
     angle = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))) if cosine is not None else 0.0)
     contact = capture["contacts"][index]
-    return {
+    result = {
         "target": "limb/12-floor in shared physical contact basis",
         "actual_tangent_impulse_vector": actual,
         "actual_tangent_impulse_norm": actual_norm,
@@ -532,6 +546,20 @@ def compute_solver_excess(
         "friction_cap_utilisation": actual_norm / float(contact["friction"][0] * contact["normal_impulse"]),
         "pre_slip": np.asarray(contact["pre_tangential_velocity"], dtype=np.float64),
         "post_slip": np.asarray(contact["post_tangential_velocity"], dtype=np.float64),
+    }
+    # Compatibility aliases for the validated cone helper's historical schema.
+    # All new code below uses the explicit *_vector names above.
+    result["actual_tangent_impulse"] = result["actual_tangent_impulse_vector"]
+    result["rigid_demand_impulse"] = result["rigid_demand_vector"]
+    return result
+
+
+def validate_excess_schema(excess: dict[str, Any]) -> dict[str, Any]:
+    missing = [name for name in EXCESS_REQUIRED_FIELDS if name not in excess]
+    return {
+        "required_fields": list(EXCESS_REQUIRED_FIELDS),
+        "missing_fields": missing,
+        "valid": not missing,
     }
 
 
@@ -615,6 +643,12 @@ def run_condition(
     capture = capture_after_integration(mujoco, model, data, snapshot, mapping, solver_data)
     demand = shared_physical_global_demand(capture)
     excess = compute_solver_excess(capture, demand)
+    excess_schema = validate_excess_schema(excess)
+    if not excess_schema["valid"]:
+        raise RuntimeError(
+            "solver-excess schema is incomplete: "
+            + ", ".join(excess_schema["missing_fields"])
+        )
     return {
         "condition_name": condition_name,
         "condition_label": condition_label,
@@ -623,6 +657,7 @@ def run_condition(
         "budget": {"shared_physical_global_demand": demand},
         "shared_demand": demand,
         "excess": excess,
+        "excess_schema": excess_schema,
         "original_aref": original_aref,
         "condition_aref": condition_aref,
         "pre_constraint_arrays": pre_constraint,
@@ -662,7 +697,82 @@ def baseline_regression(condition: dict[str, Any], reference: dict[str, Any]) ->
 
 
 def restore_regression(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    return cone_helper.restore_regression(before, after)
+    before_schema = validate_excess_schema(before.get("excess", {}))
+    after_schema = validate_excess_schema(after.get("excess", {}))
+    if not before_schema["valid"] or not after_schema["valid"]:
+        return {
+            "checks": {"excess_schema": False},
+            "row_checks": {},
+            "excess_schema": {"before": before_schema, "after": after_schema},
+            "AREF_RESTORE_REPRODUCTION": "FAIL",
+            "PYRAMIDAL_RESTORE_REPRODUCTION": "FAIL",
+        }
+    left_capture, right_capture = before["capture"], after["capture"]
+    left_contacts = {_contact_key(item): item for item in left_capture["contacts"]}
+    right_contacts = {_contact_key(item): item for item in right_capture["contacts"]}
+    common = sorted(set(left_contacts) & set(right_contacts))
+    checks = {
+        "mass_matrix": _allclose(left_capture["mass_matrix"], right_capture["mass_matrix"]),
+        "physical_jacobian": _allclose(left_capture["J_phys"], right_capture["J_phys"]),
+        "physical_delassus": _allclose(left_capture["W_phys"], right_capture["W_phys"]),
+        "contact_set": set(left_contacts) == set(right_contacts),
+        "contact_points": set(left_contacts) == set(right_contacts) and all(
+            _allclose(left_contacts[key]["point_world"], right_contacts[key]["point_world"])
+            for key in common
+        ),
+        "contact_bases": set(left_contacts) == set(right_contacts) and all(
+            _allclose(left_contacts[key]["physical_basis_world_rows"], right_contacts[key]["physical_basis_world_rows"])
+            for key in common
+        ),
+        "normal_impulses": set(left_contacts) == set(right_contacts) and all(
+            np.isclose(left_contacts[key]["normal_impulse"], right_contacts[key]["normal_impulse"], rtol=REGRESSION_RTOL, atol=REGRESSION_ATOL)
+            for key in common
+        ),
+        "actual_tangent_impulse": _allclose(
+            before["excess"]["actual_tangent_impulse_vector"],
+            after["excess"]["actual_tangent_impulse_vector"],
+        ),
+        "rigid_demand": _allclose(
+            before["excess"]["rigid_demand_vector"],
+            after["excess"]["rigid_demand_vector"],
+        ),
+        "solver_excess": _allclose(
+            before["excess"]["solver_excess_norm"],
+            after["excess"]["solver_excess_norm"],
+        ),
+        "post_slip": _allclose(before["excess"]["post_slip"], after["excess"]["post_slip"]),
+    }
+    row_fields = ("efc_row", "efc_type", "efc_id", "efc_aref", "efc_R", "efc_D", "efc_diagApprox", "efc_vel", "efc_force")
+    row_checks = {}
+    if set(left_contacts) == set(right_contacts):
+        for key in common:
+            left_rows = left_contacts[key]["solver_rows"]
+            right_rows = right_contacts[key]["solver_rows"]
+            row_checks["__".join(key)] = len(left_rows) == len(right_rows) and all(
+                all(
+                    (field not in left_row and field not in right_row)
+                    or (field in left_row and field in right_row and (
+                        _allclose(left_row[field], right_row[field])
+                        if field not in ("efc_row", "efc_type", "efc_id")
+                        else left_row[field] == right_row[field]
+                    ))
+                    for field in row_fields
+                )
+                for left_row, right_row in zip(left_rows, right_rows)
+            )
+    checks["constraint_rows"] = bool(row_checks) and all(row_checks.values())
+    checks["excess_schema"] = True
+    return {
+        "checks": checks,
+        "row_checks": row_checks,
+        "AREF_RESTORE_REPRODUCTION": "PASS" if all(checks.values()) else "FAIL",
+        # Retain the old validation key used by the existing artifact contract.
+        "PYRAMIDAL_RESTORE_REPRODUCTION": "PASS" if all(checks.values()) else "FAIL",
+    }
+
+
+def _contact_key(contact: dict[str, Any]) -> tuple[str, str]:
+    return (str(contact["geom1_name"]), str(contact["geom2_name"]))
 
 
 def invariant_validation(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
