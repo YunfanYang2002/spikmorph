@@ -1,9 +1,9 @@
-"""Fixed-global55 MuJoCo contact-row regularization counterfactual.
+"""Fixed-global55 MuJoCo contact-row regularization diagnostics.
 
-This diagnostic is deliberately fail-closed.  Before formal replay it audits
-the installed MuJoCo source/wheel evidence for the actual R/D/AR consumption
-path.  If that evidence is unavailable, or if AR/island storage cannot be
-updated consistently, it writes a failure artifact and never runs R=0.1.
+The default mode runs the formal contact-row R counterfactual.  The
+``consumption-audit-only`` mode first replays to the fixed global55 state,
+constructs constraints on an independent clone, and performs only populated
+runtime consumption probes.  It never runs R_SCALE_0P1.
 """
 
 from __future__ import annotations
@@ -80,7 +80,12 @@ class Tee:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Run fixed-global55 pyramidal contact-row R counterfactual."
+        description="Run fixed-global55 pyramidal contact-row R diagnostics."
+    )
+    result.add_argument(
+        "--mode",
+        choices=("consumption-audit-only", "counterfactual"),
+        default="counterfactual",
     )
     result.add_argument("--formal-server-defaults", action="store_true")
     result.add_argument("--checkpoint")
@@ -88,6 +93,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--corrected-oracle")
     result.add_argument("--output-dir")
     result.add_argument("--zip-path")
+    result.add_argument("--mujoco-source-dir")
     result.add_argument("--morphology-id", default=MORPHOLOGY)
     result.add_argument("--cfg", default="configs/ft.yaml")
     result.add_argument("--seed", type=int, default=1409)
@@ -95,13 +101,18 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _default_output_paths() -> tuple[Path, Path]:
+def _default_output_paths(mode: str = "counterfactual") -> tuple[Path, Path]:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+    suffix = (
+        "consumption_audit"
+        if mode == "consumption-audit-only"
+        else "counterfactual"
+    )
     return (
         REPO_ROOT / "output/diagnostics"
-        / f"mujoco_global55_contact_regularization_counterfactual_{stamp}",
+        / f"mujoco_global55_contact_regularization_{suffix}_{stamp}",
         REPO_ROOT / "tmp"
-        / f"mujoco_global55_contact_regularization_counterfactual_{stamp}.zip",
+        / f"mujoco_global55_contact_regularization_{suffix}_{stamp}.zip",
     )
 
 
@@ -120,7 +131,7 @@ def resolve_arguments(args: argparse.Namespace) -> argparse.Namespace:
     ]
     if missing:
         raise ValueError(f"missing required arguments: {', '.join(missing)}")
-    default_output, default_zip = _default_output_paths()
+    default_output, default_zip = _default_output_paths(args.mode)
     args.output_dir = args.output_dir or str(default_output)
     args.zip_path = args.zip_path or str(default_zip)
     return args
@@ -1501,7 +1512,764 @@ def write_git_identity(output: Path) -> None:
     (output / "git_status_short.txt").write_text(git("status", "--short"), encoding="utf-8")
 
 
+def _safe_sha256(path: Path) -> str | None:
+    try:
+        return oracle.sha256(path) if path.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _source_provenance(mujoco: Any, args: argparse.Namespace) -> dict[str, Any]:
+    """Record local MuJoCo provenance without scanning site-packages."""
+    package_file = Path(getattr(mujoco, "__file__", "")).resolve()
+    package_root = package_file.parent if package_file.name else None
+    header_candidates = []
+    if package_root is not None:
+        header_candidates.extend([
+            package_root / "include" / "mujoco",
+            package_root / "mujoco" / "include" / "mujoco",
+        ])
+    headers = []
+    for root in header_candidates:
+        if root.is_dir():
+            for name in ("mujoco.h", "mjdata.h", "mjmodel.h"):
+                path = root / name
+                if path.is_file():
+                    headers.append({
+                        "path": str(path),
+                        "sha256": _safe_sha256(path),
+                    })
+    libraries = []
+    if package_root is not None and package_root.is_dir():
+        for path in sorted(package_root.iterdir()):
+            if (
+                path.is_file()
+                and (
+                    path.suffix.lower() in {".so", ".dylib", ".dll"}
+                    or ".so." in path.name
+                )
+            ):
+                libraries.append({"path": str(path), "sha256": _safe_sha256(path)})
+    source_dir = Path(args.mujoco_source_dir).resolve() if args.mujoco_source_dir else None
+    source_files = []
+    if source_dir is not None and source_dir.is_dir():
+        for path in _source_files(source_dir):
+            source_files.append({"path": str(path), "sha256": _safe_sha256(path)})
+    return {
+        "mujoco_version": getattr(mujoco, "__version__", None),
+        "release_commit_reference": "6882095",
+        "package_root": str(package_root) if package_root is not None else None,
+        "public_header_paths": headers,
+        "libmujoco_paths": libraries,
+        "source_dir": str(source_dir) if source_dir is not None else None,
+        "source_files": source_files,
+        "SOURCE_IMPLEMENTATION_EVIDENCE": (
+            "AVAILABLE" if source_files else "NOT_INSTALLED"
+        ),
+        "network_download_performed": False,
+        "site_packages_recursive_scan": False,
+    }
+
+
+def _public_api_contract(mujoco: Any) -> dict[str, Any]:
+    fields = {
+        "efc_R": "inverse constraint mass / regularizer field",
+        "efc_D": "constraint mass field",
+        "efc_AR": "J * inv(M) * J' + R in global constraint storage",
+        "iefc_R": "island-space inverse constraint mass array",
+        "iefc_D": "island-space constraint mass array",
+        "map_efc2iefc": "global efc row to island row mapping",
+        "map_iefc2efc": "island row to global efc row mapping",
+    }
+    exposed = {}
+    try:
+        model = mujoco.MjModel.from_xml_string("<mujoco/>\n")
+        data = mujoco.MjData(model)
+        for name, description in fields.items():
+            value = _field(data, name)
+            exposed[name] = {
+                "description": description,
+                "exposed": value is not None,
+                "empty_probe_shape": list(value.shape) if value is not None else None,
+            }
+    except Exception as error:
+        return {
+            "PUBLIC_API_CONTRACT": "INCOMPLETE",
+            "error": f"{type(error).__name__}: {error}",
+            "fields": {name: {"description": description} for name, description in fields.items()},
+        }
+    return {
+        "PUBLIC_API_CONTRACT": "AVAILABLE",
+        "functions": {
+            name: bool(callable(getattr(mujoco, name, None)))
+            for name in ("mj_makeConstraint", "mj_projectConstraint", "mj_fwdConstraint")
+        },
+        "fields": exposed,
+        "runtime_evidence_required": True,
+        "runtime_evidence_source": "populated global55 clone probes",
+    }
+
+
+def _field_manifest(data: Any, names: Sequence[str]) -> dict[str, Any]:
+    result = {}
+    for name in names:
+        value = _field(data, name)
+        result[name] = {
+            "available": value is not None,
+            "shape": list(value.shape) if value is not None else None,
+            "size": int(value.size) if value is not None else None,
+            "dtype": str(value.dtype) if value is not None else None,
+        }
+    return result
+
+
+def _contact_identities(mujoco: Any, model: Any, data: Any) -> list[dict[str, Any]]:
+    result = []
+    for index in range(int(getattr(data, "ncon", 0))):
+        contact = data.contact[index]
+        geom_names = []
+        for geom_id in (int(contact.geom1), int(contact.geom2)):
+            try:
+                geom_names.append(str(mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
+                )))
+            except Exception:
+                geom_names.append(str(geom_id))
+        result.append({
+            "contact_index": index,
+            "geom_ids": [int(contact.geom1), int(contact.geom2)],
+            "geom_names": geom_names,
+            "efc_address": int(contact.efc_address),
+            "dim": int(contact.dim),
+        })
+    return result
+
+
+def _populated_constraint_state(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    staged_calls: Sequence[str],
+    selected_rows: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    nefc = int(getattr(data, "nefc", 0))
+    ncon = int(getattr(data, "ncon", 0))
+    storage = _field_manifest(
+        data,
+        (
+            "efc_R", "efc_D", "efc_AR", "efc_AR_rownnz", "efc_AR_rowadr",
+            "efc_AR_colind", "iefc_R", "iefc_D", "map_efc2iefc", "map_iefc2efc",
+        ),
+    )
+    required_global = all(
+        storage[name]["available"] and storage[name]["size"] == nefc
+        for name in ("efc_R", "efc_D")
+    )
+    required_ar = bool(storage["efc_AR"]["available"] and storage["efc_AR"]["size"] > 0)
+    nisland = _island_count(data)
+    island_valid = True
+    if nisland > 0:
+        island_valid = all(
+            storage[name]["available"] and storage[name]["size"] >= nefc
+            for name in ("iefc_R", "iefc_D", "map_efc2iefc", "map_iefc2efc")
+        )
+    target_present = bool(selected_rows)
+    passed = bool(ncon > 0 and nefc > 0 and required_global and required_ar and island_valid and target_present)
+    constraint_types = _field(data, "efc_type")
+    return {
+        "POPULATED_CONSTRAINT_STATE": "PASS" if passed else "FAIL",
+        "ncon": ncon,
+        "nefc": nefc,
+        "nisland": nisland,
+        "storage": storage,
+        "constraint_types": constraint_types,
+        "contact_identities": _contact_identities(mujoco, model, data),
+        "selected_floor_contact_row_ids": [int(item["row_id"]) for item in selected_rows],
+        "target_floor_contact_rows_present": target_present,
+        "staged_calls": list(staged_calls),
+        "formal_replay_data_touched": False,
+        "checks": {
+            "ncon_gt_zero": ncon > 0,
+            "nefc_gt_zero": nefc > 0,
+            "efc_R_size_equals_nefc": required_global,
+            "efc_D_size_equals_nefc": required_global,
+            "efc_AR_populated": required_ar,
+            "island_storage_valid_when_needed": island_valid,
+            "target_floor_contact_rows_present": target_present,
+        },
+    }
+
+
+def _clone_and_stage(mujoco: Any, model: Any, snapshot: Any) -> tuple[Any, list[str]]:
+    data = mujoco.MjData(model)
+    mujoco.mj_copyData(data, model, snapshot)
+    calls = aref_audit.stage_to_constraint(mujoco, model, data)
+    return data, calls
+
+
+def _solver_outputs_changed(left: dict[str, Any], right: dict[str, Any]) -> dict[str, bool]:
+    return {
+        name: not _allclose(left.get(name), right.get(name))
+        for name in ("efc_force", "qfrc_constraint", "qacc")
+    }
+
+
+def _ar_probe_delta(
+    baseline: dict[str, Any], altered: dict[str, Any], row: int, delta_r: float
+) -> dict[str, Any]:
+    base_ar = baseline.get("ar_matrix")
+    altered_ar = altered.get("ar_matrix")
+    if base_ar is None or altered_ar is None:
+        return {
+            "available": False,
+            "classification": "UNAVAILABLE",
+            "max_abs_error": None,
+        }
+    base_array = np.asarray(base_ar, dtype=np.float64)
+    altered_array = np.asarray(altered_ar, dtype=np.float64)
+    if base_array.shape != altered_array.shape or row < 0 or row >= base_array.shape[0]:
+        return {
+            "available": False,
+            "classification": "NONCANONICAL",
+            "max_abs_error": None,
+        }
+    expected = np.zeros_like(base_array)
+    expected[row, row] = float(delta_r)
+    actual = altered_array - base_array
+    error = float(np.max(np.abs(actual - expected)))
+    return {
+        "available": True,
+        "classification": "PASS" if error <= AR_TOL else "FAIL",
+        "max_abs_error": error,
+        "actual_delta": actual,
+        "expected_delta": expected,
+    }
+
+
+def _classify_probe(
+    baseline: dict[str, Any],
+    altered: dict[str, Any],
+    row: int,
+    expected_r: float,
+    expected_d: float,
+    delta_r: float,
+    island_values: tuple[np.ndarray | None, np.ndarray | None] = (None, None),
+    expected_island: tuple[float | None, float | None] = (None, None),
+) -> dict[str, Any]:
+    r_after = altered.get("efc_R")
+    d_after = altered.get("efc_D")
+    r_retained = bool(
+        r_after is not None and row < len(r_after)
+        and np.isclose(float(r_after[row]), expected_r, rtol=R_GATE_RTOL, atol=R_GATE_ATOL)
+    )
+    d_retained = bool(
+        d_after is not None and row < len(d_after)
+        and np.isclose(float(d_after[row]), expected_d, rtol=R_GATE_RTOL, atol=R_GATE_ATOL)
+    )
+    island_r, island_d = island_values
+    expected_island_r, expected_island_d = expected_island
+    island_retained = True
+    if expected_island_r is not None:
+        island_retained = bool(
+            island_r is not None and _allclose(island_r, [expected_island_r])
+            and island_d is not None and _allclose(island_d, [expected_island_d])
+        )
+    ar_delta = _ar_probe_delta(baseline, altered, row, delta_r)
+    solver_changed = _solver_outputs_changed(baseline, altered)
+    solver_effect = bool(any(solver_changed.values()))
+    if not r_retained or not d_retained or not island_retained:
+        classification = "OVERWRITTEN"
+    elif not ar_delta["available"]:
+        classification = "NONCANONICAL"
+    elif ar_delta["classification"] != "PASS":
+        classification = "NONCANONICAL"
+    elif not solver_effect:
+        classification = "NO_SOLVER_EFFECT"
+    else:
+        classification = "OBSERVED"
+    return {
+        "classification": classification,
+        "expected_R": expected_r,
+        "expected_D": expected_d,
+        "R_retained": r_retained,
+        "D_retained": d_retained,
+        "island_mirror_retained": island_retained,
+        "AR_delta": ar_delta,
+        "solver_outputs_changed": solver_changed,
+        "baseline": baseline,
+        "altered": altered,
+    }
+
+
+def _run_populated_probe(
+    mujoco: Any,
+    model: Any,
+    baseline_data: Any,
+    row: int,
+    scale: float,
+    update_island: bool,
+) -> dict[str, Any]:
+    # ``baseline_data`` is staged but not solved.  Comparing probe outputs
+    # against that object would report a false solver effect for every probe.
+    baseline_staged = _constraint_snapshot(baseline_data, mujoco, model)
+    r_values = baseline_staged.get("efc_R")
+    d_values = baseline_staged.get("efc_D")
+    if r_values is None or d_values is None or row >= len(r_values) or row >= len(d_values):
+        raise RuntimeError("selected populated row has no R/D values")
+    r0 = float(r_values[row])
+    d0 = float(d_values[row])
+    if not np.isfinite(r0) or not np.isfinite(d0) or r0 <= 0:
+        raise RuntimeError("selected populated row has non-finite or non-positive R/D")
+    if not np.isclose(d0, 1.0 / r0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL):
+        return {
+            "classification": "NONCANONICAL",
+            "row_id": row,
+            "probe_scale": scale,
+            "R0": r0,
+            "D0": d0,
+            "reciprocal_gate": False,
+            "reason": "D0 is not approximately reciprocal to R0",
+        }
+    baseline_solver = mujoco.MjData(model)
+    mujoco.mj_copyData(baseline_solver, model, constraint_baseline)
+    mujoco.mj_projectConstraint(model, baseline_solver)
+    baseline_projected = _constraint_snapshot(baseline_solver, mujoco, model)
+    mujoco.mj_fwdConstraint(model, baseline_solver)
+    baseline = _constraint_snapshot(
+        baseline_solver, mujoco, model, read_physical_contact_forces=True
+    )
+
+    data = mujoco.MjData(model)
+    mujoco.mj_copyData(data, model, baseline_data)
+    new_r = r0 * float(scale)
+    new_d = 1.0 / new_r
+    np.asarray(data.efc_R)[row] = new_r
+    np.asarray(data.efc_D)[row] = new_d
+    island_update = None
+    island_after = (None, None)
+    if update_island:
+        island_update = _sync_island_regularization(data, [row], [new_r], [new_d])
+    mujoco.mj_projectConstraint(model, data)
+    projected = _constraint_snapshot(data, mujoco, model)
+    mujoco.mj_fwdConstraint(model, data)
+    solved = _constraint_snapshot(data, mujoco, model, read_physical_contact_forces=True)
+    if update_island:
+        island_r, island_d, _ = _island_selected_values(data, [row])
+        island_after = (island_r, island_d)
+    probe = _classify_probe(
+        baseline,
+        solved,
+        row,
+        new_r,
+        new_d,
+        new_r - r0,
+        island_values=island_after,
+        expected_island=(new_r if update_island else None, new_d if update_island else None),
+    )
+    probe.update({
+        "row_id": row,
+        "probe_scale": scale,
+        "R0": r0,
+        "D0": d0,
+        "R1": new_r,
+        "D1": new_d,
+        "reciprocal_gate": True,
+        "staged_baseline": baseline_staged,
+        "projected_baseline": baseline_projected,
+        "update_island_mirrors": update_island,
+        "island_update": island_update,
+        "projected_state": projected,
+        "solved_state": solved,
+    })
+    return probe
+
+
+def _audit_output_paths(output: Path) -> tuple[Path, Path]:
+    return output / "run.log", output / "audit_phase.json"
+
+
+def execute_consumption_audit_only(
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+) -> dict[str, Any]:
+    """Replay once, then audit only a populated global55 constraint clone."""
+    output = paths["output_dir"]
+    output.mkdir(parents=True, exist_ok=True)
+    write_git_identity(output)
+    phase = {"mode": "consumption-audit-only", "formal_R_counterfactual_was_run": False}
+    write_json(output / "audit_phase.json", phase)
+    source_files = [
+        paths["morphology_xml"], paths["checkpoint"],
+        REPO_ROOT / "tools/analyze_mujoco_global55_contact_demand.py",
+        REPO_ROOT / "tools/audit_mujoco_global55_friction_aref_counterfactual.py",
+        Path(__file__).resolve(), paths["corrected_oracle"] / "validation.json",
+    ]
+    hashes_before = {str(path): _safe_sha256(path) for path in source_files}
+    import_result = importlib.import_module("mujoco")
+    mujoco = import_result
+    write_json(output / "public_api_contract.json", _public_api_contract(mujoco))
+    write_json(output / "source_provenance.json", _source_provenance(mujoco, args))
+    recorder, mapping = aref_audit.cone_helper.replay_once(args, paths)
+    model, snapshot = recorder.raw_model, recorder.global55_snapshot
+    if model is None or snapshot is None:
+        raise RuntimeError("global55 replay did not provide native model/data/snapshot")
+    formal_data_unchanged = bool(
+        recorder.snapshot_copy_evidence
+        and recorder.snapshot_copy_evidence.get("live_unchanged_by_copy", False)
+    )
+    write_json(output / "global55_pre_state_snapshot.json", aref_audit.state_input_snapshot(snapshot))
+    write_json(output / "state_copy_manifest.json", {
+        **aref_audit.state_copy_manifest(snapshot),
+        "formal_snapshot_copy_evidence": recorder.snapshot_copy_evidence,
+    })
+    staged_data, staged_calls = _clone_and_stage(mujoco, model, snapshot)
+    decomposition, decomposition_capture = aref_audit._extract_decompositions(
+        staged_data, mujoco, model, mapping, snapshot
+    )
+    staged_snapshot = _constraint_snapshot(staged_data, mujoco, model)
+    # Keep the staged object intact for the pipeline record.  Build the
+    # constraint storage required by the runtime audit on a second clone;
+    # this is where MuJoCo versions that populate efc_AR lazily do so.
+    constraint_baseline = mujoco.MjData(model)
+    mujoco.mj_copyData(constraint_baseline, model, staged_data)
+    mujoco.mj_projectConstraint(model, constraint_baseline)
+    projected_calls = [*staged_calls, "mj_projectConstraint"]
+    baseline_stage = _constraint_snapshot(constraint_baseline, mujoco, model)
+    selected_manifest = selected_floor_contact_rows(
+        constraint_baseline, decomposition, baseline_stage
+    )
+    populated = _populated_constraint_state(
+        mujoco, model, constraint_baseline, projected_calls, selected_manifest
+    )
+    populated["formal_replay_physics_substeps"] = len(recorder.records)
+    populated["expected_formal_replay_physics_substeps"] = EXPECTED_SUBSTEPS
+    populated["formal_replay_additional_steps"] = 0
+    write_json(output / "populated_constraint_state.json", populated)
+    write_json(output / "selected_floor_contact_rows.json", {
+        "contacts": decomposition_capture,
+        "rows": selected_manifest,
+    })
+    if populated["POPULATED_CONSTRAINT_STATE"] != "PASS":
+        validation = _audit_only_validation(
+            populated=populated,
+            audit=None,
+            pipeline=None,
+            source_hashes_unchanged=None,
+            formal_records=len(recorder.records),
+            formal_data_unchanged=formal_data_unchanged,
+        )
+        _write_audit_only_results(
+            output, validation, hashes_before, source_files, None, None, None
+        )
+        return validation
+    if any(item["baseline_AR_diagonal"] is None for item in selected_manifest):
+        populated["POPULATED_CONSTRAINT_STATE"] = "FAIL"
+        populated["checks"]["selected_AR_diagonal_available"] = False
+        write_json(output / "populated_constraint_state.json", populated)
+        validation = _audit_only_validation(
+            populated, None, None, None, len(recorder.records), formal_data_unchanged
+        )
+        _write_audit_only_results(
+            output, validation, hashes_before, source_files, None, None, None
+        )
+        return validation
+
+    baseline_solver = mujoco.MjData(model)
+    mujoco.mj_copyData(baseline_solver, model, baseline_data)
+    mujoco.mj_fwdConstraint(model, baseline_solver)
+    baseline_solver_snapshot = _constraint_snapshot(
+        baseline_solver, mujoco, model, read_physical_contact_forces=True
+    )
+    no_op = mujoco.MjData(model)
+    mujoco.mj_copyData(no_op, model, constraint_baseline)
+    mujoco.mj_projectConstraint(model, no_op)
+    mujoco.mj_fwdConstraint(model, no_op)
+    no_op_snapshot = _constraint_snapshot(
+        no_op, mujoco, model, read_physical_contact_forces=True
+    )
+    production = mujoco.MjData(model)
+    mujoco.mj_copyData(production, model, snapshot)
+    mujoco.mj_forward(model, production)
+    production_snapshot = _constraint_snapshot(
+        production, mujoco, model, read_physical_contact_forces=True
+    )
+    no_op_checks = _snapshot_equal_fields(
+        no_op_snapshot,
+        production_snapshot,
+        ("efc_R", "efc_D", "ar_matrix", "efc_force", "qfrc_constraint", "qacc"),
+    )
+    no_op_checks["physical_contact_forces"] = _allclose(
+        [item["force_contact_frame"] for item in no_op_snapshot["physical_contact_forces"]],
+        [item["force_contact_frame"] for item in production_snapshot["physical_contact_forces"]],
+    )
+    pipeline = {
+        "checks": no_op_checks,
+        "staged_calls": staged_calls,
+        "no_op_calls": ["mj_projectConstraint", "mj_fwdConstraint"],
+        "production_calls": ["mj_forward on independent clone"],
+        "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "PASS" if all(no_op_checks.values()) else "FAIL",
+        "baseline_solver": baseline_solver_snapshot,
+        "no_op_solver": no_op_snapshot,
+        "production_solver": production_snapshot,
+    }
+    write_json(output / "regularization_audit_pipeline_reproduction.json", pipeline)
+    write_json(output / "runtime_constraint_storage_baseline.json", {
+        "staged": staged_snapshot,
+        "projected": baseline_stage,
+        "solved": baseline_solver_snapshot,
+        "storage_manifest": populated["storage"],
+    })
+    probe_row = int(selected_manifest[0]["row_id"])
+    global_only = _run_populated_probe(
+        mujoco, model, constraint_baseline, probe_row, 0.9, update_island=False
+    )
+    write_json(output / "probe_global_only.json", global_only)
+    island_required = _island_count(constraint_baseline) > 0
+    if island_required:
+        global_plus_island = _run_populated_probe(
+            mujoco, model, constraint_baseline, probe_row, 0.9, update_island=True
+        )
+    else:
+        global_plus_island = {
+            "classification": "NOT_APPLICABLE",
+            "probe_scale": 0.9,
+            "update_island_mirrors": False,
+            "reason": "nisland=0",
+        }
+    write_json(output / "probe_global_plus_island.json", global_plus_island)
+    audit = _classify_populated_consumption(
+        populated, pipeline, global_only, global_plus_island
+    )
+    write_json(output / "constraint_regularization_consumption_audit.json", audit)
+    source_hashes_after = {str(path): _safe_sha256(path) for path in source_files}
+    hashes_known = all(value is not None for value in hashes_before.values())
+    source_unchanged = (
+        hashes_before == source_hashes_after if hashes_known else None
+    )
+    validation = _audit_only_validation(
+        populated,
+        audit,
+        pipeline,
+        source_unchanged,
+        len(recorder.records),
+        formal_data_unchanged,
+    )
+    consistency = _summary_classification_consistency(validation, audit)
+    validation["SUMMARY_CLASSIFICATION_CONSISTENCY"] = consistency["SUMMARY_CLASSIFICATION_CONSISTENCY"]
+    write_json(output / "summary_classification_consistency.json", consistency)
+    _write_audit_only_results(
+        output, validation, hashes_before, source_files, source_hashes_after,
+        audit, pipeline,
+    )
+    return validation
+
+
+def _classify_populated_consumption(
+    populated: dict[str, Any],
+    pipeline: dict[str, Any],
+    global_only: dict[str, Any],
+    global_plus_island: dict[str, Any],
+) -> dict[str, Any]:
+    island_required = populated["nisland"] > 0
+    global_effect = global_only.get("classification")
+    island_effect = global_plus_island.get("classification")
+    global_probe_valid = global_effect in {"OBSERVED", "NO_SOLVER_EFFECT"}
+    island_probe_valid = island_effect in {"OBSERVED", "NO_SOLVER_EFFECT"}
+    if island_required:
+        r_path = (
+            "GLOBAL_AND_ISLAND_SYNCHRONIZED"
+            if island_probe_valid else
+            "ISLAND_IEFC_R"
+            if island_effect in {"NO_SOLVER_EFFECT", "OVERWRITTEN"} and global_effect != "OBSERVED" else
+            "GLOBAL_EFC_R_REPROJECTED"
+            if global_probe_valid else "UNDETERMINED"
+        )
+        d_path = "ISLAND_IEFC_D" if island_probe_valid else "UNDETERMINED"
+        island_status = "YES" if island_probe_valid else "UNDETERMINED"
+    else:
+        r_path = "GLOBAL_EFC_R_REPROJECTED" if global_probe_valid else "UNDETERMINED"
+        d_path = "GLOBAL_EFC_D_DIRECT" if global_probe_valid else "UNDETERMINED"
+        island_status = "NO"
+    ar_path = (
+        "MJ_PROJECT_CONSTRAINT_FROM_CURRENT_R"
+        if global_only.get("AR_delta", {}).get("classification") == "PASS"
+        else "UNDETERMINED"
+    )
+    ready = bool(
+        populated["POPULATED_CONSTRAINT_STATE"] == "PASS"
+        and pipeline["REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION"] == "PASS"
+        and r_path != "UNDETERMINED"
+        and d_path != "UNDETERMINED"
+        and ar_path != "UNDETERMINED"
+        and island_status != "UNDETERMINED"
+    )
+    no_island_baseline = (
+        "PASS"
+        if not island_required
+        and pipeline["REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION"] == "PASS"
+        else "NOT_APPLICABLE"
+        if island_required
+        else "INSUFFICIENT_EVIDENCE"
+    )
+    return {
+        "R_CONSUMPTION_PATH": r_path,
+        "D_CONSUMPTION_PATH": d_path,
+        "AR_CONSUMPTION_PATH": ar_path,
+        "ISLAND_MIRROR_REQUIRED": island_status,
+        "GLOBAL_ONLY_PROBE_EFFECT": global_effect,
+        "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": island_effect,
+        "NO_ISLAND_BASELINE_REPRODUCTION": no_island_baseline,
+        "CONTACT_R_COUNTERFACTUAL_READY": "YES" if ready else "NO",
+        "audit_status": "PASS" if ready else "INSUFFICIENT_EVIDENCE",
+        "counterfactual_ready": ready,
+        "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
+        "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NOT_RUN_AUDIT_ONLY",
+        "formal_R_counterfactual_was_run": False,
+        "reason": "runtime paths were classified on populated global55 clone state",
+    }
+
+
+def _audit_only_validation(
+    populated: dict[str, Any],
+    audit: dict[str, Any] | None,
+    pipeline: dict[str, Any] | None,
+    source_hashes_unchanged: bool | None,
+    formal_records: int,
+    formal_data_unchanged: bool,
+) -> dict[str, Any]:
+    audit = audit or {}
+    pipeline = pipeline or {}
+    return {
+        "POPULATED_CONSTRAINT_STATE": populated["POPULATED_CONSTRAINT_STATE"],
+        "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": pipeline.get(
+            "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION", "INSUFFICIENT_EVIDENCE"
+        ),
+        "GLOBAL_ONLY_PROBE_EFFECT": audit.get("GLOBAL_ONLY_PROBE_EFFECT", "NOT_RUN"),
+        "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": audit.get("GLOBAL_PLUS_ISLAND_PROBE_EFFECT", "NOT_RUN"),
+        "NO_ISLAND_BASELINE_REPRODUCTION": audit.get(
+            "NO_ISLAND_BASELINE_REPRODUCTION", "NOT_RUN"
+        ),
+        "R_CONSUMPTION_PATH": audit.get("R_CONSUMPTION_PATH", "UNDETERMINED"),
+        "D_CONSUMPTION_PATH": audit.get("D_CONSUMPTION_PATH", "UNDETERMINED"),
+        "AR_CONSUMPTION_PATH": audit.get("AR_CONSUMPTION_PATH", "UNDETERMINED"),
+        "ISLAND_MIRROR_REQUIRED": audit.get("ISLAND_MIRROR_REQUIRED", "UNDETERMINED"),
+        "SUMMARY_CLASSIFICATION_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
+        "CONTACT_R_COUNTERFACTUAL_READY": audit.get("CONTACT_R_COUNTERFACTUAL_READY", "NO"),
+        "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
+        "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NOT_RUN_AUDIT_ONLY",
+        "formal_R_counterfactual_was_run": False,
+        "formal_replay_physics_substeps": formal_records,
+        "expected_formal_replay_physics_substeps": EXPECTED_SUBSTEPS,
+        "formal_replay_additional_steps": 0,
+        "formal_data_mutated_by_probe": not formal_data_unchanged,
+        "source_hashes_unchanged": source_hashes_unchanged,
+        "UNCONDITIONAL_ZIP_PACKAGING": "IMPLEMENTED",
+        "LOCAL_IMPLEMENTATION": "READY_FOR_SERVER_AUDIT",
+        "COUNTERFACTUAL_VALID": False,
+    }
+
+
+def _summary_classification_consistency(
+    validation: dict[str, Any], audit: dict[str, Any]
+) -> dict[str, Any]:
+    keys = (
+        "R_CONSUMPTION_PATH", "D_CONSUMPTION_PATH", "AR_CONSUMPTION_PATH",
+        "ISLAND_MIRROR_REQUIRED", "CONTACT_R_COUNTERFACTUAL_READY",
+    )
+    checks = {key: validation.get(key) == audit.get(key) for key in keys}
+    return {
+        "checks": checks,
+        "SUMMARY_CLASSIFICATION_CONSISTENCY": "PASS" if all(checks.values()) else "FAIL",
+    }
+
+
+def _write_audit_only_results(
+    output: Path,
+    validation: dict[str, Any],
+    hashes_before: dict[str, str | None],
+    source_files: Sequence[Path],
+    hashes_after: dict[str, str | None] | None,
+    audit: dict[str, Any] | None,
+    pipeline: dict[str, Any] | None,
+) -> None:
+    if hashes_after is None:
+        hashes_after = {str(path): _safe_sha256(path) for path in source_files}
+    if validation.get("source_hashes_unchanged") is None:
+        source_purity = {
+            "source_hashes_unchanged": None,
+            "hashes_before": hashes_before,
+            "hashes_after": hashes_after,
+            "status": "incomplete",
+        }
+    else:
+        source_purity = {
+            "source_hashes_unchanged": validation["source_hashes_unchanged"],
+            "hashes_before": hashes_before,
+            "hashes_after": hashes_after,
+            "status": "complete",
+        }
+    if audit is None:
+        # Keep the audit artifact and validation/summary artifacts
+        # classification-consistent even when replay or population failed
+        # before runtime probes could run.
+        audit = {
+            "audit_version": 1,
+            "audit_status": "INSUFFICIENT_EVIDENCE",
+            "counterfactual_ready": False,
+            "R_CONSUMPTION_PATH": validation.get("R_CONSUMPTION_PATH", "UNDETERMINED"),
+            "D_CONSUMPTION_PATH": validation.get("D_CONSUMPTION_PATH", "UNDETERMINED"),
+            "AR_CONSUMPTION_PATH": validation.get("AR_CONSUMPTION_PATH", "UNDETERMINED"),
+            "ISLAND_MIRROR_REQUIRED": validation.get(
+                "ISLAND_MIRROR_REQUIRED", "UNDETERMINED"
+            ),
+            "GLOBAL_ONLY_PROBE_EFFECT": validation.get(
+                "GLOBAL_ONLY_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": validation.get(
+                "GLOBAL_PLUS_ISLAND_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "CONTACT_R_COUNTERFACTUAL_READY": "NO",
+            "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
+            "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NOT_RUN_AUDIT_ONLY",
+            "formal_R_counterfactual_was_run": False,
+            "reason": "populated runtime audit did not reach a conclusive probe",
+        }
+    consistency = _summary_classification_consistency(validation, audit)
+    validation["SUMMARY_CLASSIFICATION_CONSISTENCY"] = consistency[
+        "SUMMARY_CLASSIFICATION_CONSISTENCY"
+    ]
+    if pipeline is None:
+        pipeline = {
+            "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            "checks": {},
+            "reason": "audit stopped before the populated no-op pipeline probe",
+        }
+    for filename, payload in (
+        ("constraint_regularization_consumption_audit.json", audit),
+        ("regularization_audit_pipeline_reproduction.json", pipeline),
+        ("summary_classification_consistency.json", consistency),
+        ("validation.json", validation),
+        ("summary.json", validation),
+        ("source_purity.json", source_purity),
+    ):
+        write_json(output / filename, payload)
+    write_json(output / "metadata.json", {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "mode": "consumption-audit-only",
+        "formal_R_counterfactual_was_run": False,
+        "formal_replay_physics_substeps": validation.get("formal_replay_physics_substeps"),
+        "formal_replay_additional_steps": 0,
+        "audit": audit,
+        "pipeline": pipeline,
+    })
+
+
 def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
+    if getattr(args, "mode", "counterfactual") == "consumption-audit-only":
+        # The populated-state audit must not be gated by the legacy empty
+        # MjData/source-only audit.  Its runtime evidence is produced after
+        # the fixed global55 replay inside execute_consumption_audit_only().
+        return execute_consumption_audit_only(args, paths)
     output = paths["output_dir"]
     output.mkdir(parents=True, exist_ok=True)
     write_git_identity(output)
@@ -1695,7 +2463,32 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     return validation
 
 
-def failure_payload(error: Exception) -> dict[str, Any]:
+def failure_payload(
+    error: Exception, mode: str = "counterfactual"
+) -> dict[str, Any]:
+    if mode == "consumption-audit-only":
+        return {
+            "POPULATED_CONSTRAINT_STATE": "INSUFFICIENT_EVIDENCE",
+            "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            "GLOBAL_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": "NOT_RUN",
+            "NO_ISLAND_BASELINE_REPRODUCTION": "NOT_RUN",
+            "R_CONSUMPTION_PATH": "UNDETERMINED",
+            "D_CONSUMPTION_PATH": "UNDETERMINED",
+            "AR_CONSUMPTION_PATH": "UNDETERMINED",
+            "ISLAND_MIRROR_REQUIRED": "UNDETERMINED",
+            "SUMMARY_CLASSIFICATION_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
+            "CONTACT_R_COUNTERFACTUAL_READY": "NO",
+            "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
+            "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NOT_RUN_AUDIT_ONLY",
+            "formal_R_counterfactual_was_run": False,
+            "formal_replay_additional_steps": 0,
+            "UNCONDITIONAL_ZIP_PACKAGING": "IMPLEMENTED",
+            "LOCAL_IMPLEMENTATION": "INCOMPLETE",
+            "COUNTERFACTUAL_VALID": False,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
     return {
         "R_CONSUMPTION_PATH": "UNDETERMINED",
         "D_CONSUMPTION_PATH": "UNDETERMINED",
@@ -1717,7 +2510,12 @@ def failure_payload(error: Exception) -> dict[str, Any]:
     }
 
 
-def write_failure_bundle(output: Path, error: Exception, trace: str) -> None:
+def write_failure_bundle(
+    output: Path,
+    error: Exception,
+    trace: str,
+    mode: str = "counterfactual",
+) -> None:
     """Make failure artifacts complete even when validation fails before replay."""
     audit_path = output / "constraint_regularization_consumption_audit.json"
     if not audit_path.exists():
@@ -1728,7 +2526,23 @@ def write_failure_bundle(output: Path, error: Exception, trace: str) -> None:
             "R_CONSUMPTION_PATH": "UNDETERMINED",
             "D_CONSUMPTION_PATH": "UNDETERMINED",
             "AR_CONSUMPTION_PATH": "UNDETERMINED",
-            "ISLAND_MIRROR_REQUIRED": "YES",
+            "ISLAND_MIRROR_REQUIRED": (
+                "UNDETERMINED"
+                if mode == "consumption-audit-only" else "YES"
+            ),
+            "GLOBAL_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": "NOT_RUN",
+            "NO_ISLAND_BASELINE_REPRODUCTION": "NOT_RUN",
+            "CONTACT_R_COUNTERFACTUAL_READY": "NO",
+            "CONTACT_R_SOLVER_EXCESS_EFFECT": (
+                "NOT_RUN_AUDIT_ONLY"
+                if mode == "consumption-audit-only" else "INSUFFICIENT_EVIDENCE"
+            ),
+            "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": (
+                "NOT_RUN_AUDIT_ONLY"
+                if mode == "consumption-audit-only" else "INSUFFICIENT_EVIDENCE"
+            ),
+            "formal_R_counterfactual_was_run": False,
             "reason": "execution failed before solver-consumption audit completed",
             "error": str(error),
         })
@@ -1738,27 +2552,59 @@ def write_failure_bundle(output: Path, error: Exception, trace: str) -> None:
         except Exception:
             pass
     (output / "traceback.txt").write_text(trace, encoding="utf-8")
+    (output / "inner_exception_traceback.txt").write_text(trace, encoding="utf-8")
+    phase_path = output / "audit_phase.json"
+    try:
+        phase = json.loads(phase_path.read_text(encoding="utf-8"))
+        if not isinstance(phase, dict):
+            phase = {}
+    except (OSError, json.JSONDecodeError):
+        phase = {}
+    phase.update({
+        "mode": mode,
+        "status": "FAIL",
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "formal_R_counterfactual_was_run": False,
+        "traceback_file": "traceback.txt",
+        "inner_exception_traceback_file": "inner_exception_traceback.txt",
+    })
+    write_json(phase_path, phase)
     partial = [
         str(path.relative_to(output))
         for path in sorted((output / "conditions").glob("*") if (output / "conditions").is_dir() else [])
     ]
     write_json(output / "failure_context.json", {
+        "mode": mode,
         "error": str(error),
         "traceback_file": "traceback.txt",
+        "inner_exception_traceback_file": "inner_exception_traceback.txt",
+        "audit_phase_file": "audit_phase.json",
         "partial_conditions": partial,
     })
-    failure = failure_payload(error)
+    failure = failure_payload(error, mode=mode)
     write_json(output / "validation.json", failure)
     write_json(output / "summary.json", failure)
+    write_json(output / "summary_classification_consistency.json", {
+        "checks": {},
+        "SUMMARY_CLASSIFICATION_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
+    })
+    if mode == "consumption-audit-only":
+        write_json(output / "regularization_audit_pipeline_reproduction.json", {
+            "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            "checks": {},
+            "reason": "execution failed before populated no-op pipeline probe",
+        })
     write_json(output / "metadata.json", {
         "created_at": datetime.now().astimezone().isoformat(),
         "status": "failure",
+        "mode": mode,
         "diagnostic": Path(__file__).name,
         "error_type": type(error).__name__,
         "error": str(error),
     })
     write_json(output / "source_purity.json", {
-        "source_hashes_unchanged": False,
+        "source_hashes_unchanged": None,
         "formal_data_mutated_by_probe": False,
         "status": "incomplete",
     })
@@ -1783,11 +2629,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 validation = execute(args, paths)
                 print(json.dumps(_json_normalize(validation), indent=2, sort_keys=True, allow_nan=False))
-                return_code = 0 if validation["COUNTERFACTUAL_VALID"] else 2
+                if args.mode == "consumption-audit-only":
+                    return_code = (
+                        0
+                        if validation.get("CONTACT_R_COUNTERFACTUAL_READY") == "YES"
+                        else 2
+                    )
+                else:
+                    return_code = 0 if validation["COUNTERFACTUAL_VALID"] else 2
             except Exception as error:
                 trace = traceback.format_exc()
                 print(trace, file=sys.stderr, end="")
-                write_failure_bundle(output, error, trace)
+                write_failure_bundle(output, error, trace, mode=args.mode)
         package = _package(output, zip_path)
         print(f"ZIP_VERIFY={package['ZIP_VERIFY']}")
         print(f"ZIP_SHA256={package['ZIP_SHA256']}")
@@ -1795,13 +2648,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return return_code
     except Exception as error:
         if output is None or zip_path is None or output.exists() or zip_path.exists():
-            output, zip_path = _default_output_paths()
+            output, zip_path = _default_output_paths(
+                getattr(raw_args, "mode", "counterfactual")
+            )
         output = Path(output).resolve()
         zip_path = Path(zip_path).resolve()
         output.mkdir(parents=True, exist_ok=False)
         trace = traceback.format_exc()
         (output / "run.log").write_text(trace, encoding="utf-8")
-        write_failure_bundle(output, error, trace)
+        write_failure_bundle(
+            output, error, trace, mode=getattr(raw_args, "mode", "counterfactual")
+        )
         package = _package(output, zip_path)
         print(f"ZIP_VERIFY={package['ZIP_VERIFY']}")
         print(f"ZIP_SHA256={package['ZIP_SHA256']}")

@@ -298,6 +298,121 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         self.assertIn("SHARED_PHYSICAL_GLOBAL_COUPLED_DEMAND", source)
         self.assertIn("not a pure tangent-only R intervention", source)
 
+    def test_consumption_audit_only_has_a_dedicated_cli_mode(self):
+        audit_args = AUDIT.parser().parse_args(["--mode", "consumption-audit-only"])
+        self.assertEqual(audit_args.mode, "consumption-audit-only")
+        self.assertEqual(
+            AUDIT._default_output_paths(audit_args.mode)[0].name.split("_")[4],
+            "consumption",
+        )
+
+    def test_consumption_audit_dispatches_before_legacy_empty_state_audit(self):
+        args = SimpleNamespace(mode="consumption-audit-only")
+        paths = {"output_dir": Path("unused")}
+        expected = {"CONTACT_R_COUNTERFACTUAL_READY": "NO"}
+        with patch.object(
+            AUDIT,
+            "execute_consumption_audit_only",
+            return_value=expected,
+        ) as populated_audit, patch.object(
+            AUDIT,
+            "run_solver_consumption_audit",
+            side_effect=AssertionError("legacy empty-state audit must not run"),
+        ):
+            self.assertEqual(AUDIT.execute(args, paths), expected)
+        populated_audit.assert_called_once_with(args, paths)
+
+    def test_consumption_audit_only_never_invokes_formal_R_conditions(self):
+        tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "execute_consumption_audit_only"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("run_condition", called)
+        self.assertNotIn("apply_regularization_scale", called)
+        self.assertNotIn("custom_pipeline_one_step_regression", called)
+
+    def test_audit_only_validation_never_claims_solver_excess_result(self):
+        populated = {"POPULATED_CONSTRAINT_STATE": "FAIL"}
+        validation = AUDIT._audit_only_validation(
+            populated, None, None, None, 120, True
+        )
+        self.assertEqual(
+            validation["CONTACT_R_SOLVER_EXCESS_EFFECT"],
+            "NOT_RUN_AUDIT_ONLY",
+        )
+        self.assertEqual(
+            validation["MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER"],
+            "NOT_RUN_AUDIT_ONLY",
+        )
+        self.assertFalse(validation["formal_R_counterfactual_was_run"])
+        self.assertEqual(validation["formal_replay_physics_substeps"], 120)
+
+    def test_audit_only_results_write_canonical_failure_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            validation = AUDIT._audit_only_validation(
+                {"POPULATED_CONSTRAINT_STATE": "FAIL"},
+                None,
+                None,
+                None,
+                120,
+                True,
+            )
+            AUDIT._write_audit_only_results(
+                output,
+                validation,
+                {"source.py": None},
+                [Path("source.py")],
+                {"source.py": None},
+                None,
+                None,
+            )
+            audit = json.loads(
+                (output / "constraint_regularization_consumption_audit.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(audit["ISLAND_MIRROR_REQUIRED"], "UNDETERMINED")
+            self.assertEqual(
+                audit["CONTACT_R_SOLVER_EXCESS_EFFECT"],
+                "NOT_RUN_AUDIT_ONLY",
+            )
+            self.assertEqual(
+                summary["SUMMARY_CLASSIFICATION_CONSISTENCY"],
+                "PASS",
+            )
+            self.assertTrue(
+                (output / "regularization_audit_pipeline_reproduction.json").is_file()
+            )
+
+    def test_audit_only_failure_bundle_keeps_unknown_source_purity_and_inner_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            AUDIT.write_failure_bundle(
+                output,
+                RuntimeError("populated audit failed"),
+                "Traceback: populated audit failed\n",
+                mode="consumption-audit-only",
+            )
+            validation = json.loads((output / "validation.json").read_text(encoding="utf-8"))
+            purity = json.loads((output / "source_purity.json").read_text(encoding="utf-8"))
+            self.assertEqual(validation["ISLAND_MIRROR_REQUIRED"], "UNDETERMINED")
+            self.assertEqual(
+                validation["CONTACT_R_SOLVER_EXCESS_EFFECT"],
+                "NOT_RUN_AUDIT_ONLY",
+            )
+            self.assertIsNone(purity["source_hashes_unchanged"])
+            self.assertTrue((output / "inner_exception_traceback.txt").is_file())
+            self.assertTrue((output / "audit_phase.json").is_file())
+
     def test_only_allowed_solver_arrays_are_written_and_prohibited_options_are_not(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertIn("data.efc_R", source)

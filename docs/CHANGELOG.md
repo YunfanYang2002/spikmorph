@@ -2,6 +2,8 @@
 
 ## 2026-08-05
 
+- Fixed the regularization consumption audit to replay to populated global55 before runtime probes; added `--mode consumption-audit-only`, canonical fail-closed artifacts, and inner traceback/audit-phase packaging.
+
 - 修正 contact regularization consumption audit：移除不存在的 `iefc_AR` 假设，按 `map_efc2iefc`/`map_iefc2efc` 同步并验证 MuJoCo 的 `iefc_R`/`iefc_D` island mirrors；独立 PGS probe 不再因可证明的 mirror 路径误 fail closed。
 
 - 新增固定 global55 production-pyramidal contact-row regularization `R` 单因素反事实诊断：先审计 MuJoCo 的 `mj_makeConstraint`、`mj_projectConstraint`、`mj_fwdConstraint` 对 `efc_R`、`efc_D`、`efc_AR` 的实际消费路径；无法证明或检测到未覆盖的 island mirror 时 fail closed，并始终生成经过 `testzip()` 与 SHA256 校验的 ZIP artifact。
