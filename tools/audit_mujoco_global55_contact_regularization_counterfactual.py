@@ -322,6 +322,192 @@ def audit_source_consumption(
     }
 
 
+def behavioral_solver_consumption_audit(mujoco: Any) -> dict[str, Any]:
+    """Prove the wheel's R/D/AR path when C sources are not bundled.
+
+    This is an in-memory MuJoCo probe model.  It never touches the formal
+    replay data or repository XML.  The probe checks that projectConstraint
+    retains R/D, changes only the corresponding AR diagonal, and that the
+    subsequent fwdConstraint consumes the coupled update.
+    """
+    probe_xml = """
+    <mujoco model="regularization_consumption_probe">
+      <option timestep="0.001" gravity="0 0 -9.81" cone="pyramidal"/>
+      <worldbody>
+        <geom name="probe_floor" type="plane" size="2 2 0.1"/>
+        <body name="probe_body" pos="0 0 0.08">
+          <freejoint/>
+          <geom name="probe_box" type="box" size="0.1 0.1 0.1"
+                friction="0.8 0.6 0.4"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    try:
+        model = mujoco.MjModel.from_xml_string(probe_xml)
+        data = mujoco.MjData(model)
+        data.qpos[:] = np.asarray([0.0, 0.0, 0.08, 1.0, 0.0, 0.0, 0.0])
+        data.qvel[:] = 0.0
+        staged_calls = aref_audit.stage_to_constraint(mujoco, model, data)
+        if int(data.ncon) <= 0 or int(data.nefc) <= 0:
+            raise RuntimeError(
+                f"probe produced no active contact constraints: ncon={data.ncon}, nefc={data.nefc}"
+            )
+
+        staged = _constraint_snapshot(data, mujoco, model)
+        r_values = staged.get("efc_R")
+        d_values = staged.get("efc_D")
+        if r_values is None or d_values is None:
+            raise RuntimeError("probe does not expose efc_R and efc_D")
+        candidates = [
+            row for row in range(int(data.nefc))
+            if np.isfinite(r_values[row]) and np.isfinite(d_values[row])
+            and float(r_values[row]) > 0.0
+            and np.isclose(
+                float(d_values[row]), 1.0 / float(r_values[row]),
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )
+        ]
+        if not candidates:
+            raise RuntimeError("probe has no finite positive efc_R row")
+        row = int(candidates[0])
+
+        # Establish the baseline AR on the same staged probe before cloning.
+        mujoco.mj_projectConstraint(model, data)
+        projected = _constraint_snapshot(data, mujoco, model)
+        if projected["ar_matrix"] is None:
+            raise RuntimeError("probe efc_AR layout is unavailable after projectConstraint")
+        baseline_r = float(projected["efc_R"][row])
+        baseline_d = float(projected["efc_D"][row])
+        baseline_ar = np.asarray(projected["ar_matrix"], dtype=np.float64)
+
+        baseline_solver = mujoco.MjData(model)
+        mujoco.mj_copyData(baseline_solver, model, data)
+        mujoco.mj_fwdConstraint(model, baseline_solver)
+        solved_baseline = _constraint_snapshot(baseline_solver, mujoco, model)
+
+        altered = mujoco.MjData(model)
+        mujoco.mj_copyData(altered, model, data)
+        altered_r = baseline_r * 0.1
+        altered_d = 1.0 / altered_r
+        altered.efc_R[row] = altered_r
+        altered.efc_D[row] = altered_d
+        mujoco.mj_projectConstraint(model, altered)
+        altered_projected = _constraint_snapshot(altered, mujoco, model)
+
+        expected_ar_delta = np.zeros_like(baseline_ar)
+        expected_ar_delta[row, row] = altered_r - baseline_r
+        ar_delta = np.asarray(altered_projected["ar_matrix"]) - baseline_ar
+        core_checks = _snapshot_equal_fields(
+            projected, altered_projected, CORE_FIELDS
+        )
+        project_checks = {
+            "selected_R_retained": bool(np.isclose(
+                altered_projected["efc_R"][row], altered_r,
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )),
+            "selected_D_retained": bool(np.isclose(
+                altered_projected["efc_D"][row], altered_d,
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )),
+            "baseline_D_reciprocal": bool(np.isclose(
+                baseline_d, 1.0 / baseline_r, rtol=R_GATE_RTOL, atol=R_GATE_ATOL
+            )),
+            "altered_D_reciprocal": bool(np.isclose(
+                altered_projected["efc_D"][row],
+                1.0 / float(altered_projected["efc_R"][row]),
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )),
+            "AR_delta_only_selected_diagonal": _allclose(
+                ar_delta, expected_ar_delta, atol=AR_TOL
+            ),
+            "J_vel_aref_unchanged": all(core_checks.values()),
+            "unselected_R_unchanged": _allclose(
+                np.delete(altered_projected["efc_R"], row),
+                np.delete(projected["efc_R"], row),
+            ),
+            "unselected_D_unchanged": _allclose(
+                np.delete(altered_projected["efc_D"], row),
+                np.delete(projected["efc_D"], row),
+            ),
+        }
+
+        altered_solver = mujoco.MjData(model)
+        mujoco.mj_copyData(altered_solver, model, altered)
+        mujoco.mj_fwdConstraint(model, altered_solver)
+        solved_altered = _constraint_snapshot(altered_solver, mujoco, model)
+        solver_fields = ("efc_force", "qfrc_constraint", "qacc")
+        solver_output_changed = {
+            field: not _allclose(solved_baseline[field], solved_altered[field])
+            for field in solver_fields
+        }
+
+        d_only_solver = mujoco.MjData(model)
+        mujoco.mj_copyData(d_only_solver, model, data)
+        d_only_d = baseline_d * 0.5
+        d_only_solver.efc_D[row] = d_only_d
+        mujoco.mj_fwdConstraint(model, d_only_solver)
+        solved_d_only = _constraint_snapshot(d_only_solver, mujoco, model)
+        d_only_output_changed = any(
+            not _allclose(solved_baseline[field], solved_d_only[field])
+            for field in solver_fields
+        )
+        consumption_checks = {
+            **project_checks,
+            "D_only_write_retained": bool(np.isclose(
+                d_only_solver.efc_D[row], d_only_d,
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )),
+            "D_only_update_consumed": d_only_output_changed,
+            "fwdConstraint_consumes_updated_solver_state": any(solver_output_changed.values()),
+        }
+        ready = bool(all(consumption_checks.values()))
+        return {
+            "audit_mode": "wheel_behavioral_probe",
+            "status": "PASS" if ready else "INSUFFICIENT_EVIDENCE",
+            "counterfactual_ready": ready,
+            "probe_model": {
+                "contact_count": int(data.ncon),
+                "constraint_count": int(data.nefc),
+                "selected_row": row,
+                "cone": "mjCONE_PYRAMIDAL",
+                "formal_replay_data_touched": False,
+            },
+            "staged_calls": staged_calls,
+            "project_constraint_calls": 2,
+            "fwd_constraint_calls": 3,
+            "checks": consumption_checks,
+            "core_field_checks": core_checks,
+            "solver_output_changed": solver_output_changed,
+            "D_only_solver_output_changed": d_only_output_changed,
+            "ar_layout": altered_projected["ar_layout"],
+            "R_CONSUMPTION_PATH": (
+                "wheel_behavioral_probe: efc_R write retained by mj_projectConstraint "
+                "and changes efc_AR diagonal; updated state consumed by mj_fwdConstraint"
+            ),
+            "D_CONSUMPTION_PATH": (
+                "wheel_behavioral_probe: efc_D-only write retained by "
+                "mj_fwdConstraint and changes solver output"
+            ),
+            "AR_CONSUMPTION_PATH": (
+                "wheel_behavioral_probe: mj_projectConstraint reconstructs efc_AR "
+                "with only the selected diagonal delta"
+            ),
+            "ISLAND_MIRROR_REQUIRED": "NO",
+            "island_mirror_evidence": (
+                "no iefc_R/iefc_D/iefc_AR storage exposed by the probed wheel binding"
+            ),
+        }
+    except Exception as error:
+        return {
+            "audit_mode": "wheel_behavioral_probe",
+            "status": "INSUFFICIENT_EVIDENCE",
+            "counterfactual_ready": False,
+            "ISLAND_MIRROR_REQUIRED": "YES",
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
 def run_solver_consumption_audit() -> dict[str, Any]:
     try:
         mujoco = importlib.import_module("mujoco")
@@ -370,6 +556,22 @@ def run_solver_consumption_audit() -> dict[str, Any]:
         str(path) for path in Path(package_path).glob("*")
         if path.suffix.lower() in {".so", ".dylib", ".dll"} or ".so." in path.name
     ]
+    if not report.get("counterfactual_ready", False):
+        behavioral = behavioral_solver_consumption_audit(mujoco)
+        report["wheel_behavioral_probe"] = behavioral
+        if (
+            behavioral.get("counterfactual_ready", False)
+            and not report.get("island_mirror_fields_observed")
+        ):
+            report.update({
+                "R_CONSUMPTION_PATH": behavioral["R_CONSUMPTION_PATH"],
+                "D_CONSUMPTION_PATH": behavioral["D_CONSUMPTION_PATH"],
+                "AR_CONSUMPTION_PATH": behavioral["AR_CONSUMPTION_PATH"],
+                "ISLAND_MIRROR_REQUIRED": behavioral["ISLAND_MIRROR_REQUIRED"],
+                "audit_status": "PASS",
+                "counterfactual_ready": True,
+                "reason": "wheel behavioral probe verified R/D/AR update and consumption semantics",
+            })
     return report
 
 
