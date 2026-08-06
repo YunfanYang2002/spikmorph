@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-06
+
+- 修复正式 global55 regularization 反事实路径：复用已验证的 NEWTON_PRIMAL consumption audit，不再重复运行 audit/probe；仅同步 reciprocal `efc_R`/`efc_D` 与映射的 `iefc_R`/`iefc_D`，并避免在 Newton 路径调用 `mj_projectConstraint`。
+- 正式 artifact 新增 reciprocal gate、global/island row mapping、field retention、solver numerics 与正式 condition 目录；保留失败上下文和无条件 ZIP 打包。
+
 ## 2026-08-05
 
 - 修正 global55 regularization consumption audit：按实际 solver 区分 PGS dual 与 CG/Newton primal 的 `efc_AR` gate，新增 global/island R/D 独立 probes、solver storage semantics 与 source-hash pass 状态；audit-only 仍不运行 `R_SCALE_0P1`。

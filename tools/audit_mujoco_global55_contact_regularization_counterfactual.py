@@ -47,10 +47,13 @@ CHECKPOINT_SHA256 = oracle.CHECKPOINT_SHA256
 GLOBAL_STEP = oracle.GLOBAL_STEP
 EXPECTED_SUBSTEPS = oracle.EXPECTED_SUBSTEPS
 REFERENCE_ORACLE_NAME = "mujoco_global55_contact_demand_oracle_corrected_20260804_143138"
+REFERENCE_CONSUMPTION_AUDIT_NAME = (
+    "mujoco_global55_contact_regularization_consumption_audit_20260806_102228"
+)
 CONDITIONS = (
-    ("r_scale_1_before", "R_SCALE_1_BEFORE", 1.0),
-    ("r_scale_0p1", "R_SCALE_0P1", 0.1),
-    ("r_scale_1_after_restore", "R_SCALE_1_AFTER_RESTORE", 1.0),
+    ("r_scale_1_before", "REGULARIZATION_SCALE_1_BEFORE", 1.0),
+    ("r_scale_0p1", "REGULARIZATION_R_SCALE_0P1", 0.1),
+    ("r_scale_1_after_restore", "REGULARIZATION_SCALE_1_AFTER_RESTORE", 1.0),
 )
 REG_FIELDS = (
     "efc_R", "efc_D", "efc_AR", "efc_AR_rownnz", "efc_AR_rowadr", "efc_AR_colind",
@@ -103,6 +106,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--checkpoint")
     result.add_argument("--walker-dir")
     result.add_argument("--corrected-oracle")
+    result.add_argument("--consumption-audit-reference")
     result.add_argument("--output-dir")
     result.add_argument("--zip-path")
     result.add_argument("--mujoco-source-dir")
@@ -137,6 +141,10 @@ def resolve_arguments(args: argparse.Namespace) -> argparse.Namespace:
         args.corrected_oracle = str(
             REPO_ROOT / "output/diagnostics" / REFERENCE_ORACLE_NAME
         )
+        args.consumption_audit_reference = str(
+            REPO_ROOT / "output/diagnostics"
+            / REFERENCE_CONSUMPTION_AUDIT_NAME
+        )
     missing = [
         name for name in ("checkpoint", "walker_dir", "corrected_oracle")
         if not getattr(args, name)
@@ -153,13 +161,78 @@ def validate_paths(args: argparse.Namespace) -> dict[str, Path]:
     return aref_audit.validate_paths(args)
 
 
+def _load_consumption_audit_reference(
+    args: argparse.Namespace,
+    output: Path,
+) -> dict[str, Any]:
+    """Load the already completed populated-state audit for formal replay.
+
+    The formal counterfactual deliberately does not rerun the consumption
+    audit or any of its probes.  A missing or incompatible reference is a
+    hard failure, rather than a reason to silently fall back to the legacy
+    source-only audit.
+    """
+    reference = getattr(args, "consumption_audit_reference", None)
+    if reference is None:
+        reference = str(
+            REPO_ROOT / "output/diagnostics"
+            / REFERENCE_CONSUMPTION_AUDIT_NAME
+        )
+    reference_path = Path(reference).resolve()
+    if reference_path.is_dir():
+        reference_path = reference_path / "constraint_regularization_consumption_audit.json"
+    if not reference_path.is_file():
+        raise RuntimeError(
+            "formal counterfactual requires the completed populated-state "
+            f"consumption audit reference: {reference_path}"
+        )
+    try:
+        audit = json.loads(reference_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"cannot read consumption audit reference {reference_path}: {error}"
+        ) from error
+    if not isinstance(audit, dict):
+        raise RuntimeError("consumption audit reference is not a JSON object")
+    if audit.get("CONTACT_R_COUNTERFACTUAL_READY") == "YES":
+        audit["counterfactual_ready"] = True
+    required = {
+        "SOLVER_FORMULATION": "NEWTON_PRIMAL",
+        "R_CONSUMPTION_PATH": "NOT_CONSUMED_DIRECTLY",
+        "D_CONSUMPTION_PATH": "ISLAND_IEFC_D_DIRECT",
+        "AR_CONSUMPTION_PATH": "NOT_APPLICABLE_PRIMAL_SOLVER",
+        "ISLAND_MIRROR_REQUIRED": "YES",
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": audit.get(key)}
+        for key, expected in required.items()
+        if audit.get(key) != expected
+    }
+    if mismatches or audit.get("counterfactual_ready") is not True:
+        raise RuntimeError(
+            "consumption audit reference is not the validated NEWTON_PRIMAL "
+            "global55 audit: " + json.dumps(_json_normalize({
+                "mismatches": mismatches,
+                "counterfactual_ready": audit.get("counterfactual_ready"),
+            }), sort_keys=True)
+        )
+    audit["formal_reference_path"] = str(reference_path)
+    audit["formal_reference_reused_without_rerun"] = True
+    write_json(output / "consumption_audit_reference.json", audit)
+    write_json(output / "constraint_regularization_consumption_audit.json", audit)
+    return audit
+
+
 def _json_normalize(value: Any) -> Any:
     if isinstance(value, np.bool_):
         return bool(value)
     if isinstance(value, np.integer):
         return int(value)
     if isinstance(value, np.floating):
-        return float(value)
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
             return _json_normalize(value.item())
@@ -906,6 +979,8 @@ def _constraint_snapshot(
         "efc_R": _field(data, "efc_R"),
         "efc_D": _field(data, "efc_D"),
         "efc_force": _field(data, "efc_force"),
+        "iefc_R": _field(data, "iefc_R"),
+        "iefc_D": _field(data, "iefc_D"),
         "iefc_force": _field(data, "iefc_force"),
         "iefc_state": _field(data, "iefc_state"),
         "qfrc_constraint": _field(data, "qfrc_constraint"),
@@ -992,6 +1067,104 @@ def _rd_gate(snapshot: dict[str, Any], rows: Sequence[int]) -> dict[str, Any]:
     }
 
 
+def _regularization_reciprocal_gate(
+    data: Any,
+    selected_manifest: Sequence[dict[str, Any]],
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the complete global/island reciprocal pair before mutation."""
+    if snapshot is None:
+        snapshot = {
+            "efc_R": _field(data, "efc_R"),
+            "efc_D": _field(data, "efc_D"),
+        }
+    rows = [int(item["row_id"]) for item in selected_manifest]
+    global_r = snapshot.get("efc_R")
+    global_d = snapshot.get("efc_D")
+    state = _island_regularization_state(data, rows)
+    island_r = _field(data, "iefc_R")
+    island_d = _field(data, "iefc_D")
+    checks = []
+    if global_r is None or global_d is None:
+        return {
+            "REGULARIZATION_RECIPROCAL_GATE": "FAIL",
+            "valid": False,
+            "reason": "global efc_R/efc_D unavailable",
+            "rows": rows,
+            "checks": checks,
+        }
+    if any(row < 0 or row >= len(global_r) or row >= len(global_d) for row in rows):
+        return {
+            "REGULARIZATION_RECIPROCAL_GATE": "FAIL",
+            "valid": False,
+            "reason": "selected row is outside global efc_R/efc_D arrays",
+            "rows": rows,
+            "checks": checks,
+        }
+    for row in rows:
+        island_row = None
+        if state["required"] == "YES":
+            island_row = int(state["map_efc2iefc"][row])
+        r0 = float(global_r[row])
+        d0 = float(global_d[row])
+        ir0 = None if island_r is None or island_row is None else float(island_r[island_row])
+        id0 = None if island_d is None or island_row is None else float(island_d[island_row])
+        row_checks = {
+            "row_id": row,
+            "island_row_id": island_row,
+            "R": r0,
+            "D": d0,
+            "R_times_D": r0 * d0,
+            "global_reciprocal": bool(np.isfinite(r0) and r0 > 0.0 and np.isclose(
+                d0, 1.0 / r0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL
+            )),
+            "global_island_R_equal": True,
+            "global_island_D_equal": True,
+        }
+        if state["required"] == "YES":
+            row_checks.update({
+                "island_R": ir0,
+                "island_D": id0,
+                "island_R_times_D": None if ir0 is None or id0 is None else ir0 * id0,
+                "island_reciprocal": bool(
+                    ir0 is not None and id0 is not None and np.isfinite(ir0)
+                    and np.isfinite(id0) and ir0 > 0.0 and np.isclose(
+                        id0, 1.0 / ir0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL
+                    )
+                ),
+                "global_island_R_equal": bool(
+                    ir0 is not None and np.isclose(
+                        r0, ir0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL
+                    )
+                ),
+                "global_island_D_equal": bool(
+                    id0 is not None and np.isclose(
+                        d0, id0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL
+                    )
+                ),
+            })
+        row_checks["valid"] = bool(
+            row_checks["global_reciprocal"]
+            and row_checks["global_island_R_equal"]
+            and row_checks["global_island_D_equal"]
+            and row_checks.get("island_reciprocal", True)
+        )
+        checks.append(row_checks)
+    valid = bool(rows) and all(bool(item["valid"]) for item in checks)
+    return {
+        "REGULARIZATION_RECIPROCAL_GATE": "PASS" if valid else "FAIL",
+        "valid": valid,
+        "rows": checks,
+        "island_mirror_required": state["required"],
+        "rtol": R_GATE_RTOL,
+        "atol": R_GATE_ATOL,
+        "reason": (
+            "all selected global and mapped island R/D pairs are reciprocal and equal"
+            if valid else "at least one selected global/island R/D pair failed the reciprocal gate"
+        ),
+    }
+
+
 def apply_regularization_scale(
     mujoco: Any,
     model: Any,
@@ -1002,37 +1175,43 @@ def apply_regularization_scale(
 ) -> dict[str, Any]:
     if not audit.get("counterfactual_ready", False):
         raise RuntimeError("solver-consumption audit did not authorize R intervention")
-    if (
-        audit.get("ISLAND_MIRROR_REQUIRED") == "YES"
-        and audit.get("island_update_path") not in {"VALIDATED", "PROVEN_BY_SOURCE"}
-    ):
-        raise RuntimeError("island mirror update path is not proven; refusing R intervention")
+    semantics = audit.get("solver_storage_semantics", {})
+    formulation = audit.get("SOLVER_FORMULATION") or semantics.get(
+        "SOLVER_FORMULATION", "UNKNOWN"
+    )
+    if formulation == "UNKNOWN":
+        raise RuntimeError("solver formulation is unknown; refusing R intervention")
     before = _constraint_snapshot(data, mujoco, model)
     rows = [int(item["row_id"]) for item in selected_manifest]
-    gate = _rd_gate(before, rows)
+    gate = _regularization_reciprocal_gate(data, selected_manifest, before)
     if not gate["valid"]:
-        raise RuntimeError("D ~= 1/R gate failed; refusing reciprocal R intervention")
+        raise RuntimeError("global/island reciprocal R/D gate failed; refusing intervention")
     r_values = np.asarray(data.efc_R)
     d_values = np.asarray(data.efc_D)
-    baseline_r = np.asarray(gate["R"], dtype=np.float64)
+    baseline_r = np.asarray([float(before["efc_R"][row]) for row in rows], dtype=np.float64)
+    baseline_d = np.asarray([float(before["efc_D"][row]) for row in rows], dtype=np.float64)
     new_r = baseline_r * float(scale)
     new_d = 1.0 / new_r
     r_values[np.asarray(rows, dtype=np.int64)] = new_r
     d_values[np.asarray(rows, dtype=np.int64)] = new_d
     island_update = _sync_island_regularization(data, rows, new_r, new_d)
-    mujoco.mj_projectConstraint(model, data)
+    project_called = False
+    if formulation == "PGS_DUAL":
+        mujoco.mj_projectConstraint(model, data)
+        project_called = True
     after = _constraint_snapshot(data, mujoco, model)
     actual_r = np.asarray(after["efc_R"], dtype=np.float64)[rows]
     actual_d = np.asarray(after["efc_D"], dtype=np.float64)[rows]
     if not _allclose(actual_r, new_r, rtol=R_GATE_RTOL, atol=R_GATE_ATOL):
-        raise RuntimeError("mj_projectConstraint overwrote selected efc_R")
+        raise RuntimeError("solver preparation overwrote selected efc_R")
     if not _allclose(actual_d, new_d, rtol=R_GATE_RTOL, atol=R_GATE_ATOL):
-        raise RuntimeError("mj_projectConstraint overwrote selected efc_D")
+        raise RuntimeError("solver preparation overwrote selected efc_D")
     core_checks = _snapshot_equal_fields(before, after, CORE_FIELDS)
     if not all(core_checks.values()):
-        raise RuntimeError(f"mj_projectConstraint changed forbidden fields: {core_checks}")
-    if before["ar_matrix"] is None or after["ar_matrix"] is None:
-        raise RuntimeError("AR matrix layout is unavailable after staged projectConstraint")
+        raise RuntimeError(f"regularization preparation changed forbidden fields: {core_checks}")
+    ar_required = formulation == "PGS_DUAL"
+    if ar_required and (before["ar_matrix"] is None or after["ar_matrix"] is None):
+        raise RuntimeError("AR matrix layout is unavailable for PGS regularization")
     island_after_r, island_after_d, island_state = _island_selected_values(data, rows)
     island_checks = {
         "required": island_update["required"],
@@ -1054,23 +1233,37 @@ def apply_regularization_scale(
     if not island_checks["updated"]:
         raise RuntimeError("solver-consumed island R/D mirrors were not retained")
     return {
+        "solver_formulation": formulation,
         "scale": float(scale),
         "selected_rows": rows,
         "baseline_R": baseline_r,
         "condition_R": actual_r,
-        "baseline_D": np.asarray(gate["D"], dtype=np.float64),
+        "baseline_D": baseline_d,
         "condition_D": actual_d,
         "rd_gate": gate,
         "before": before,
         "after": after,
+        "core_unchanged_after_regularization": core_checks,
         "core_unchanged_after_project": core_checks,
         "island_update": island_update,
+        "island_checks_after_regularization": island_checks,
         "island_checks_after_project": island_checks,
-        "project_constraint_api": "mujoco.mj_projectConstraint(model, data)",
+        "project_constraint_called": project_called,
+        "project_constraint_api": (
+            "mujoco.mj_projectConstraint(model, data)"
+            if project_called else "not called for NEWTON_PRIMAL/CG_PRIMAL"
+        ),
         "solver_consumed_fields": (
-            ["efc_R", "efc_D", "efc_AR", "iefc_R", "iefc_D"]
-            if island_update["required"] == "YES"
-            else ["efc_R", "efc_D", "efc_AR"]
+            ["iefc_D", "efc_D", "iefc_R", "efc_R"]
+            if formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"}
+            else ["efc_R", "efc_D", "efc_AR", "iefc_R", "iefc_D"]
+        ),
+        "solver_consumption_statement": (
+            "The Newton solver directly consumed mapped island iefc_D; "
+            "the intervention updated the reciprocal global/island R/D pair. "
+            "The solver did not directly consume modified R arrays."
+            if formulation == "NEWTON_PRIMAL" else
+            "PGS consumes the projected efc_AR path built from the updated R/D pair."
         ),
     }
 
@@ -1124,6 +1317,48 @@ def _run_excess(capture: dict[str, Any], demand: dict[str, Any]) -> dict[str, An
     return aref_audit.compute_solver_excess(capture, demand)
 
 
+def _solver_numerics(data: Any) -> dict[str, Any]:
+    fields = {}
+    finite = True
+    for name in ("solver_niter", "solver_nnz", "solver_fwdinv"):
+        value = _field(data, name)
+        fields[name] = value
+        if value is not None:
+            finite = finite and bool(np.isfinite(value).all())
+    return {
+        "fields": fields,
+        "finite": bool(finite),
+        "status": "VALID" if finite else "NONFINITE",
+    }
+
+
+def _regularization_field_retention(
+    expected: dict[str, Any], actual: dict[str, Any], formulation: str
+) -> dict[str, Any]:
+    checks = {
+        "efc_R": _allclose(expected.get("efc_R"), actual.get("efc_R")),
+        "efc_D": _allclose(expected.get("efc_D"), actual.get("efc_D")),
+        "iefc_R": _allclose(expected.get("iefc_R"), actual.get("iefc_R")),
+        "iefc_D": _allclose(expected.get("iefc_D"), actual.get("iefc_D")),
+        "efc_vel": _allclose(expected.get("efc_vel"), actual.get("efc_vel")),
+        "efc_aref": _allclose(expected.get("efc_aref"), actual.get("efc_aref")),
+        "efc_J": _allclose(expected.get("efc_J"), actual.get("efc_J")),
+    }
+    if formulation == "PGS_DUAL":
+        checks["efc_AR"] = _allclose(expected.get("ar_matrix"), actual.get("ar_matrix"))
+    return {
+        "solver_formulation": formulation,
+        "checks": checks,
+        "valid": bool(all(checks.values())),
+        "R/D_consumption_note": (
+            "The Newton solver directly consumed mapped island iefc_D; "
+            "R arrays were not directly consumed by the solver."
+            if formulation == "NEWTON_PRIMAL" else
+            "PGS consumed the projected efc_AR path."
+        ),
+    }
+
+
 def run_condition(
     mujoco: Any,
     model: Any,
@@ -1148,6 +1383,16 @@ def run_condition(
     post_constraint = _constraint_snapshot(
         solver_data, mujoco, model, read_physical_contact_forces=True
     )
+    field_retention = _regularization_field_retention(
+        regularization["after"], post_constraint,
+        regularization["solver_formulation"],
+    )
+    if not field_retention["valid"]:
+        raise RuntimeError(
+            "solver did not retain the condition regularization fields: "
+            + json.dumps(_json_normalize(field_retention), sort_keys=True)
+        )
+    numerics = _solver_numerics(solver_data)
     mujoco.mj_Euler(model, data)
     capture = capture_after_integration(
         mujoco, model, data, snapshot, mapping, solver_data
@@ -1163,6 +1408,8 @@ def run_condition(
         "budget": {"shared_physical_global_demand": demand},
         "excess": excess,
         "regularization": regularization,
+        "field_retention": field_retention,
+        "solver_numerics": numerics,
         "post_constraint_snapshot": post_constraint,
         "state_validation": {
             "clone_pre_state": clone_state,
@@ -1172,8 +1419,9 @@ def run_condition(
             "condition_staged_forward_count": 1,
             "constraint_solve_count": 1,
             "custom_integration_count": 1,
-            "project_constraint_count": 1,
+            "project_constraint_count": int(regularization["project_constraint_called"]),
             "staged_calls": staged_calls,
+            "solver_calls": ["mj_fwdConstraint"],
             "integration_api": "mujoco.mj_Euler",
         },
     }
@@ -1189,7 +1437,11 @@ def _full_forward_snapshot(mujoco: Any, model: Any, snapshot: Any) -> dict[str, 
 def _compare_pipeline_snapshots(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     checks = _snapshot_equal_fields(
         left, right,
-        ("efc_R", "efc_D", "efc_J", "efc_vel", "efc_aref", "efc_force", "qfrc_constraint", "qacc", "qacc_smooth", "ar_matrix"),
+        (
+            "efc_R", "efc_D", "iefc_R", "iefc_D", "efc_J", "efc_vel",
+            "efc_aref", "efc_force", "iefc_force", "iefc_state",
+            "qfrc_constraint", "qacc", "qacc_smooth", "ar_matrix",
+        ),
     )
     left_forces, right_forces = left["physical_contact_forces"], right["physical_contact_forces"]
     checks["physical_contact_forces"] = len(left_forces) == len(right_forces) and all(
@@ -1232,7 +1484,15 @@ def custom_pipeline_one_step_regression(
     checks["post_slip"] = _allclose(s_target["post_tangential_velocity"], f_target["post_tangential_velocity"])
     return {
         "checks": checks,
-        "staged_calls": ["mj_fwdPosition", "mj_fwdVelocity", "mj_fwdActuation", "mj_fwdAcceleration", "mj_projectConstraint", "mj_fwdConstraint", "mj_Euler"],
+        "staged_calls": [
+            "mj_fwdPosition", "mj_fwdVelocity", "mj_fwdActuation",
+            "mj_fwdAcceleration",
+            *(["mj_projectConstraint"]
+              if audit.get("SOLVER_FORMULATION") == "PGS_DUAL"
+              or audit.get("solver_storage_semantics", {}).get("SOLVER_FORMULATION") == "PGS_DUAL"
+              else []),
+            "mj_fwdConstraint", "mj_Euler",
+        ],
         "full_validation_calls": ["mj_step on independent clone"],
         "CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION": "PASS" if all(checks.values()) else "FAIL",
     }
@@ -1261,7 +1521,12 @@ def regularization_activation_report(
         "selected_D_ratio": _allclose(altered_d[selected] / base_d[selected], 10.0, rtol=R_GATE_RTOL, atol=R_GATE_ATOL),
         "unselected_R_unchanged": _allclose(altered_r[unselected], base_r[unselected]),
         "unselected_D_unchanged": _allclose(altered_d[unselected], base_d[unselected]),
-        "core_fields_unchanged": all(zero["regularization"]["core_unchanged_after_project"].values()),
+        "core_fields_unchanged": all(
+            zero["regularization"].get(
+                "core_unchanged_after_regularization",
+                zero["regularization"].get("core_unchanged_after_project", {}),
+            ).values()
+        ),
         "ar_layout_same": before["regularization"]["after"]["ar_layout"] == zero["regularization"]["after"]["ar_layout"],
     }
     base_island = base.get("island_fields", {})
@@ -1307,12 +1572,18 @@ def regularization_activation_report(
     else:
         checks["island_mirror_consistency"] = True
     base_ar, altered_ar = base.get("ar_matrix"), altered.get("ar_matrix")
+    formulation = before["regularization"].get("solver_formulation", "UNKNOWN")
+    if formulation == "UNKNOWN" and base_ar is not None:
+        # Backward-compatible synthetic reports from the focused unit tests
+        # represent the projected PGS layout without an explicit formulation.
+        formulation = "PGS_DUAL"
     expected_delta = np.zeros_like(base_ar) if base_ar is not None else None
-    if expected_delta is not None:
+    if formulation == "PGS_DUAL" and expected_delta is not None and altered_ar is not None:
         expected_delta[selected, selected] = altered_r[selected] - base_r[selected]
         checks["AR_delta_only_selected_diagonal"] = _allclose(altered_ar - base_ar, expected_delta, atol=AR_TOL)
     else:
-        checks["AR_delta_only_selected_diagonal"] = False
+        checks["AR_delta_only_selected_diagonal"] = formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"}
+    activation = "VALIDATED" if all(checks.values()) else "FAILED"
     return {
         "selected_rows": selected,
         "unselected_rows": unselected,
@@ -1320,10 +1591,20 @@ def regularization_activation_report(
         "condition_R": altered_r,
         "baseline_D": base_d,
         "condition_D": altered_d,
-        "AR_delta": None if base_ar is None else altered_ar - base_ar,
+        "AR_delta": (
+            None if base_ar is None or altered_ar is None
+            else altered_ar - base_ar
+        ),
         "expected_AR_delta": expected_delta,
         "checks": checks,
-        "CONTACT_R_COUNTERFACTUAL_ACTIVATION": "VALIDATED" if all(checks.values()) else "FAILED",
+        "solver_formulation": formulation,
+        "AR_semantics": (
+            "not applicable to the primal solver path"
+            if formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"}
+            else "projected efc_AR diagonal"
+        ),
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION": activation,
+        "CONTACT_R_COUNTERFACTUAL_ACTIVATION": activation,
     }
 
 
@@ -1365,7 +1646,14 @@ def regularization_invariant_validation(
     valid = all(all(values.values()) for values in checks.values())
     return {
         "checks_against_r_scale_1_before": checks,
-        "allowed_differences": ["selected floor-contact efc_R", "selected floor-contact efc_D", "corresponding efc_AR diagonal", "solver outputs", "impulses", "post-step state"],
+        "allowed_differences": [
+            "selected floor-contact efc_R", "selected floor-contact efc_D",
+            "corresponding efc_AR diagonal when the solver is PGS_DUAL",
+            "solver outputs", "impulses", "post-step state",
+        ],
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION": (
+            "VALIDATED" if valid else "FAILED"
+        ),
         "CONTACT_R_COUNTERFACTUAL_ISOLATION": "VALIDATED" if valid else "FAILED",
     }
 
@@ -1385,6 +1673,10 @@ def _restore_regression(before: dict[str, Any], after: dict[str, Any]) -> dict[s
             right["after"].get("island_fields", {}).get("iefc_D"),
         ),
         "efc_force": _allclose(before["post_constraint_snapshot"]["efc_force"], after["post_constraint_snapshot"]["efc_force"]),
+        "iefc_force": _allclose(before["post_constraint_snapshot"].get("iefc_force"), after["post_constraint_snapshot"].get("iefc_force")),
+        "qfrc_constraint": _allclose(before["post_constraint_snapshot"].get("qfrc_constraint"), after["post_constraint_snapshot"].get("qfrc_constraint")),
+        "qacc": _allclose(before["post_constraint_snapshot"].get("qacc"), after["post_constraint_snapshot"].get("qacc")),
+        "efc_aref": _allclose(before["post_constraint_snapshot"].get("efc_aref"), after["post_constraint_snapshot"].get("efc_aref")),
         "physical_impulses": _allclose(
             [item["tangential_impulse"] for item in before["capture"]["contacts"]],
             [item["tangential_impulse"] for item in after["capture"]["contacts"]],
@@ -1445,12 +1737,68 @@ def _baseline_regression(condition: dict[str, Any], reference: dict[str, Any]) -
     return {"R_BASELINE_REPRODUCTION": result["R_BASELINE_REPRODUCTION"], "details": result}
 
 
-def classify_effect(baseline: dict[str, Any], counterfactual: dict[str, Any], gates_valid: bool) -> dict[str, Any]:
+def _counterfactual_cap_status(condition: dict[str, Any]) -> str:
+    utilisation = condition.get("excess", {}).get("friction_cap_utilisation")
+    try:
+        value = float(utilisation)
+    except (TypeError, ValueError):
+        return "INSUFFICIENT_EVIDENCE"
+    if not np.isfinite(value):
+        return "INSUFFICIENT_EVIDENCE"
+    if value >= 0.995:
+        return "CAP_LIMITED"
+    if value >= 0.95:
+        return "NEAR_CAP"
+    return "NOT_CAP_LIMITED"
+
+
+def _counterfactual_numerics_status(
+    conditions: dict[str, dict[str, Any]]
+) -> str:
+    statuses = [
+        str(condition.get("solver_numerics", {}).get("status", "INSUFFICIENT_EVIDENCE"))
+        for condition in conditions.values()
+    ]
+    if not statuses or any(status == "NONFINITE" for status in statuses):
+        return "NONFINITE"
+    if any(status in {"NONCONVERGED", "INSUFFICIENT_EVIDENCE"} for status in statuses):
+        return "INSUFFICIENT_EVIDENCE"
+    return "VALID" if all(status == "VALID" for status in statuses) else "INSUFFICIENT_EVIDENCE"
+
+
+def classify_effect(
+    baseline: dict[str, Any],
+    counterfactual: dict[str, Any],
+    gates_valid: bool,
+    cap_status: str = "NOT_CAP_LIMITED",
+    numerics_status: str = "VALID",
+) -> dict[str, Any]:
+    if cap_status == "CAP_LIMITED":
+        return {
+            "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": "NONCANONICAL_CAP_LIMITED",
+            "CONTACT_R_SOLVER_EXCESS_EFFECT": "NONCANONICAL_CAP_LIMITED",
+            "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NONCANONICAL",
+            "NEXT_ACTION": "CAP_LIMITED_MILDER_SCALE_REQUIRED",
+            "COUNTERFACTUAL_FRICTION_CAP_STATUS": cap_status,
+            "REGULARIZATION_COUNTERFACTUAL_NUMERICS": numerics_status,
+        }
+    if numerics_status != "VALID":
+        return {
+            "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
+            "CONTACT_R_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
+            "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "INSUFFICIENT_EVIDENCE",
+            "NEXT_ACTION": "INSUFFICIENT_EVIDENCE",
+            "COUNTERFACTUAL_FRICTION_CAP_STATUS": cap_status,
+            "REGULARIZATION_COUNTERFACTUAL_NUMERICS": numerics_status,
+        }
     if not gates_valid:
         return {
+            "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
             "CONTACT_R_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
             "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "INSUFFICIENT_EVIDENCE",
             "NEXT_ACTION": "COUNTERFACTUAL_IMPLEMENTATION_FIX_REQUIRED",
+            "COUNTERFACTUAL_FRICTION_CAP_STATUS": cap_status,
+            "REGULARIZATION_COUNTERFACTUAL_NUMERICS": numerics_status,
         }
     b = float(baseline["solver_excess_norm"])
     c = float(counterfactual["solver_excess_norm"])
@@ -1475,8 +1823,11 @@ def classify_effect(baseline: dict[str, Any], counterfactual: dict[str, Any], ga
         "r_scale_0p1_vector_excess_norm": c_vec,
         "relative_vector_excess_reduction": vector_reduction,
         "CONTACT_R_SOLVER_EXCESS_EFFECT": effect,
+        "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": effect,
         "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": driver,
         "NEXT_ACTION": action,
+        "COUNTERFACTUAL_FRICTION_CAP_STATUS": cap_status,
+        "REGULARIZATION_COUNTERFACTUAL_NUMERICS": numerics_status,
     }
 
 
@@ -1485,6 +1836,8 @@ def _condition_row_payload(condition: dict[str, Any]) -> dict[str, Any]:
     return {
         "state_validation": condition["state_validation"],
         "constraint_regularization": condition["regularization"],
+        "field_retention": condition["field_retention"],
+        "solver_numerics": condition["solver_numerics"],
         "solver_rows": {
             "contacts": [
                 {"contact_index": item["contact_index"], "pair": [item["geom1_name"], item["geom2_name"]], "rows": item["solver_rows"]}
@@ -1512,7 +1865,14 @@ def _condition_row_payload(condition: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_condition(output: Path, condition: dict[str, Any]) -> None:
-    target = output / "conditions" / condition["condition_name"]
+    directory_names = {
+        "r_scale_1_before": "regularization_scale_1_before",
+        "r_scale_0p1": "regularization_r_scale_0p1",
+        "r_scale_1_after_restore": "regularization_scale_1_after_restore",
+    }
+    target = output / "conditions" / directory_names.get(
+        condition["condition_name"], condition["condition_name"]
+    )
     target.mkdir(parents=True, exist_ok=True)
     for filename, payload in _condition_row_payload(condition).items():
         write_json(target / f"{filename}.json", payload)
@@ -2814,23 +3174,9 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     output = paths["output_dir"]
     output.mkdir(parents=True, exist_ok=True)
     write_git_identity(output)
-    consumption_audit = run_solver_consumption_audit()
-    write_json(output / "constraint_regularization_consumption_audit.json", consumption_audit)
-    if not consumption_audit.get("counterfactual_ready", False):
-        behavioral = consumption_audit.get("wheel_behavioral_probe", {})
-        detail = behavioral.get("error")
-        if detail is None and behavioral.get("checks"):
-            failed_checks = [
-                name for name, passed in behavioral["checks"].items()
-                if not bool(passed)
-            ]
-            detail = "failed behavioral checks: " + ", ".join(failed_checks)
-        reason = str(consumption_audit.get("reason", "unknown reason"))
-        if detail:
-            reason += "; " + str(detail)
-        raise RuntimeError(
-            "solver-consumption audit failed closed: " + reason
-        )
+    # Formal conditions consume the completed populated-state audit.  Do not
+    # rerun the source audit, behavioral probes, or any solver probe here.
+    consumption_audit = _load_consumption_audit_reference(args, output)
     source_files = [
         paths["morphology_xml"], paths["checkpoint"],
         REPO_ROOT / "tools/analyze_mujoco_global55_contact_demand.py",
@@ -2848,6 +3194,18 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     if int(model.opt.cone) != production_cone:
         raise RuntimeError("production model cone is not mjCONE_PYRAMIDAL")
     original_options = aref_audit.cone_helper.model_option_snapshot(model)
+    runtime_semantics = solver_storage_semantics(mujoco, model)
+    if runtime_semantics["SOLVER_FORMULATION"] != consumption_audit.get(
+        "SOLVER_FORMULATION"
+    ):
+        raise RuntimeError(
+            "formal runtime solver formulation disagrees with consumption audit "
+            "reference: "
+            f"{runtime_semantics['SOLVER_FORMULATION']} vs "
+            f"{consumption_audit.get('SOLVER_FORMULATION')}"
+        )
+    consumption_audit["runtime_solver_storage_semantics"] = runtime_semantics
+    write_json(output / "consumption_audit_reference.json", consumption_audit)
     formal_records = len(recorder.records)
     formal_data_unchanged = bool(
         recorder.snapshot_copy_evidence
@@ -2864,13 +3222,29 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     selected_manifest = selected_floor_contact_rows(decomposition_data, decomposition, baseline_stage)
     if not selected_manifest:
         raise RuntimeError("no active pyramidal floor-contact edge rows selected")
-    if any(item["baseline_AR_diagonal"] is None for item in selected_manifest):
+    if runtime_semantics["SOLVER_FORMULATION"] == "PGS_DUAL" and any(
+        item["baseline_AR_diagonal"] is None for item in selected_manifest
+    ):
         raise RuntimeError(
             "baseline efc_AR diagonal is unavailable for selected floor-contact rows"
         )
     write_json(output / "selected_floor_contact_rows.json", {
         "contacts": decomposition_capture,
         "rows": selected_manifest,
+    })
+    reciprocal_gate = _regularization_reciprocal_gate(
+        decomposition_data, selected_manifest, baseline_stage
+    )
+    write_json(output / "regularization_reciprocal_gate.json", reciprocal_gate)
+    if reciprocal_gate["REGULARIZATION_RECIPROCAL_GATE"] != "PASS":
+        raise RuntimeError("formal reciprocal R/D gate failed closed")
+    write_json(output / "regularization_row_mapping.json", {
+        "solver_formulation": runtime_semantics,
+        "rows": selected_manifest,
+        "mapping_statement": (
+            "Each selected global efc row is paired with its reciprocal mapped "
+            "island iefc_R/iefc_D row."
+        ),
     })
 
     conditions: dict[str, dict[str, Any]] = {}
@@ -2913,10 +3287,13 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     model_restore = "PASS" if not aref_audit.cone_helper.model_option_difference(
         original_options, aref_audit.cone_helper.model_option_snapshot(model)
     )["changed_fields"] else "FAIL"
+    cap_status = _counterfactual_cap_status(conditions["r_scale_0p1"])
+    numerics_status = _counterfactual_numerics_status(conditions)
     gates = bool(
         pipeline["REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION"] == "PASS"
-        and activation["CONTACT_R_COUNTERFACTUAL_ACTIVATION"] == "VALIDATED"
-        and invariant["CONTACT_R_COUNTERFACTUAL_ISOLATION"] == "VALIDATED"
+        and reciprocal_gate["REGULARIZATION_RECIPROCAL_GATE"] == "PASS"
+        and activation["CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION"] == "VALIDATED"
+        and invariant["CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION"] == "VALIDATED"
         and baseline["R_BASELINE_REPRODUCTION"] == "PASS"
         and restore["R_RESTORE_REPRODUCTION"] == "PASS"
         and custom_step["CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION"] == "PASS"
@@ -2925,9 +3302,15 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         and formal_data_unchanged
         and model_restore == "PASS"
         and source_unchanged
+        and cap_status != "CAP_LIMITED"
+        and numerics_status == "VALID"
     )
     comparison = classify_effect(
-        conditions["r_scale_1_before"]["excess"], conditions["r_scale_0p1"]["excess"], gates
+        conditions["r_scale_1_before"]["excess"],
+        conditions["r_scale_0p1"]["excess"],
+        gates,
+        cap_status,
+        numerics_status,
     )
     baseline_excess = conditions["r_scale_1_before"]["excess"]
     counterfactual_excess = conditions["r_scale_0p1"]["excess"]
@@ -2940,11 +3323,16 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     write_json(output / "regularization_counterfactual_comparison.json", comparison)
 
     validation = {
+        "SOLVER_FORMULATION": runtime_semantics["SOLVER_FORMULATION"],
         "R_CONSUMPTION_PATH": consumption_audit["R_CONSUMPTION_PATH"],
         "D_CONSUMPTION_PATH": consumption_audit["D_CONSUMPTION_PATH"],
         "AR_CONSUMPTION_PATH": consumption_audit["AR_CONSUMPTION_PATH"],
         "ISLAND_MIRROR_REQUIRED": consumption_audit["ISLAND_MIRROR_REQUIRED"],
+        "CONTACT_R_COUNTERFACTUAL_READY": "YES",
+        "REGULARIZATION_RECIPROCAL_GATE": reciprocal_gate["REGULARIZATION_RECIPROCAL_GATE"],
         "REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION": pipeline["REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION"],
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION": activation["CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION"],
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION": invariant["CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION"],
         "CONTACT_R_COUNTERFACTUAL_ACTIVATION": activation["CONTACT_R_COUNTERFACTUAL_ACTIVATION"],
         "CONTACT_R_COUNTERFACTUAL_ISOLATION": invariant["CONTACT_R_COUNTERFACTUAL_ISOLATION"],
         "R_BASELINE_REPRODUCTION": baseline["R_BASELINE_REPRODUCTION"],
@@ -2953,9 +3341,18 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "formal_replay_physics_substeps": formal_records,
         "expected_formal_replay_physics_substeps": EXPECTED_SUBSTEPS,
         "formal_replay_additional_steps": 0,
+        "formal_consumption_audit_rerun": False,
+        "condition_project_constraint_count": sum(
+            int(condition["regularization"]["project_constraint_called"])
+            for condition in conditions.values()
+        ),
         "formal_data_mutated_by_probe": not formal_data_unchanged,
         "source_hashes_unchanged": source_unchanged,
         "MODEL_OPTION_RESTORE": model_restore,
+        "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": comparison.get(
+            "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT",
+            comparison["CONTACT_R_SOLVER_EXCESS_EFFECT"],
+        ),
         "CONTACT_R_SOLVER_EXCESS_EFFECT": comparison["CONTACT_R_SOLVER_EXCESS_EFFECT"],
         "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": comparison["MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER"],
         "NEXT_ACTION": comparison["NEXT_ACTION"],
@@ -2963,14 +3360,27 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "UNCONDITIONAL_ZIP_PACKAGING": "ENABLED",
         "LOCAL_IMPLEMENTATION": "READY_FOR_SERVER_VALIDATION",
     }
+    validation["COUNTERFACTUAL_FRICTION_CAP_STATUS"] = cap_status
+    validation["REGULARIZATION_COUNTERFACTUAL_NUMERICS"] = numerics_status
+    comparison["COUNTERFACTUAL_FRICTION_CAP_STATUS"] = validation[
+        "COUNTERFACTUAL_FRICTION_CAP_STATUS"
+    ]
+    comparison["REGULARIZATION_COUNTERFACTUAL_NUMERICS"] = validation[
+        "REGULARIZATION_COUNTERFACTUAL_NUMERICS"
+    ]
+    write_json(output / "regularization_counterfactual_comparison.json", comparison)
     summary = {key: validation[key] for key in (
         "R_CONSUMPTION_PATH", "D_CONSUMPTION_PATH", "AR_CONSUMPTION_PATH", "ISLAND_MIRROR_REQUIRED",
+        "REGULARIZATION_RECIPROCAL_GATE",
         "REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION", "CONTACT_R_COUNTERFACTUAL_ACTIVATION", "CONTACT_R_COUNTERFACTUAL_ISOLATION",
-        "R_BASELINE_REPRODUCTION", "R_RESTORE_REPRODUCTION", "CONTACT_R_SOLVER_EXCESS_EFFECT",
-        "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER", "NEXT_ACTION", "UNCONDITIONAL_ZIP_PACKAGING", "LOCAL_IMPLEMENTATION",
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION", "CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION",
+        "R_BASELINE_REPRODUCTION", "R_RESTORE_REPRODUCTION", "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT", "CONTACT_R_SOLVER_EXCESS_EFFECT",
+        "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER", "NEXT_ACTION", "COUNTERFACTUAL_FRICTION_CAP_STATUS",
+        "REGULARIZATION_COUNTERFACTUAL_NUMERICS", "UNCONDITIONAL_ZIP_PACKAGING", "LOCAL_IMPLEMENTATION",
     )}
     summary["baseline_solver_excess_Ns"] = baseline_excess["solver_excess_norm"]
     summary["r_scale_0p1_solver_excess_Ns"] = counterfactual_excess["solver_excess_norm"]
+    consistency = _summary_classification_consistency(validation, consumption_audit)
     metadata = {
         "created_at": datetime.now().astimezone().isoformat(),
         "backend": "mujoco",
@@ -2981,9 +3391,13 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "checkpoint": str(paths["checkpoint"]),
         "checkpoint_sha256": hashes_before[str(paths["checkpoint"])],
         "corrected_reference_oracle": str(paths["corrected_oracle"]),
+        "consumption_audit_reference": consumption_audit.get("formal_reference_path"),
+        "consumption_audit_rerun": False,
+        "solver_storage_semantics": runtime_semantics,
         "formal_replay_helper": "tools.analyze_mujoco_global55_contact_demand.replay",
         "formal_replay_physics_substeps": formal_records,
         "formal_replay_additional_steps": 0,
+        "formal_consumption_audit_rerun": False,
         "formal_data_mutated_by_probe": not formal_data_unchanged,
         "global_physics_step": GLOBAL_STEP,
         "physics_dt": float(model.opt.timestep),
@@ -2993,9 +3407,14 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "condition_staged_forward_count": 3,
         "condition_constraint_solve_count": 3,
         "condition_custom_integration_count": 3,
+        "condition_project_constraint_count": sum(
+            int(condition["regularization"]["project_constraint_called"])
+            for condition in conditions.values()
+        ),
     }
     for filename, payload in (
         ("metadata.json", metadata),
+        ("summary_classification_consistency.json", consistency),
         ("validation.json", validation),
         ("summary.json", summary),
         ("source_purity.json", {"hashes_before": hashes_before, "hashes_after": hashes_after, "source_hashes_unchanged": source_unchanged, "formal_data_mutated_by_probe": not formal_data_unchanged}),
@@ -3042,11 +3461,17 @@ def failure_payload(
         "D_CONSUMPTION_PATH": "UNDETERMINED",
         "AR_CONSUMPTION_PATH": "UNDETERMINED",
         "ISLAND_MIRROR_REQUIRED": "YES",
+        "REGULARIZATION_RECIPROCAL_GATE": "INSUFFICIENT_EVIDENCE",
         "REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE",
+        "CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION": "INSUFFICIENT_EVIDENCE",
         "CONTACT_R_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE",
         "CONTACT_R_COUNTERFACTUAL_ISOLATION": "INSUFFICIENT_EVIDENCE",
         "R_BASELINE_REPRODUCTION": "FAIL",
         "R_RESTORE_REPRODUCTION": "FAIL",
+        "COUNTERFACTUAL_FRICTION_CAP_STATUS": "INSUFFICIENT_EVIDENCE",
+        "REGULARIZATION_COUNTERFACTUAL_NUMERICS": "INSUFFICIENT_EVIDENCE",
+        "CONTACT_REGULARIZATION_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
         "CONTACT_R_SOLVER_EXCESS_EFFECT": "INSUFFICIENT_EVIDENCE",
         "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "INSUFFICIENT_EVIDENCE",
         "NEXT_ACTION": "COUNTERFACTUAL_IMPLEMENTATION_FIX_REQUIRED",
@@ -3169,6 +3594,38 @@ def write_failure_bundle(
             "checks": {},
             "reason": "execution failed before populated no-op pipeline probe",
         })
+    else:
+        formal_placeholders = {
+            "consumption_audit_reference.json": {
+                "status": "INSUFFICIENT_EVIDENCE",
+                "reason": "formal execution failed before the validated audit reference was loaded",
+            },
+            "regularization_reciprocal_gate.json": {
+                "REGULARIZATION_RECIPROCAL_GATE": "INSUFFICIENT_EVIDENCE",
+            },
+            "regularization_row_mapping.json": {"status": "INSUFFICIENT_EVIDENCE"},
+            "regularization_counterfactual_activation.json": {
+                "CONTACT_REGULARIZATION_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE",
+                "CONTACT_R_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE",
+            },
+            "regularization_invariant_validation.json": {
+                "CONTACT_REGULARIZATION_COUNTERFACTUAL_ISOLATION": "INSUFFICIENT_EVIDENCE",
+                "CONTACT_R_COUNTERFACTUAL_ISOLATION": "INSUFFICIENT_EVIDENCE",
+            },
+            "regularization_pipeline_baseline_regression.json": {
+                "REGULARIZATION_PIPELINE_BASELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            },
+            "custom_pipeline_one_step_regression.json": {
+                "CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            },
+            "baseline_regression.json": {"R_BASELINE_REPRODUCTION": "FAIL"},
+            "restore_regression.json": {"R_RESTORE_REPRODUCTION": "FAIL"},
+            "regularization_counterfactual_comparison.json": failure_payload(error),
+        }
+        for filename, payload in formal_placeholders.items():
+            target = output / filename
+            if not target.exists():
+                write_json(target, payload)
     write_json(output / "metadata.json", {
         "created_at": datetime.now().astimezone().isoformat(),
         "status": "failure",

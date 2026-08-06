@@ -98,6 +98,24 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         )
         self.assertEqual(calls, ["fwd"])
 
+    def test_reciprocal_gate_checks_global_and_island_pairs(self):
+        data = SimpleNamespace(
+            nefc=2,
+            nisland=1,
+            efc_R=np.asarray([0.5, 0.25]),
+            efc_D=np.asarray([2.0, 4.0]),
+            map_efc2iefc=np.asarray([1, 0]),
+            map_iefc2efc=np.asarray([1, 0]),
+            iefc_R=np.asarray([0.25, 0.5]),
+            iefc_D=np.asarray([4.0, 2.0]),
+        )
+        manifest = [{"row_id": 0}, {"row_id": 1}]
+        report = AUDIT._regularization_reciprocal_gate(data, manifest)
+        self.assertEqual(report["REGULARIZATION_RECIPROCAL_GATE"], "PASS")
+        data.iefc_D[1] = 3.0
+        failed = AUDIT._regularization_reciprocal_gate(data, manifest)
+        self.assertEqual(failed["REGULARIZATION_RECIPROCAL_GATE"], "FAIL")
+
     def test_unknown_solver_formulation_fails_populated_gate(self):
         contact = SimpleNamespace(geom1=0, geom2=1, efc_address=0, dim=1)
         data = SimpleNamespace(
@@ -407,7 +425,9 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         self.assertEqual(AUDIT.EXPECTED_SUBSTEPS, 120)
         self.assertEqual([item[2] for item in AUDIT.CONDITIONS], [1.0, 0.1, 1.0])
         self.assertEqual([item[1] for item in AUDIT.CONDITIONS], [
-            "R_SCALE_1_BEFORE", "R_SCALE_0P1", "R_SCALE_1_AFTER_RESTORE"
+            "REGULARIZATION_SCALE_1_BEFORE",
+            "REGULARIZATION_R_SCALE_0P1",
+            "REGULARIZATION_SCALE_1_AFTER_RESTORE",
         ])
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertIn("cone_helper.replay_once(args, paths)", source)
