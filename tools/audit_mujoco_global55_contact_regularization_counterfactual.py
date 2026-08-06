@@ -161,6 +161,8 @@ def _json_normalize(value: Any) -> Any:
     if isinstance(value, np.floating):
         return float(value)
     if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _json_normalize(value.item())
         return [_json_normalize(item) for item in value.tolist()]
     if isinstance(value, dict):
         return {key: _json_normalize(item) for key, item in value.items()}

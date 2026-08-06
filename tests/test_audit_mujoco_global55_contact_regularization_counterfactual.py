@@ -549,8 +549,16 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         self.assertEqual(report["UNCONDITIONAL_ZIP_PACKAGING"], "ENABLED")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "payload.json"
-            AUDIT.write_json(path, {"check": np.bool_(True), "value": np.float64(1.25)})
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"check": True, "value": 1.25})
+            AUDIT.write_json(path, {
+                "check": np.bool_(True),
+                "value": np.float64(1.25),
+                "zero_dim_int": np.asarray(7),
+                "zero_dim_float": np.asarray(2.5),
+            })
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"check": True, "value": 1.25, "zero_dim_int": 7, "zero_dim_float": 2.5},
+            )
 
     def test_success_failure_zip_testzip_sidecar_and_stdout_contract(self):
         with tempfile.TemporaryDirectory() as directory:
