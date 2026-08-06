@@ -1699,6 +1699,7 @@ def _baseline_regression(condition: dict[str, Any], reference: dict[str, Any]) -
     demand = condition["shared_demand"]
     adapted = {
         "capture": condition["capture"],
+        "shared_demand": condition["shared_demand"],
         "budget": {"selected": {"limb/12": {
             "actual_tangential_impulse": target["tangential_impulse"],
             "actual_tangential_impulse_norm": target["tangential_impulse_norm"],

@@ -407,6 +407,34 @@ class RegularizationCounterfactualTests(unittest.TestCase):
             "PASS",
         )
 
+    def test_baseline_adapter_passes_shared_demand_to_aref_regression(self):
+        demand = {
+            "limb_12_contact_index": 0,
+            "limb_12_tangent_impulse_2d": np.asarray([0.1, 0.2]),
+        }
+        condition = {
+            "shared_demand": demand,
+            "capture": {
+                "contacts": [{
+                    "tangential_impulse": [0.1, 0.2],
+                    "tangential_impulse_norm": 0.2236067977,
+                    "normal_impulse": 1.0,
+                    "pre_tangential_speed": [0.0, 0.0],
+                    "contact_index": 0,
+                    "solver_rows": [],
+                }],
+            },
+            "excess": {},
+        }
+        with patch.object(
+            AUDIT.aref_audit,
+            "baseline_regression",
+            return_value={"checks": {}},
+        ) as regression:
+            AUDIT._baseline_regression(condition, {})
+        adapted = regression.call_args.args[0]
+        self.assertIs(adapted["shared_demand"], demand)
+
     def test_classification_thresholds_and_next_actions(self):
         baseline = {"solver_excess_norm": 1.0, "solver_excess_vector_norm": 1.0}
         strong = AUDIT.classify_effect(baseline, {"solver_excess_norm": 0.2, "solver_excess_vector_norm": 0.3}, True)
