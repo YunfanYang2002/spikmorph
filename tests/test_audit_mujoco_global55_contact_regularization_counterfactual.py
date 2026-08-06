@@ -26,7 +26,122 @@ SPEC.loader.exec_module(AUDIT)
 
 class RegularizationCounterfactualTests(unittest.TestCase):
     def test_numpy_bool_compatibility_alias_is_installed_before_replay_helpers(self):
-        self.assertIs(np.bool, np.bool_)
+        self.assertIs(np.bool, bool)
+
+    def test_solver_storage_semantics_are_read_from_live_model_options(self):
+        solver_type = SimpleNamespace(mjSOL_PGS=0, mjSOL_CG=1, mjSOL_NEWTON=2)
+        jacobian_type = SimpleNamespace(mjJAC_DENSE=0, mjJAC_SPARSE=1)
+        cone_type = SimpleNamespace(mjCONE_PYRAMIDAL=0)
+        mujoco = SimpleNamespace(
+            mjtSolver=solver_type,
+            mjtJacobian=jacobian_type,
+            mjtCone=cone_type,
+            mj_isDual=lambda model: False,
+            mj_isSparse=lambda model: True,
+        )
+        model = SimpleNamespace(
+            opt=SimpleNamespace(solver=1, jacobian=1, cone=0)
+        )
+        semantics = AUDIT.solver_storage_semantics(mujoco, model)
+        self.assertEqual(semantics["SOLVER_FORMULATION"], "CG_PRIMAL")
+        self.assertFalse(semantics["efc_AR_required_for_solver"])
+        self.assertEqual(semantics["model_opt_solver_name"], "mjSOL_CG")
+        self.assertTrue(semantics["mj_isSparse"])
+
+    def test_primal_populated_gate_accepts_unallocated_efc_AR(self):
+        contact = SimpleNamespace(geom1=0, geom2=1, efc_address=0, dim=4)
+        data = SimpleNamespace(
+            ncon=1,
+            nefc=4,
+            nisland=0,
+            contact=[contact],
+            efc_R=np.ones(4),
+            efc_D=np.ones(4),
+            efc_AR=np.zeros(0),
+            efc_AR_rownnz=np.ones(4, dtype=int),
+            efc_AR_rowadr=np.arange(4, dtype=int),
+            efc_AR_colind=np.arange(4, dtype=int),
+            efc_force=np.zeros(4),
+            qfrc_constraint=np.zeros(2),
+            qacc=np.zeros(2),
+            efc_type=np.full(4, 6, dtype=int),
+            efc_id=np.zeros(4, dtype=int),
+        )
+        model = SimpleNamespace(nv=2)
+        mujoco = SimpleNamespace(
+            mjtObj=SimpleNamespace(mjOBJ_GEOM=0),
+            mj_id2name=lambda *args: "geom",
+        )
+        selected = [{"row_id": 0}]
+        semantics = {"SOLVER_FORMULATION": "NEWTON_PRIMAL"}
+        populated = AUDIT._populated_constraint_state(
+            mujoco, model, data, ["mj_fwdAcceleration"], selected, semantics
+        )
+        self.assertEqual(populated["POPULATED_CONSTRAINT_STATE"], "PASS")
+        self.assertEqual(
+            populated["efc_AR_status"],
+            "EXPECTED_UNALLOCATED_FOR_PRIMAL_SOLVER",
+        )
+        self.assertTrue(populated["checks"]["efc_AR_gate"])
+
+    def test_primal_constraint_path_does_not_require_projected_AR(self):
+        calls = []
+        mujoco = SimpleNamespace(
+            mj_projectConstraint=lambda *args: calls.append("project"),
+            mj_fwdConstraint=lambda *args: calls.append("fwd"),
+        )
+        self.assertEqual(
+            AUDIT._solver_constraint_calls(
+                mujoco, object(), object(), {"SOLVER_FORMULATION": "NEWTON_PRIMAL"}
+            ),
+            ["mj_fwdConstraint"],
+        )
+        self.assertEqual(calls, ["fwd"])
+
+    def test_unknown_solver_formulation_fails_populated_gate(self):
+        contact = SimpleNamespace(geom1=0, geom2=1, efc_address=0, dim=1)
+        data = SimpleNamespace(
+            ncon=1, nefc=1, nisland=0, contact=[contact],
+            efc_R=np.ones(1), efc_D=np.ones(1), efc_AR=np.zeros(0),
+            efc_AR_rownnz=np.zeros(1, dtype=int), efc_AR_rowadr=np.zeros(1, dtype=int),
+            efc_AR_colind=np.zeros(0, dtype=int), efc_type=np.ones(1, dtype=int),
+            efc_id=np.zeros(1, dtype=int),
+        )
+        populated = AUDIT._populated_constraint_state(
+            SimpleNamespace(), SimpleNamespace(), data, [], [{"row_id": 0}],
+            {"SOLVER_FORMULATION": "UNKNOWN"},
+        )
+        self.assertEqual(populated["POPULATED_CONSTRAINT_STATE"], "FAIL")
+        self.assertFalse(populated["checks"]["solver_formulation_known"])
+
+    def test_probe_classification_distinguishes_global_and_island_consumption(self):
+        def probe(effect):
+            return {"FIELD_PROBE_EFFECT": effect}
+
+        probes = {
+            "global_r_only": probe("NO_SOLVER_EFFECT"),
+            "global_d_only": probe("NO_SOLVER_EFFECT"),
+            "island_r_only": probe("OBSERVED"),
+            "island_d_only": probe("OBSERVED"),
+            "global_and_island_r": probe("OBSERVED"),
+            "global_and_island_d": probe("OBSERVED"),
+        }
+        report = AUDIT._classify_populated_consumption(
+            {"POPULATED_CONSTRAINT_STATE": "PASS", "nisland": 1},
+            {"REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "PASS"},
+            probes,
+            {"SOLVER_FORMULATION": "NEWTON_PRIMAL"},
+        )
+        self.assertEqual(report["R_CONSUMPTION_PATH"], "ISLAND_IEFC_R_DIRECT")
+        self.assertEqual(report["D_CONSUMPTION_PATH"], "ISLAND_IEFC_D_DIRECT")
+        self.assertEqual(report["AR_CONSUMPTION_PATH"], "NOT_APPLICABLE_PRIMAL_SOLVER")
+        self.assertEqual(report["ISLAND_MIRROR_REQUIRED"], "YES")
+        self.assertEqual(report["CONTACT_R_COUNTERFACTUAL_READY"], "YES")
+
+    def test_source_hash_status_reports_true_only_when_before_and_after_are_complete(self):
+        complete = {"a": "1", "b": "2"}
+        self.assertTrue(AUDIT._source_hash_status(complete, dict(complete)))
+        self.assertIsNone(AUDIT._source_hash_status({"a": None}, {"a": None}))
 
     def test_source_consumption_audit_requires_function_and_field_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -458,6 +573,14 @@ class RegularizationCounterfactualTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         for filename in (
             "constraint_regularization_consumption_audit.json",
+            "solver_storage_semantics.json",
+            "probe_global_r_only.json",
+            "probe_global_d_only.json",
+            "probe_island_r_only.json",
+            "probe_island_d_only.json",
+            "probe_global_and_island_r.json",
+            "probe_global_and_island_d.json",
+            "probe_effect_summary.json",
             "selected_floor_contact_rows.json",
             "regularization_counterfactual_activation.json",
             "regularization_invariant_validation.json",
@@ -468,7 +591,10 @@ class RegularizationCounterfactualTests(unittest.TestCase):
             "failure_context.json",
             "traceback.txt",
         ):
-            self.assertIn(filename, source)
+            if filename.startswith("probe_") and filename.endswith(".json"):
+                self.assertIn("probe_{probe_name}.json", source)
+            else:
+                self.assertIn(filename, source)
         tree = ast.parse(source)
         run_condition = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_condition")
         calls = {node.func.attr for node in ast.walk(run_condition) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}

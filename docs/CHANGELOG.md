@@ -2,6 +2,8 @@
 
 ## 2026-08-05
 
+- 修正 global55 regularization consumption audit：按实际 solver 区分 PGS dual 与 CG/Newton primal 的 `efc_AR` gate，新增 global/island R/D 独立 probes、solver storage semantics 与 source-hash pass 状态；audit-only 仍不运行 `R_SCALE_0P1`。
+
 - Fixed the regularization consumption audit to replay to populated global55 before runtime probes; added `--mode consumption-audit-only`, canonical fail-closed artifacts, and inner traceback/audit-phase packaging.
 
 - 修正 contact regularization consumption audit：移除不存在的 `iefc_AR` 假设，按 `map_efc2iefc`/`map_iefc2efc` 同步并验证 MuJoCo 的 `iefc_R`/`iefc_D` island mirrors；独立 PGS probe 不再因可证明的 mirror 路径误 fail closed。

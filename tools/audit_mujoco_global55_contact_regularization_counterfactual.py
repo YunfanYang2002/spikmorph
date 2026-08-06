@@ -24,10 +24,14 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 # Older Gym/experiment dependencies still reference the removed NumPy 1.x
-# alias during import.  Install the compatibility alias before importing the
-# replay helpers; the current tool does not otherwise use ``np.bool``.
-if "bool" not in np.__dict__:
-    np.bool = np.bool_
+# alias during import.  Install it directly in the module dictionary so the
+# compatibility remains visible to every replay dependency.
+def _ensure_numpy_bool_compatibility() -> None:
+    if "bool" not in np.__dict__:
+        np.__dict__["bool"] = bool
+
+
+_ensure_numpy_bool_compatibility()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -66,6 +70,8 @@ REGRESSION_ATOL = 1.0e-9
 R_GATE_RTOL = 1.0e-7
 R_GATE_ATOL = 1.0e-10
 AR_TOL = 1.0e-8
+PROBE_RTOL = 1.0e-8
+PROBE_ATOL = 1.0e-8
 ROOT_LINEAR_COLUMNS = (0, 1, 2)
 
 
@@ -898,6 +904,8 @@ def _constraint_snapshot(
         "efc_R": _field(data, "efc_R"),
         "efc_D": _field(data, "efc_D"),
         "efc_force": _field(data, "efc_force"),
+        "iefc_force": _field(data, "iefc_force"),
+        "iefc_state": _field(data, "iefc_state"),
         "qfrc_constraint": _field(data, "qfrc_constraint"),
         "qacc": _field(data, "qacc"),
         "qacc_smooth": _field(data, "qacc_smooth"),
@@ -1525,6 +1533,19 @@ def _safe_sha256(path: Path) -> str | None:
         return None
 
 
+def _source_hash_status(
+    hashes_before: dict[str, str | None],
+    hashes_after: dict[str, str | None] | None,
+) -> bool | None:
+    if hashes_after is None or set(hashes_before) != set(hashes_after):
+        return None
+    if any(value is None for value in hashes_before.values()) or any(
+        value is None for value in hashes_after.values()
+    ):
+        return None
+    return bool(hashes_before == hashes_after)
+
+
 def _source_provenance(mujoco: Any, args: argparse.Namespace) -> dict[str, Any]:
     """Record local MuJoCo provenance without scanning site-packages."""
     package_file = Path(getattr(mujoco, "__file__", "")).resolve()
@@ -1651,43 +1672,177 @@ def _contact_identities(mujoco: Any, model: Any, data: Any) -> list[dict[str, An
     return result
 
 
+def _enum_name(enum_type: Any, value: int) -> str:
+    try:
+        member = enum_type(int(value))
+        name = getattr(member, "name", None)
+        if name:
+            return str(name)
+    except (TypeError, ValueError):
+        pass
+    for name in dir(enum_type):
+        if not name.startswith("mj"):
+            continue
+        try:
+            if int(getattr(enum_type, name)) == int(value):
+                return name
+        except (TypeError, ValueError):
+            continue
+    return f"UNKNOWN_{int(value)}"
+
+
+def _safe_solver_bool(mujoco: Any, function_name: str, model: Any) -> bool | None:
+    function = getattr(mujoco, function_name, None)
+    if not callable(function):
+        return None
+    try:
+        return bool(function(model))
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
+def solver_storage_semantics(mujoco: Any, model: Any) -> dict[str, Any]:
+    """Read the live model's solver formulation and storage contract.
+
+    This intentionally uses the model options and MuJoCo query functions from
+    the populated replay model.  It never assumes the MuJoCo default solver.
+    """
+    solver_value = int(model.opt.solver)
+    solver_type = getattr(mujoco, "mjtSolver", object)
+    solver_name = _enum_name(solver_type, solver_value)
+    dual = _safe_solver_bool(mujoco, "mj_isDual", model)
+    sparse = _safe_solver_bool(mujoco, "mj_isSparse", model)
+    jacobian_value = int(model.opt.jacobian)
+    jacobian_type = getattr(mujoco, "mjtJacobian", object)
+    jacobian_name = _enum_name(jacobian_type, jacobian_value)
+    cone_value = int(model.opt.cone)
+    cone_name = _enum_name(getattr(mujoco, "mjtCone", object), cone_value)
+
+    if solver_name == "mjSOL_PGS" or dual is True:
+        formulation = "PGS_DUAL"
+    elif solver_name == "mjSOL_CG":
+        formulation = "CG_PRIMAL"
+    elif solver_name == "mjSOL_NEWTON":
+        formulation = "NEWTON_PRIMAL"
+    else:
+        formulation = "UNKNOWN"
+
+    return {
+        "SOLVER_FORMULATION": formulation,
+        "model_opt_solver_numeric": solver_value,
+        "model_opt_solver_name": solver_name,
+        "mj_isDual": dual,
+        "mj_isSparse": sparse,
+        "model_opt_jacobian_numeric": jacobian_value,
+        "model_opt_jacobian_name": jacobian_name,
+        "model_opt_cone_numeric": cone_value,
+        "model_opt_cone_name": cone_name,
+        "efc_AR_required_for_solver": formulation == "PGS_DUAL",
+        "efc_AR_semantics": (
+            "computed by mj_projectConstraint (PGS solver)"
+            if formulation == "PGS_DUAL" else
+            "not required by the primal solver path"
+            if formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"} else
+            "unknown"
+        ),
+    }
+
+
+def _solver_constraint_calls(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    semantics: dict[str, Any],
+) -> list[str]:
+    formulation = semantics.get("SOLVER_FORMULATION")
+    if formulation == "UNKNOWN":
+        raise RuntimeError("unknown solver formulation; refusing constraint probe")
+    calls = []
+    if formulation == "PGS_DUAL":
+        mujoco.mj_projectConstraint(model, data)
+        calls.append("mj_projectConstraint")
+    mujoco.mj_fwdConstraint(model, data)
+    calls.append("mj_fwdConstraint")
+    return calls
+
+
 def _populated_constraint_state(
     mujoco: Any,
     model: Any,
     data: Any,
     staged_calls: Sequence[str],
     selected_rows: Sequence[dict[str, Any]],
+    semantics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    semantics = semantics or {"SOLVER_FORMULATION": "UNKNOWN"}
+    formulation = semantics.get("SOLVER_FORMULATION", "UNKNOWN")
     nefc = int(getattr(data, "nefc", 0))
     ncon = int(getattr(data, "ncon", 0))
     storage = _field_manifest(
         data,
         (
             "efc_R", "efc_D", "efc_AR", "efc_AR_rownnz", "efc_AR_rowadr",
-            "efc_AR_colind", "iefc_R", "iefc_D", "map_efc2iefc", "map_iefc2efc",
+            "efc_AR_colind", "efc_force", "qfrc_constraint", "qacc",
+            "iefc_R", "iefc_D", "iefc_force", "iefc_state",
+            "map_efc2iefc", "map_iefc2efc",
         ),
     )
     required_global = all(
         storage[name]["available"] and storage[name]["size"] == nefc
         for name in ("efc_R", "efc_D")
     )
-    required_ar = bool(storage["efc_AR"]["available"] and storage["efc_AR"]["size"] > 0)
+    ar_matrix, ar_layout = _ar_matrix(data, nefc)
+    if formulation == "PGS_DUAL":
+        ar_status = (
+            "POPULATED"
+            if ar_matrix is not None and ar_layout.get("valid", False)
+            else "MISSING_OR_INVALID"
+        )
+        ar_gate = ar_status == "POPULATED"
+    elif formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"}:
+        ar_status = (
+            "EXPECTED_UNALLOCATED_FOR_PRIMAL_SOLVER"
+            if storage["efc_AR"]["size"] == 0 else
+            "AVAILABLE_BUT_NOT_REQUIRED"
+        )
+        ar_gate = True
+    else:
+        ar_status = "UNKNOWN_SOLVER_FORMULATION"
+        ar_gate = False
     nisland = _island_count(data)
     island_valid = True
+    island_validation_error = None
     if nisland > 0:
         island_valid = all(
-            storage[name]["available"] and storage[name]["size"] >= nefc
+            storage[name]["available"] and storage[name]["size"] == nefc
             for name in ("iefc_R", "iefc_D", "map_efc2iefc", "map_iefc2efc")
         )
+        if island_valid:
+            try:
+                _island_regularization_state(data, list(range(nefc)))
+            except RuntimeError as error:
+                island_valid = False
+                island_validation_error = str(error)
     target_present = bool(selected_rows)
-    passed = bool(ncon > 0 and nefc > 0 and required_global and required_ar and island_valid and target_present)
+    passed = bool(
+        formulation != "UNKNOWN"
+        and ncon > 0
+        and nefc > 0
+        and required_global
+        and ar_gate
+        and island_valid
+        and target_present
+    )
     constraint_types = _field(data, "efc_type")
     return {
         "POPULATED_CONSTRAINT_STATE": "PASS" if passed else "FAIL",
         "ncon": ncon,
         "nefc": nefc,
         "nisland": nisland,
+        "solver_semantics": semantics,
         "storage": storage,
+        "efc_AR_layout": ar_layout,
+        "efc_AR_status": ar_status,
         "constraint_types": constraint_types,
         "contact_identities": _contact_identities(mujoco, model, data),
         "selected_floor_contact_row_ids": [int(item["row_id"]) for item in selected_rows],
@@ -1699,10 +1854,14 @@ def _populated_constraint_state(
             "nefc_gt_zero": nefc > 0,
             "efc_R_size_equals_nefc": required_global,
             "efc_D_size_equals_nefc": required_global,
-            "efc_AR_populated": required_ar,
+            "efc_AR_required_for_solver": formulation == "PGS_DUAL",
+            "efc_AR_populated": bool(ar_matrix is not None and ar_layout.get("valid", False)),
+            "efc_AR_gate": ar_gate,
             "island_storage_valid_when_needed": island_valid,
             "target_floor_contact_rows_present": target_present,
+            "solver_formulation_known": formulation != "UNKNOWN",
         },
+        "island_validation_error": island_validation_error,
     }
 
 
@@ -1837,7 +1996,7 @@ def _run_populated_probe(
             "reason": "D0 is not approximately reciprocal to R0",
         }
     baseline_solver = mujoco.MjData(model)
-    mujoco.mj_copyData(baseline_solver, model, constraint_baseline)
+    mujoco.mj_copyData(baseline_solver, model, baseline_data)
     mujoco.mj_projectConstraint(model, baseline_solver)
     baseline_projected = _constraint_snapshot(baseline_solver, mujoco, model)
     mujoco.mj_fwdConstraint(model, baseline_solver)
@@ -1890,6 +2049,278 @@ def _run_populated_probe(
     return probe
 
 
+def _probe_vector(snapshot: dict[str, Any], field: str) -> np.ndarray | None:
+    if field == "physical_contact_impulse":
+        values = [
+            item.get("force_contact_frame")
+            for item in snapshot.get("physical_contact_forces", [])
+        ]
+        if not values:
+            return np.zeros(0, dtype=np.float64)
+        return np.asarray(values, dtype=np.float64).reshape(-1)
+    value = snapshot.get(field)
+    return None if value is None else np.asarray(value, dtype=np.float64)
+
+
+def _probe_delta(before: Any, after: Any) -> dict[str, Any]:
+    if before is None or after is None:
+        return {
+            "available": False,
+            "changed": False,
+            "absolute_delta": None,
+            "relative_delta": None,
+            "noise_tolerance": {"rtol": PROBE_RTOL, "atol": PROBE_ATOL},
+        }
+    before_array = np.asarray(before, dtype=np.float64)
+    after_array = np.asarray(after, dtype=np.float64)
+    if before_array.shape != after_array.shape:
+        return {
+            "available": False,
+            "changed": True,
+            "absolute_delta": None,
+            "relative_delta": None,
+            "noise_tolerance": {"rtol": PROBE_RTOL, "atol": PROBE_ATOL},
+            "reason": "shape mismatch",
+        }
+    delta = after_array - before_array
+    absolute = float(np.max(np.abs(delta))) if delta.size else 0.0
+    scale = float(np.max(np.abs(before_array))) if before_array.size else 0.0
+    relative = absolute / max(scale, np.finfo(np.float64).tiny)
+    return {
+        "available": True,
+        "changed": bool(
+            not np.allclose(
+                before_array, after_array, rtol=PROBE_RTOL, atol=PROBE_ATOL
+            )
+        ),
+        "absolute_delta": absolute,
+        "relative_delta": relative,
+        "noise_tolerance": {"rtol": PROBE_RTOL, "atol": PROBE_ATOL},
+        "delta": delta,
+    }
+
+
+def _probe_solver_effect(
+    baseline: dict[str, Any], altered: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    fields = (
+        "efc_force", "iefc_force", "qfrc_constraint", "qacc",
+        "physical_contact_impulse",
+    )
+    deltas = {}
+    changed = False
+    for field in fields:
+        report = _probe_delta(
+            _probe_vector(baseline, field), _probe_vector(altered, field)
+        )
+        deltas[field] = report
+        changed = changed or bool(report.get("changed", False))
+    return deltas, changed
+
+
+def _probe_field_arrays(
+    data: Any,
+    row: int,
+    island_row: int | None,
+) -> dict[str, Any]:
+    result = {
+        "efc_R": _field(data, "efc_R"),
+        "efc_D": _field(data, "efc_D"),
+        "iefc_R": _field(data, "iefc_R"),
+        "iefc_D": _field(data, "iefc_D"),
+    }
+    return {
+        "global_R": None if result["efc_R"] is None else result["efc_R"][row],
+        "global_D": None if result["efc_D"] is None else result["efc_D"][row],
+        "island_R": (
+            None if result["iefc_R"] is None or island_row is None
+            else result["iefc_R"][island_row]
+        ),
+        "island_D": (
+            None if result["iefc_D"] is None or island_row is None
+            else result["iefc_D"][island_row]
+        ),
+    }
+
+
+def _run_storage_probe(
+    mujoco: Any,
+    model: Any,
+    baseline_data: Any,
+    row: int,
+    scale: float,
+    semantics: dict[str, Any],
+    name: str,
+    mutate_global_r: bool = False,
+    mutate_global_d: bool = False,
+    mutate_island_r: bool = False,
+    mutate_island_d: bool = False,
+) -> dict[str, Any]:
+    island_state = _island_regularization_state(baseline_data, [row])
+    if (mutate_island_r or mutate_island_d) and island_state["required"] != "YES":
+        return {
+            "probe_name": name,
+            "FIELD_PROBE_EFFECT": "NOT_APPLICABLE",
+            "classification": "NOT_APPLICABLE",
+            "row_id": row,
+            "probe_scale": scale,
+            "reason": "nisland=0",
+        }
+    island_row = (
+        int(island_state["selected_iefc_rows"][0])
+        if island_state["required"] == "YES" else None
+    )
+    baseline_data_snapshot = _constraint_snapshot(baseline_data, mujoco, model)
+    baseline_values = _probe_field_arrays(baseline_data, row, island_row)
+    baseline_solver = mujoco.MjData(model)
+    mujoco.mj_copyData(baseline_solver, model, baseline_data)
+    baseline_calls = _solver_constraint_calls(
+        mujoco, model, baseline_solver, semantics
+    )
+    baseline_solver_snapshot = _constraint_snapshot(
+        baseline_solver, mujoco, model, read_physical_contact_forces=True
+    )
+
+    altered = mujoco.MjData(model)
+    mujoco.mj_copyData(altered, model, baseline_data)
+    before_values = _probe_field_arrays(altered, row, island_row)
+    modifications = {"before": before_values, "after_write": {}}
+    if mutate_global_r:
+        altered.efc_R[row] = float(before_values["global_R"]) * float(scale)
+    if mutate_global_d:
+        altered.efc_D[row] = float(before_values["global_D"]) * float(scale)
+    if mutate_island_r:
+        altered.iefc_R[island_row] = float(before_values["island_R"]) * float(scale)
+    if mutate_island_d:
+        altered.iefc_D[island_row] = float(before_values["island_D"]) * float(scale)
+    modifications["after_write"] = _probe_field_arrays(altered, row, island_row)
+    altered_calls = _solver_constraint_calls(mujoco, model, altered, semantics)
+    altered_solver_snapshot = _constraint_snapshot(
+        altered, mujoco, model, read_physical_contact_forces=True
+    )
+    after_values = _probe_field_arrays(altered, row, island_row)
+
+    expected = dict(before_values)
+    for key, enabled in (
+        ("global_R", mutate_global_r), ("global_D", mutate_global_d),
+        ("island_R", mutate_island_r), ("island_D", mutate_island_d),
+    ):
+        if enabled:
+            expected[key] = before_values[key] * float(scale)
+    field_retention = {
+        key: bool(
+            after_values[key] is not None
+            and expected[key] is not None
+            and np.isclose(
+                float(after_values[key]), float(expected[key]),
+                rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+            )
+        )
+        for key in expected
+        if (key == "global_R" and mutate_global_r)
+        or (key == "global_D" and mutate_global_d)
+        or (key == "island_R" and mutate_island_r)
+        or (key == "island_D" and mutate_island_d)
+    }
+    untouched = {
+        key: (
+            True
+            if after_values[key] is None and before_values[key] is None else
+            bool(
+                after_values[key] is not None
+                and before_values[key] is not None
+                and np.isclose(
+                    float(after_values[key]), float(before_values[key]),
+                    rtol=R_GATE_RTOL, atol=R_GATE_ATOL,
+                )
+            )
+        )
+        for key in expected
+        if key not in field_retention
+    }
+    solver_deltas, solver_changed = _probe_solver_effect(
+        baseline_solver_snapshot, altered_solver_snapshot
+    )
+    overwritten = not all(field_retention.values()) or not all(untouched.values())
+    if overwritten:
+        effect = "OVERWRITTEN"
+    elif solver_changed:
+        effect = "OBSERVED"
+    else:
+        effect = "NO_SOLVER_EFFECT"
+    ar_delta = _probe_delta(
+        baseline_solver_snapshot.get("ar_matrix"),
+        altered_solver_snapshot.get("ar_matrix"),
+    )
+    return {
+        "probe_name": name,
+        "FIELD_PROBE_EFFECT": effect,
+        "classification": effect,
+        "solver_formulation": semantics.get("SOLVER_FORMULATION"),
+        "row_id": row,
+        "island_row_id": island_row,
+        "probe_scale": float(scale),
+        "mutations": {
+            "global_R": mutate_global_r,
+            "global_D": mutate_global_d,
+            "island_R": mutate_island_r,
+            "island_D": mutate_island_d,
+        },
+        "modifications": modifications,
+        "field_retention": field_retention,
+        "untouched_fields": untouched,
+        "solver_calls_baseline": baseline_calls,
+        "solver_calls_altered": altered_calls,
+        "solver_outputs_changed": {
+            field: bool(report.get("changed", False))
+            for field, report in solver_deltas.items()
+        },
+        "absolute_delta": {
+            field: report.get("absolute_delta")
+            for field, report in solver_deltas.items()
+        },
+        "relative_delta": {
+            field: report.get("relative_delta")
+            for field, report in solver_deltas.items()
+        },
+        "noise_tolerance": {"rtol": PROBE_RTOL, "atol": PROBE_ATOL},
+        "solver_output_deltas": solver_deltas,
+        "ar_delta": ar_delta,
+        "baseline_storage": baseline_values,
+        "before": baseline_data_snapshot,
+        "baseline_solver": baseline_solver_snapshot,
+        "altered_solver": altered_solver_snapshot,
+    }
+
+
+def _run_storage_probes(
+    mujoco: Any,
+    model: Any,
+    baseline_data: Any,
+    row: int,
+    scale: float,
+    semantics: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    specs = {
+        "global_r_only": {"mutate_global_r": True},
+        "global_d_only": {"mutate_global_d": True},
+        "island_r_only": {"mutate_island_r": True},
+        "island_d_only": {"mutate_island_d": True},
+        "global_and_island_r": {
+            "mutate_global_r": True, "mutate_island_r": True,
+        },
+        "global_and_island_d": {
+            "mutate_global_d": True, "mutate_island_d": True,
+        },
+    }
+    return {
+        name: _run_storage_probe(
+            mujoco, model, baseline_data, row, scale, semantics, name, **flags
+        )
+        for name, flags in specs.items()
+    }
+
+
 def _audit_output_paths(output: Path) -> tuple[Path, Path]:
     return output / "run.log", output / "audit_phase.json"
 
@@ -1915,10 +2346,13 @@ def execute_consumption_audit_only(
     mujoco = import_result
     write_json(output / "public_api_contract.json", _public_api_contract(mujoco))
     write_json(output / "source_provenance.json", _source_provenance(mujoco, args))
+    _ensure_numpy_bool_compatibility()
     recorder, mapping = aref_audit.cone_helper.replay_once(args, paths)
     model, snapshot = recorder.raw_model, recorder.global55_snapshot
     if model is None or snapshot is None:
         raise RuntimeError("global55 replay did not provide native model/data/snapshot")
+    semantics = solver_storage_semantics(mujoco, model)
+    write_json(output / "solver_storage_semantics.json", semantics)
     formal_data_unchanged = bool(
         recorder.snapshot_copy_evidence
         and recorder.snapshot_copy_evidence.get("live_unchanged_by_copy", False)
@@ -1933,19 +2367,21 @@ def execute_consumption_audit_only(
         staged_data, mujoco, model, mapping, snapshot
     )
     staged_snapshot = _constraint_snapshot(staged_data, mujoco, model)
-    # Keep the staged object intact for the pipeline record.  Build the
-    # constraint storage required by the runtime audit on a second clone;
-    # this is where MuJoCo versions that populate efc_AR lazily do so.
+    # Keep the staged object intact for the pipeline record.  Only PGS needs
+    # the global AR projection; primal solvers must not be gated on efc_AR.
     constraint_baseline = mujoco.MjData(model)
     mujoco.mj_copyData(constraint_baseline, model, staged_data)
-    mujoco.mj_projectConstraint(model, constraint_baseline)
-    projected_calls = [*staged_calls, "mj_projectConstraint"]
+    projected_calls = list(staged_calls)
+    if semantics["SOLVER_FORMULATION"] == "PGS_DUAL":
+        mujoco.mj_projectConstraint(model, constraint_baseline)
+        projected_calls.append("mj_projectConstraint")
     baseline_stage = _constraint_snapshot(constraint_baseline, mujoco, model)
     selected_manifest = selected_floor_contact_rows(
         constraint_baseline, decomposition, baseline_stage
     )
     populated = _populated_constraint_state(
-        mujoco, model, constraint_baseline, projected_calls, selected_manifest
+        mujoco, model, constraint_baseline, projected_calls, selected_manifest,
+        semantics,
     )
     populated["formal_replay_physics_substeps"] = len(recorder.records)
     populated["expected_formal_replay_physics_substeps"] = EXPECTED_SUBSTEPS
@@ -1968,28 +2404,17 @@ def execute_consumption_audit_only(
             output, validation, hashes_before, source_files, None, None, None
         )
         return validation
-    if any(item["baseline_AR_diagonal"] is None for item in selected_manifest):
-        populated["POPULATED_CONSTRAINT_STATE"] = "FAIL"
-        populated["checks"]["selected_AR_diagonal_available"] = False
-        write_json(output / "populated_constraint_state.json", populated)
-        validation = _audit_only_validation(
-            populated, None, None, None, len(recorder.records), formal_data_unchanged
-        )
-        _write_audit_only_results(
-            output, validation, hashes_before, source_files, None, None, None
-        )
-        return validation
-
     baseline_solver = mujoco.MjData(model)
-    mujoco.mj_copyData(baseline_solver, model, baseline_data)
-    mujoco.mj_fwdConstraint(model, baseline_solver)
+    mujoco.mj_copyData(baseline_solver, model, constraint_baseline)
+    baseline_calls = _solver_constraint_calls(
+        mujoco, model, baseline_solver, semantics
+    )
     baseline_solver_snapshot = _constraint_snapshot(
         baseline_solver, mujoco, model, read_physical_contact_forces=True
     )
     no_op = mujoco.MjData(model)
     mujoco.mj_copyData(no_op, model, constraint_baseline)
-    mujoco.mj_projectConstraint(model, no_op)
-    mujoco.mj_fwdConstraint(model, no_op)
+    no_op_calls = _solver_constraint_calls(mujoco, model, no_op, semantics)
     no_op_snapshot = _constraint_snapshot(
         no_op, mujoco, model, read_physical_contact_forces=True
     )
@@ -1999,11 +2424,19 @@ def execute_consumption_audit_only(
     production_snapshot = _constraint_snapshot(
         production, mujoco, model, read_physical_contact_forces=True
     )
+    no_op_fields = (
+        "efc_R", "efc_D", "iefc_R", "iefc_D", "efc_force",
+        "iefc_force", "qfrc_constraint", "qacc",
+    )
     no_op_checks = _snapshot_equal_fields(
         no_op_snapshot,
         production_snapshot,
-        ("efc_R", "efc_D", "ar_matrix", "efc_force", "qfrc_constraint", "qacc"),
+        no_op_fields,
     )
+    if semantics["SOLVER_FORMULATION"] == "PGS_DUAL":
+        no_op_checks["ar_matrix"] = _allclose(
+            no_op_snapshot.get("ar_matrix"), production_snapshot.get("ar_matrix")
+        )
     no_op_checks["physical_contact_forces"] = _allclose(
         [item["force_contact_frame"] for item in no_op_snapshot["physical_contact_forces"]],
         [item["force_contact_frame"] for item in production_snapshot["physical_contact_forces"]],
@@ -2011,8 +2444,11 @@ def execute_consumption_audit_only(
     pipeline = {
         "checks": no_op_checks,
         "staged_calls": staged_calls,
-        "no_op_calls": ["mj_projectConstraint", "mj_fwdConstraint"],
+        "baseline_calls": baseline_calls,
+        "no_op_calls": no_op_calls,
         "production_calls": ["mj_forward on independent clone"],
+        "solver_storage_semantics": semantics,
+        "compared_fields": list(no_op_checks),
         "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "PASS" if all(no_op_checks.values()) else "FAIL",
         "baseline_solver": baseline_solver_snapshot,
         "no_op_solver": no_op_snapshot,
@@ -2026,32 +2462,44 @@ def execute_consumption_audit_only(
         "storage_manifest": populated["storage"],
     })
     probe_row = int(selected_manifest[0]["row_id"])
-    global_only = _run_populated_probe(
-        mujoco, model, constraint_baseline, probe_row, 0.9, update_island=False
+    probes = _run_storage_probes(
+        mujoco, model, constraint_baseline, probe_row, 0.9, semantics
     )
-    write_json(output / "probe_global_only.json", global_only)
-    island_required = _island_count(constraint_baseline) > 0
-    if island_required:
-        global_plus_island = _run_populated_probe(
-            mujoco, model, constraint_baseline, probe_row, 0.9, update_island=True
-        )
-    else:
-        global_plus_island = {
-            "classification": "NOT_APPLICABLE",
-            "probe_scale": 0.9,
-            "update_island_mirrors": False,
-            "reason": "nisland=0",
-        }
-    write_json(output / "probe_global_plus_island.json", global_plus_island)
+    for name, probe in probes.items():
+        write_json(output / f"probe_{name}.json", probe)
+    write_json(output / "probe_global_only.json", {
+        "global_R_only": probes["global_r_only"],
+        "global_D_only": probes["global_d_only"],
+    })
+    write_json(output / "probe_island_only.json", {
+        "island_R_only": probes["island_r_only"],
+        "island_D_only": probes["island_d_only"],
+    })
+    write_json(output / "probe_global_plus_island.json", {
+        "global_and_island_R": probes["global_and_island_r"],
+        "global_and_island_D": probes["global_and_island_d"],
+    })
     audit = _classify_populated_consumption(
-        populated, pipeline, global_only, global_plus_island
+        populated, pipeline, probes, semantics
     )
     write_json(output / "constraint_regularization_consumption_audit.json", audit)
+    write_json(output / "probe_effect_summary.json", {
+        "solver_storage_semantics": semantics,
+        "probes": {
+            name: {
+                "FIELD_PROBE_EFFECT": probe.get("FIELD_PROBE_EFFECT"),
+                "solver_outputs_changed": probe.get("solver_outputs_changed", {}),
+                "absolute_delta": probe.get("absolute_delta", {}),
+                "relative_delta": probe.get("relative_delta", {}),
+            }
+            for name, probe in probes.items()
+        },
+        "R_CONSUMPTION_PATH": audit["R_CONSUMPTION_PATH"],
+        "D_CONSUMPTION_PATH": audit["D_CONSUMPTION_PATH"],
+        "AR_CONSUMPTION_PATH": audit["AR_CONSUMPTION_PATH"],
+    })
     source_hashes_after = {str(path): _safe_sha256(path) for path in source_files}
-    hashes_known = all(value is not None for value in hashes_before.values())
-    source_unchanged = (
-        hashes_before == source_hashes_after if hashes_known else None
-    )
+    source_unchanged = _source_hash_status(hashes_before, source_hashes_after)
     validation = _audit_only_validation(
         populated,
         audit,
@@ -2073,35 +2521,64 @@ def execute_consumption_audit_only(
 def _classify_populated_consumption(
     populated: dict[str, Any],
     pipeline: dict[str, Any],
-    global_only: dict[str, Any],
-    global_plus_island: dict[str, Any],
+    probes: dict[str, dict[str, Any]],
+    semantics: dict[str, Any],
 ) -> dict[str, Any]:
     island_required = populated["nisland"] > 0
-    global_effect = global_only.get("classification")
-    island_effect = global_plus_island.get("classification")
-    global_probe_valid = global_effect in {"OBSERVED", "NO_SOLVER_EFFECT"}
-    island_probe_valid = island_effect in {"OBSERVED", "NO_SOLVER_EFFECT"}
-    if island_required:
-        r_path = (
-            "GLOBAL_AND_ISLAND_SYNCHRONIZED"
-            if island_probe_valid else
-            "ISLAND_IEFC_R"
-            if island_effect in {"NO_SOLVER_EFFECT", "OVERWRITTEN"} and global_effect != "OBSERVED" else
-            "GLOBAL_EFC_R_REPROJECTED"
-            if global_probe_valid else "UNDETERMINED"
+
+    def effect(name: str) -> str:
+        return str(probes.get(name, {}).get("FIELD_PROBE_EFFECT", "NONCANONICAL"))
+
+    def resolve_path(
+        global_name: str, island_name: str, combined_name: str
+    ) -> str:
+        global_effect = effect(global_name)
+        island_effect = effect(island_name)
+        combined_effect = effect(combined_name)
+        if not island_required:
+            if global_effect == "OBSERVED":
+                return "GLOBAL_EFC_R_DIRECT" if global_name.endswith("r_only") else "GLOBAL_EFC_D_DIRECT"
+            if global_effect == "NO_SOLVER_EFFECT":
+                return "NOT_CONSUMED_DIRECTLY"
+            if global_effect == "OVERWRITTEN":
+                return "REBUILT_FROM_CONTACT_PARAMETERS"
+            return "UNDETERMINED"
+        if global_effect == "OBSERVED" and island_effect != "OBSERVED":
+            return "GLOBAL_EFC_R_DIRECT" if global_name.endswith("r_only") else "GLOBAL_EFC_D_DIRECT"
+        if island_effect == "OBSERVED" and global_effect != "OBSERVED":
+            return "ISLAND_IEFC_R_DIRECT" if island_name.endswith("r_only") else "ISLAND_IEFC_D_DIRECT"
+        if combined_effect == "OBSERVED":
+            return "GLOBAL_AND_ISLAND_SYNCHRONIZED"
+        if global_effect == "NO_SOLVER_EFFECT" and island_effect == "NO_SOLVER_EFFECT":
+            return "NOT_CONSUMED_DIRECTLY"
+        if "OVERWRITTEN" in {global_effect, island_effect, combined_effect}:
+            return "REBUILT_FROM_CONTACT_PARAMETERS"
+        return "UNDETERMINED"
+
+    r_path = resolve_path("global_r_only", "island_r_only", "global_and_island_r")
+    d_path = resolve_path("global_d_only", "island_d_only", "global_and_island_d")
+    formulation = semantics.get("SOLVER_FORMULATION", "UNKNOWN")
+    if formulation in {"CG_PRIMAL", "NEWTON_PRIMAL"}:
+        ar_path = "NOT_APPLICABLE_PRIMAL_SOLVER"
+    elif formulation == "PGS_DUAL":
+        ar_report = probes.get("global_r_only", {}).get("ar_delta", {})
+        ar_path = (
+            "MJ_PROJECT_CONSTRAINT_FROM_CURRENT_R"
+            if ar_report.get("changed", False) else "MANUAL_AR_UPDATE_REQUIRED"
         )
-        d_path = "ISLAND_IEFC_D" if island_probe_valid else "UNDETERMINED"
-        island_status = "YES" if island_probe_valid else "UNDETERMINED"
     else:
-        r_path = "GLOBAL_EFC_R_REPROJECTED" if global_probe_valid else "UNDETERMINED"
-        d_path = "GLOBAL_EFC_D_DIRECT" if global_probe_valid else "UNDETERMINED"
+        ar_path = "UNDETERMINED"
+    if not island_required:
+        island_status = "NOT_APPLICABLE"
+    elif "ISLAND_IEFC" in r_path or "ISLAND_IEFC" in d_path or "SYNCHRONIZED" in r_path or "SYNCHRONIZED" in d_path:
+        island_status = "YES"
+    elif r_path != "UNDETERMINED" and d_path != "UNDETERMINED":
         island_status = "NO"
-    ar_path = (
-        "MJ_PROJECT_CONSTRAINT_FROM_CURRENT_R"
-        if global_only.get("AR_delta", {}).get("classification") == "PASS"
-        else "UNDETERMINED"
-    )
+    else:
+        island_status = "UNDETERMINED"
     ready = bool(
+        formulation != "UNKNOWN"
+        and
         populated["POPULATED_CONSTRAINT_STATE"] == "PASS"
         and pipeline["REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION"] == "PASS"
         and r_path != "UNDETERMINED"
@@ -2118,16 +2595,24 @@ def _classify_populated_consumption(
         else "INSUFFICIENT_EVIDENCE"
     )
     return {
+        "SOLVER_FORMULATION": formulation,
         "R_CONSUMPTION_PATH": r_path,
         "D_CONSUMPTION_PATH": d_path,
         "AR_CONSUMPTION_PATH": ar_path,
         "ISLAND_MIRROR_REQUIRED": island_status,
-        "GLOBAL_ONLY_PROBE_EFFECT": global_effect,
-        "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": island_effect,
+        "GLOBAL_R_ONLY_PROBE_EFFECT": effect("global_r_only"),
+        "GLOBAL_D_ONLY_PROBE_EFFECT": effect("global_d_only"),
+        "ISLAND_R_ONLY_PROBE_EFFECT": effect("island_r_only"),
+        "ISLAND_D_ONLY_PROBE_EFFECT": effect("island_d_only"),
+        "GLOBAL_AND_ISLAND_R_PROBE_EFFECT": effect("global_and_island_r"),
+        "GLOBAL_AND_ISLAND_D_PROBE_EFFECT": effect("global_and_island_d"),
+        "GLOBAL_ONLY_PROBE_EFFECT": effect("global_r_only"),
+        "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": effect("global_and_island_r"),
         "NO_ISLAND_BASELINE_REPRODUCTION": no_island_baseline,
         "CONTACT_R_COUNTERFACTUAL_READY": "YES" if ready else "NO",
         "audit_status": "PASS" if ready else "INSUFFICIENT_EVIDENCE",
         "counterfactual_ready": ready,
+        "solver_storage_semantics": semantics,
         "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
         "MUJOCO_SOLVER_EXCESS_CAUSAL_DRIVER": "NOT_RUN_AUDIT_ONLY",
         "formal_R_counterfactual_was_run": False,
@@ -2152,6 +2637,19 @@ def _audit_only_validation(
         ),
         "GLOBAL_ONLY_PROBE_EFFECT": audit.get("GLOBAL_ONLY_PROBE_EFFECT", "NOT_RUN"),
         "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": audit.get("GLOBAL_PLUS_ISLAND_PROBE_EFFECT", "NOT_RUN"),
+        "GLOBAL_R_ONLY_PROBE_EFFECT": audit.get("GLOBAL_R_ONLY_PROBE_EFFECT", "NOT_RUN"),
+        "GLOBAL_D_ONLY_PROBE_EFFECT": audit.get("GLOBAL_D_ONLY_PROBE_EFFECT", "NOT_RUN"),
+        "ISLAND_R_ONLY_PROBE_EFFECT": audit.get("ISLAND_R_ONLY_PROBE_EFFECT", "NOT_RUN"),
+        "ISLAND_D_ONLY_PROBE_EFFECT": audit.get("ISLAND_D_ONLY_PROBE_EFFECT", "NOT_RUN"),
+        "GLOBAL_AND_ISLAND_R_PROBE_EFFECT": audit.get(
+            "GLOBAL_AND_ISLAND_R_PROBE_EFFECT", "NOT_RUN"
+        ),
+        "GLOBAL_AND_ISLAND_D_PROBE_EFFECT": audit.get(
+            "GLOBAL_AND_ISLAND_D_PROBE_EFFECT", "NOT_RUN"
+        ),
+        "SOLVER_FORMULATION": audit.get("solver_storage_semantics", {}).get(
+            "SOLVER_FORMULATION", "UNKNOWN"
+        ),
         "NO_ISLAND_BASELINE_REPRODUCTION": audit.get(
             "NO_ISLAND_BASELINE_REPRODUCTION", "NOT_RUN"
         ),
@@ -2179,6 +2677,7 @@ def _summary_classification_consistency(
     validation: dict[str, Any], audit: dict[str, Any]
 ) -> dict[str, Any]:
     keys = (
+        "SOLVER_FORMULATION",
         "R_CONSUMPTION_PATH", "D_CONSUMPTION_PATH", "AR_CONSUMPTION_PATH",
         "ISLAND_MIRROR_REQUIRED", "CONTACT_R_COUNTERFACTUAL_READY",
     )
@@ -2200,20 +2699,17 @@ def _write_audit_only_results(
 ) -> None:
     if hashes_after is None:
         hashes_after = {str(path): _safe_sha256(path) for path in source_files}
-    if validation.get("source_hashes_unchanged") is None:
-        source_purity = {
-            "source_hashes_unchanged": None,
-            "hashes_before": hashes_before,
-            "hashes_after": hashes_after,
-            "status": "incomplete",
-        }
-    else:
-        source_purity = {
-            "source_hashes_unchanged": validation["source_hashes_unchanged"],
-            "hashes_before": hashes_before,
-            "hashes_after": hashes_after,
-            "status": "complete",
-        }
+    source_status = validation.get("source_hashes_unchanged")
+    source_purity = {
+        "source_hashes_unchanged": source_status,
+        "hashes_before": hashes_before,
+        "hashes_after": hashes_after,
+        "status": (
+            "pass" if source_status is True else
+            "fail" if source_status is False else
+            "incomplete"
+        ),
+    }
     if audit is None:
         # Keep the audit artifact and validation/summary artifacts
         # classification-consistent even when replay or population failed
@@ -2222,6 +2718,7 @@ def _write_audit_only_results(
             "audit_version": 1,
             "audit_status": "INSUFFICIENT_EVIDENCE",
             "counterfactual_ready": False,
+            "SOLVER_FORMULATION": validation.get("SOLVER_FORMULATION", "UNKNOWN"),
             "R_CONSUMPTION_PATH": validation.get("R_CONSUMPTION_PATH", "UNDETERMINED"),
             "D_CONSUMPTION_PATH": validation.get("D_CONSUMPTION_PATH", "UNDETERMINED"),
             "AR_CONSUMPTION_PATH": validation.get("AR_CONSUMPTION_PATH", "UNDETERMINED"),
@@ -2233,6 +2730,24 @@ def _write_audit_only_results(
             ),
             "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": validation.get(
                 "GLOBAL_PLUS_ISLAND_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "GLOBAL_R_ONLY_PROBE_EFFECT": validation.get(
+                "GLOBAL_R_ONLY_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "GLOBAL_D_ONLY_PROBE_EFFECT": validation.get(
+                "GLOBAL_D_ONLY_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "ISLAND_R_ONLY_PROBE_EFFECT": validation.get(
+                "ISLAND_R_ONLY_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "ISLAND_D_ONLY_PROBE_EFFECT": validation.get(
+                "ISLAND_D_ONLY_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "GLOBAL_AND_ISLAND_R_PROBE_EFFECT": validation.get(
+                "GLOBAL_AND_ISLAND_R_PROBE_EFFECT", "NOT_RUN"
+            ),
+            "GLOBAL_AND_ISLAND_D_PROBE_EFFECT": validation.get(
+                "GLOBAL_AND_ISLAND_D_PROBE_EFFECT", "NOT_RUN"
             ),
             "CONTACT_R_COUNTERFACTUAL_READY": "NO",
             "CONTACT_R_SOLVER_EXCESS_EFFECT": "NOT_RUN_AUDIT_ONLY",
@@ -2250,6 +2765,24 @@ def _write_audit_only_results(
             "checks": {},
             "reason": "audit stopped before the populated no-op pipeline probe",
         }
+    if audit.get("audit_status") != "PASS":
+        for probe_name in (
+            "global_r_only", "global_d_only", "island_r_only", "island_d_only",
+            "global_and_island_r", "global_and_island_d",
+        ):
+            probe_path = output / f"probe_{probe_name}.json"
+            if not probe_path.exists():
+                write_json(probe_path, {
+                    "probe_name": probe_name,
+                    "FIELD_PROBE_EFFECT": "NOT_RUN",
+                    "classification": "INSUFFICIENT_EVIDENCE",
+                    "reason": "audit did not reach runtime storage probes",
+                })
+        if not (output / "probe_effect_summary.json").exists():
+            write_json(output / "probe_effect_summary.json", {
+                "status": "INCOMPLETE",
+                "reason": "audit did not reach runtime storage probes",
+            })
     for filename, payload in (
         ("constraint_regularization_consumption_audit.json", audit),
         ("regularization_audit_pipeline_reproduction.json", pipeline),
@@ -2476,8 +3009,15 @@ def failure_payload(
         return {
             "POPULATED_CONSTRAINT_STATE": "INSUFFICIENT_EVIDENCE",
             "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
+            "SOLVER_FORMULATION": "UNKNOWN",
             "GLOBAL_ONLY_PROBE_EFFECT": "NOT_RUN",
             "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_R_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_D_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "ISLAND_R_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "ISLAND_D_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_AND_ISLAND_R_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_AND_ISLAND_D_PROBE_EFFECT": "NOT_RUN",
             "NO_ISLAND_BASELINE_REPRODUCTION": "NOT_RUN",
             "R_CONSUMPTION_PATH": "UNDETERMINED",
             "D_CONSUMPTION_PATH": "UNDETERMINED",
@@ -2529,6 +3069,7 @@ def write_failure_bundle(
             "audit_version": 1,
             "audit_status": "INSUFFICIENT_EVIDENCE",
             "counterfactual_ready": False,
+            "SOLVER_FORMULATION": "UNKNOWN",
             "R_CONSUMPTION_PATH": "UNDETERMINED",
             "D_CONSUMPTION_PATH": "UNDETERMINED",
             "AR_CONSUMPTION_PATH": "UNDETERMINED",
@@ -2538,6 +3079,12 @@ def write_failure_bundle(
             ),
             "GLOBAL_ONLY_PROBE_EFFECT": "NOT_RUN",
             "GLOBAL_PLUS_ISLAND_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_R_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_D_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "ISLAND_R_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "ISLAND_D_ONLY_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_AND_ISLAND_R_PROBE_EFFECT": "NOT_RUN",
+            "GLOBAL_AND_ISLAND_D_PROBE_EFFECT": "NOT_RUN",
             "NO_ISLAND_BASELINE_REPRODUCTION": "NOT_RUN",
             "CONTACT_R_COUNTERFACTUAL_READY": "NO",
             "CONTACT_R_SOLVER_EXCESS_EFFECT": (
@@ -2596,6 +3143,25 @@ def write_failure_bundle(
         "SUMMARY_CLASSIFICATION_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
     })
     if mode == "consumption-audit-only":
+        write_json(output / "solver_storage_semantics.json", {
+            "SOLVER_FORMULATION": "UNKNOWN",
+            "status": "INCOMPLETE",
+            "reason": "execution failed before populated model solver inspection",
+        })
+        for probe_name in (
+            "global_r_only", "global_d_only", "island_r_only", "island_d_only",
+            "global_and_island_r", "global_and_island_d",
+        ):
+            write_json(output / f"probe_{probe_name}.json", {
+                "probe_name": probe_name,
+                "FIELD_PROBE_EFFECT": "NOT_RUN",
+                "classification": "INSUFFICIENT_EVIDENCE",
+                "reason": "execution failed before runtime storage probes",
+            })
+        write_json(output / "probe_effect_summary.json", {
+            "status": "INCOMPLETE",
+            "reason": "execution failed before runtime storage probes",
+        })
         write_json(output / "regularization_audit_pipeline_reproduction.json", {
             "REGULARIZATION_AUDIT_PIPELINE_REPRODUCTION": "INSUFFICIENT_EVIDENCE",
             "checks": {},
