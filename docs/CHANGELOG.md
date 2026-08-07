@@ -2,6 +2,10 @@
 
 ## 2026-08-06
 
+- 新增固定 global55 的 Newton solver optimization diagnostic：仅在独立 clone 上比较 production/zero warmstart 与 tight tolerance/iteration limit，记录完整 solver iteration statistics、敏感性、收敛性和自动 ZIP artifact；不修改接触物理或已有正式工具。
+
+## 2026-08-06
+
 - 修复正式 global55 regularization 反事实路径：复用已验证的 NEWTON_PRIMAL consumption audit，不再重复运行 audit/probe；仅同步 reciprocal `efc_R`/`efc_D` 与映射的 `iefc_R`/`iefc_D`，并避免在 Newton 路径调用 `mj_projectConstraint`。
 - 正式 artifact 新增 reciprocal gate、global/island row mapping、field retention、solver numerics 与正式 condition 目录；保留失败上下文和无条件 ZIP 打包。
 
