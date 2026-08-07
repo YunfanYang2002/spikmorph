@@ -126,6 +126,23 @@ class SolverOptimizationTests(unittest.TestCase):
         AUDIT._configure_model(model, production, False)
         self.assertTrue(AUDIT._option_difference(production, AUDIT._model_option_snapshot(model))["only_allowed"])
 
+    def test_model_clone_falls_back_to_validated_xml_when_copy_symbol_is_missing(self):
+        seen = []
+
+        class FakeModel:
+            @staticmethod
+            def from_xml_path(path):
+                seen.append(path)
+                return _model()
+
+        fake_mujoco = SimpleNamespace(MjModel=FakeModel)
+        copied, method = AUDIT._copy_model(
+            fake_mujoco, _model(), Path("model.xml"), AUDIT._model_option_snapshot(_model())
+        )
+        self.assertIsNotNone(copied)
+        self.assertEqual(method, "mujoco.MjModel.from_xml_path")
+        self.assertEqual(seen, ["model.xml"])
+
     def test_solver_iteration_trace_reads_all_required_statistics(self):
         stats = [SimpleNamespace(**{
             "improvement": 1.0,

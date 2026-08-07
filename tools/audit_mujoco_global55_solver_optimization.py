@@ -196,19 +196,66 @@ def _finite(value: Any) -> bool:
         return False
 
 
-def _copy_model(mujoco: Any, model: Any) -> tuple[Any, str]:
+def _copy_model(
+    mujoco: Any,
+    model: Any,
+    morphology_xml: Path,
+    expected_options: dict[str, Any] | None = None,
+) -> tuple[Any, str]:
     copier = getattr(mujoco, "mj_copyModel", None)
-    if not callable(copier):
-        raise RuntimeError("MuJoCo binding does not expose mj_copyModel")
     errors = []
-    for arguments in ((model,), (None, model)):
+    if callable(copier):
+        for arguments in ((model,), (None, model)):
+            try:
+                copied = copier(*arguments)
+                if copied is not None:
+                    return copied, "mujoco.mj_copyModel"
+            except Exception as error:  # pragma: no cover - binding-specific signature
+                errors.append(f"mj_copyModel: {type(error).__name__}: {error}")
+
+    # MuJoCo 3.8.1's Python wheel does not expose mj_copyModel.  Recompile
+    # the already SHA-validated source XML without changing its contents;
+    # this produces an independent model with the same compiled topology.
+    model_type = getattr(mujoco, "MjModel", None)
+    from_xml_path = getattr(model_type, "from_xml_path", None)
+    if callable(from_xml_path):
         try:
-            copied = copier(*arguments)
+            copied = from_xml_path(str(morphology_xml))
             if copied is not None:
-                return copied, "mujoco.mj_copyModel"
-        except Exception as error:  # pragma: no cover - binding-specific signature
-            errors.append(f"{type(error).__name__}: {error}")
-    raise RuntimeError("mujoco.mj_copyModel failed: " + "; ".join(errors))
+                if expected_options is not None:
+                    option_diff = _option_difference(
+                        expected_options, _model_option_snapshot(copied)
+                    )
+                    if not option_diff["only_allowed"]:
+                        raise RuntimeError(
+                            "recompiled clone changed production model options: "
+                            + ", ".join(option_diff["unexpected_changed_fields"])
+                        )
+                return copied, "mujoco.MjModel.from_xml_path"
+        except Exception as error:  # pragma: no cover - server binding/path dependent
+            errors.append(f"from_xml_path: {type(error).__name__}: {error}")
+
+    from_xml_string = getattr(model_type, "from_xml_string", None)
+    if callable(from_xml_string):
+        try:
+            copied = from_xml_string(morphology_xml.read_text(encoding="utf-8"))
+            if copied is not None:
+                if expected_options is not None:
+                    option_diff = _option_difference(
+                        expected_options, _model_option_snapshot(copied)
+                    )
+                    if not option_diff["only_allowed"]:
+                        raise RuntimeError(
+                            "recompiled clone changed production model options: "
+                            + ", ".join(option_diff["unexpected_changed_fields"])
+                        )
+                return copied, "mujoco.MjModel.from_xml_string"
+        except Exception as error:  # pragma: no cover - server binding/path dependent
+            errors.append(f"from_xml_string: {type(error).__name__}: {error}")
+
+    if not errors:
+        errors.append("no supported model-copy or XML-recompile API")
+    raise RuntimeError("independent MuJoCo model clone failed: " + "; ".join(errors))
 
 
 def _scalar(data: Any, name: str, default: Any = None) -> Any:
@@ -471,8 +518,11 @@ def _run_condition(
     zero_warmstart: bool,
     tight: bool,
     production_options: dict[str, Any],
+    morphology_xml: Path,
 ) -> dict[str, Any]:
-    model, model_copy_api = _copy_model(mujoco, base_model)
+    model, model_copy_api = _copy_model(
+        mujoco, base_model, morphology_xml, production_options
+    )
     configuration = _configure_model(model, production_options, tight)
     data = mujoco.MjData(model)
     mujoco.mj_copyData(data, model, snapshot)
@@ -1082,8 +1132,11 @@ def _custom_one_step_regression(
     snapshot: Any,
     mapping: dict[str, Any],
     production_options: dict[str, Any],
+    morphology_xml: Path,
 ) -> dict[str, Any]:
-    staged_model, staged_copy_api = _copy_model(mujoco, base_model)
+    staged_model, staged_copy_api = _copy_model(
+        mujoco, base_model, morphology_xml, production_options
+    )
     staged_data = mujoco.MjData(staged_model)
     mujoco.mj_copyData(staged_data, staged_model, snapshot)
     aref.stage_to_constraint(mujoco, staged_model, staged_data)
@@ -1092,7 +1145,9 @@ def _custom_one_step_regression(
     mujoco.mj_copyData(staged_solver, staged_model, staged_data)
     mujoco.mj_Euler(staged_model, staged_data)
 
-    full_model, full_copy_api = _copy_model(mujoco, base_model)
+    full_model, full_copy_api = _copy_model(
+        mujoco, base_model, morphology_xml, production_options
+    )
     full_data = mujoco.MjData(full_model)
     mujoco.mj_copyData(full_data, full_model, snapshot)
     mujoco.mj_step(full_model, full_data)
@@ -1221,7 +1276,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     for name, label, zero_warmstart, tight in CONDITIONS:
         condition = _run_condition(
             mujoco, model, snapshot, mapping, name, label,
-            zero_warmstart, tight, production_options,
+            zero_warmstart, tight, production_options, paths["morphology_xml"],
         )
         conditions[name] = condition
         _write_condition(output, condition)
@@ -1240,7 +1295,8 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         conditions, baseline, warmstart_sensitivity, tolerance_sensitivity
     )
     custom_step = _custom_one_step_regression(
-        mujoco, model, snapshot, mapping, production_options
+        mujoco, model, snapshot, mapping, production_options,
+        paths["morphology_xml"],
     )
     write_json(output / "solver_optimization_invariant_validation.json", invariant)
     write_json(output / "warmstart_activation.json", warmstart_activation)
