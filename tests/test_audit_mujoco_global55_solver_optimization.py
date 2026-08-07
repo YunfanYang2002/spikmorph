@@ -140,8 +140,32 @@ class SolverOptimizationTests(unittest.TestCase):
             fake_mujoco, _model(), Path("model.xml"), AUDIT._model_option_snapshot(_model())
         )
         self.assertIsNotNone(copied)
-        self.assertEqual(method, "mujoco.MjModel.from_xml_path")
+        self.assertEqual(method, "mujoco.MjModel.from_xml_path+base_snapshot_sync")
         self.assertEqual(seen, ["model.xml"])
+
+    def test_xml_clone_syncs_runtime_model_options_and_contact_arrays(self):
+        reference = _model()
+        reference.opt.disableflags = 7
+        reference.geom_friction[0, 0] = 0.9
+        reference.geom_solref[0, 0] = 0.02
+        reference.geom_solimp[0, 0] = 0.8
+        compiled = _model()
+
+        class FakeModel:
+            @staticmethod
+            def from_xml_path(_path):
+                return compiled
+
+        copied, _ = AUDIT._copy_model(
+            SimpleNamespace(MjModel=FakeModel),
+            reference,
+            Path("model.xml"),
+            AUDIT._model_option_snapshot(reference),
+        )
+        self.assertEqual(copied.opt.disableflags, 7)
+        np.testing.assert_array_equal(copied.geom_friction, reference.geom_friction)
+        np.testing.assert_array_equal(copied.geom_solref, reference.geom_solref)
+        np.testing.assert_array_equal(copied.geom_solimp, reference.geom_solimp)
 
     def test_solver_iteration_trace_reads_all_required_statistics(self):
         stats = [SimpleNamespace(**{

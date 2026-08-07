@@ -196,6 +196,57 @@ def _finite(value: Any) -> bool:
         return False
 
 
+def _synchronize_recompiled_model(
+    model: Any, expected_options: dict[str, Any]
+) -> None:
+    """Copy runtime model options/arrays from the formal base model.
+
+    The environment may apply validated runtime defaults after compiling the
+    XML (for example disableflags or per-geom contact parameters).  Reusing
+    the raw XML alone would therefore create a different physical model.  The
+    copy is made only on the independent clone; the formal base model is never
+    modified.
+    """
+    for name, expected in expected_options.items():
+        owner = model.opt if name.startswith("opt.") else model
+        attribute = name[4:] if name.startswith("opt.") else name
+        current = getattr(owner, attribute, None)
+        if expected is None:
+            if current is not None:
+                raise RuntimeError(
+                    f"recompiled clone field {name} is present while base field is None"
+                )
+            continue
+        if isinstance(expected, np.ndarray):
+            if current is None:
+                raise RuntimeError(f"recompiled clone field {name} is missing")
+            target = np.asarray(current)
+            if target.shape != expected.shape:
+                raise RuntimeError(
+                    f"recompiled clone field {name} shape mismatch: "
+                    f"{target.shape} vs {expected.shape}"
+                )
+            if not target.flags.writeable:
+                raise RuntimeError(f"recompiled clone field {name} is read-only")
+            target[...] = expected
+        else:
+            setattr(owner, attribute, expected)
+
+
+def _validate_or_sync_recompiled_model(
+    model: Any, expected_options: dict[str, Any] | None
+) -> None:
+    if expected_options is None:
+        return
+    _synchronize_recompiled_model(model, expected_options)
+    option_diff = _option_difference(expected_options, _model_option_snapshot(model))
+    if not option_diff["only_allowed"]:
+        raise RuntimeError(
+            "recompiled clone changed production model options after sync: "
+            + ", ".join(option_diff["unexpected_changed_fields"])
+        )
+
+
 def _copy_model(
     mujoco: Any,
     model: Any,
@@ -222,16 +273,8 @@ def _copy_model(
         try:
             copied = from_xml_path(str(morphology_xml))
             if copied is not None:
-                if expected_options is not None:
-                    option_diff = _option_difference(
-                        expected_options, _model_option_snapshot(copied)
-                    )
-                    if not option_diff["only_allowed"]:
-                        raise RuntimeError(
-                            "recompiled clone changed production model options: "
-                            + ", ".join(option_diff["unexpected_changed_fields"])
-                        )
-                return copied, "mujoco.MjModel.from_xml_path"
+                _validate_or_sync_recompiled_model(copied, expected_options)
+                return copied, "mujoco.MjModel.from_xml_path+base_snapshot_sync"
         except Exception as error:  # pragma: no cover - server binding/path dependent
             errors.append(f"from_xml_path: {type(error).__name__}: {error}")
 
@@ -240,16 +283,8 @@ def _copy_model(
         try:
             copied = from_xml_string(morphology_xml.read_text(encoding="utf-8"))
             if copied is not None:
-                if expected_options is not None:
-                    option_diff = _option_difference(
-                        expected_options, _model_option_snapshot(copied)
-                    )
-                    if not option_diff["only_allowed"]:
-                        raise RuntimeError(
-                            "recompiled clone changed production model options: "
-                            + ", ".join(option_diff["unexpected_changed_fields"])
-                        )
-                return copied, "mujoco.MjModel.from_xml_string"
+                _validate_or_sync_recompiled_model(copied, expected_options)
+                return copied, "mujoco.MjModel.from_xml_string+base_snapshot_sync"
         except Exception as error:  # pragma: no cover - server binding/path dependent
             errors.append(f"from_xml_string: {type(error).__name__}: {error}")
 
