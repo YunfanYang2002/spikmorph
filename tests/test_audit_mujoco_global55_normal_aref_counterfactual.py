@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 import numpy as np
@@ -236,6 +237,103 @@ class NormalArefTests(unittest.TestCase):
         source = inspect.getsource(AUDIT._normal_aref_rows)
         self.assertIn("_rebuild_normal_aref", source)
         self.assertNotIn("= 0", source)
+
+    def test_legacy_aref_adapter_preserves_native_condition_and_shared_demand(self):
+        target = {
+            "tangential_impulse": np.asarray([0.2, -0.3]),
+            "tangential_impulse_norm": 0.3605551275,
+            "normal_impulse": 1.25,
+            "pre_tangential_speed": 0.4,
+        }
+        condition = {
+            "condition_name": "normal_aref_scale_1_before",
+            "native_marker": {"must_survive": True},
+            "capture": {"contacts": [target]},
+            "shared_demand": {
+                "limb_12_contact_index": 0,
+                "limb_12_tangent_impulse_2d": np.asarray([0.1, 0.2]),
+            },
+            "excess": {"solver_excess_norm": 0.5},
+        }
+        adapted = AUDIT._adapt_for_aref_baseline(condition)
+        self.assertIsNot(adapted, condition)
+        self.assertIs(adapted["shared_demand"], condition["shared_demand"])
+        self.assertIs(adapted["native_marker"], condition["native_marker"])
+        for key in AUDIT.LEGACY_AREF_BASELINE_REQUIRED_KEYS:
+            self.assertIn(key, adapted)
+        self.assertIn("limb/12", adapted["budget"]["selected"])
+        self.assertEqual(
+            adapted["budget"]["selected"]["limb/12"]["actual_normal_impulse"],
+            1.25,
+        )
+
+    def test_condition_schema_report_audits_old_helper_contract(self):
+        condition = {
+            "capture": {"contacts": [{
+                "tangential_impulse": np.zeros(2),
+                "tangential_impulse_norm": 0.0,
+                "normal_impulse": 1.0,
+                "pre_tangential_speed": 0.0,
+            }]},
+            "shared_demand": {
+                "limb_12_contact_index": 0,
+                "limb_12_tangent_impulse_2d": np.zeros(2),
+            },
+            "excess": {},
+        }
+        report = AUDIT._condition_schema_compatibility(condition)
+        self.assertEqual(report["CONDITION_SCHEMA_COMPATIBILITY"], "VALIDATED")
+        self.assertEqual(report["MISSING_COMPATIBILITY_KEYS"], [])
+        self.assertIn("shared_demand", report["LEGACY_AREF_BASELINE_REQUIRED_KEYS"])
+        self.assertIn("budget", report["ADAPTER_SYNTHESIZED_KEYS"])
+
+    def test_normal_baseline_regression_passes_complete_legacy_condition(self):
+        target = {
+            "tangential_impulse": np.asarray([0.2, -0.3]),
+            "tangential_impulse_norm": 0.3605551275,
+            "normal_impulse": 1.25,
+            "pre_tangential_speed": 0.4,
+        }
+        condition = {
+            "capture": {"contacts": [target]},
+            "shared_demand": {
+                "limb_12_contact_index": 0,
+                "limb_12_tangent_impulse_2d": np.asarray([0.1, 0.2]),
+            },
+            "excess": _excess(),
+            "solver_numerics": {"active_solver_niter": [2]},
+        }
+
+        def fake_baseline(legacy_condition, _reference):
+            for key in AUDIT.LEGACY_AREF_BASELINE_REQUIRED_KEYS:
+                self.assertIn(key, legacy_condition)
+            self.assertIn("budget", legacy_condition)
+            return {
+                "PYRAMIDAL_BASELINE_REPRODUCTION": "PASS",
+                "checks": {"fixture": True},
+            }
+
+        with mock.patch.object(AUDIT.aref, "baseline_regression", fake_baseline):
+            result = AUDIT._normal_baseline_regression(condition, {})
+        self.assertIn("condition_schema_compatibility", result)
+        self.assertEqual(
+            result["condition_schema_compatibility"]["CONDITION_SCHEMA_COMPATIBILITY"],
+            "VALIDATED",
+        )
+        self.assertEqual(result["corrected_oracle"]["PYRAMIDAL_BASELINE_REPRODUCTION"], "PASS")
+
+    def test_failure_placeholders_do_not_overwrite_condition_raw_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "artifact"
+            raw = artifact / "conditions" / "normal_aref_scale_1_before" / "solver_excess.json"
+            raw.parent.mkdir(parents=True)
+            raw.write_text('{"raw_marker": "preserve"}\n', encoding="utf-8")
+            AUDIT._write_failure_placeholders(artifact, RuntimeError("boom"))
+            self.assertEqual(
+                json.loads(raw.read_text(encoding="utf-8")),
+                {"raw_marker": "preserve"},
+            )
+            self.assertTrue((artifact / "condition_schema_compatibility.json").is_file())
 
     def test_failure_placeholders_and_zip_contract(self):
         with tempfile.TemporaryDirectory() as directory:

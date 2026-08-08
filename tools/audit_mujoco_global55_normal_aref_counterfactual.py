@@ -54,6 +54,45 @@ CAP_NEAR_THRESHOLD = 0.95
 CAP_LIMITED_THRESHOLD = 0.995
 ROOT_LINEAR_COLUMNS = (0, 1, 2)
 
+# The normal-aref condition is richer than the legacy friction-aref helper
+# condition.  Keep this contract explicit: the adapter below must preserve
+# the native condition and only add the fields required by the old helper
+# call-chain.  In particular, ``aref.baseline_regression`` reads
+# ``shared_demand`` before constructing the legacy budget itself.
+LEGACY_AREF_BASELINE_REQUIRED_KEYS = (
+    "capture",
+    "shared_demand",
+    "excess",
+)
+LEGACY_AREF_BASELINE_OPTIONAL_KEYS = (
+    "budget",
+)
+LEGACY_CONE_BASELINE_REQUIRED_KEYS = (
+    "capture",
+    "budget",
+    "excess",
+)
+NORMAL_CONDITION_NATIVE_KEYS = (
+    "condition_name",
+    "condition_label",
+    "normal_aref_scale",
+    "capture",
+    "shared_demand",
+    "excess",
+    "original_full_aref",
+    "condition_full_aref",
+    "condition_aref",
+    "pre_constraint_arrays",
+    "post_constraint_arrays",
+    "pre_contact_geometry",
+    "solver_iteration_trace",
+    "solver_numerics",
+    "state_validation",
+    "model_options",
+    "one_step_result",
+    "counts",
+)
+
 
 class Tee:
     def __init__(self, *streams: Any) -> None:
@@ -611,21 +650,87 @@ def _run_condition(
 
 
 def _adapt_for_aref_baseline(condition: dict[str, Any]) -> dict[str, Any]:
+    missing = [
+        key for key in LEGACY_AREF_BASELINE_REQUIRED_KEYS if key not in condition
+    ]
+    if missing:
+        raise KeyError(
+            "normal condition missing legacy aref baseline keys: "
+            + ", ".join(missing)
+        )
     demand = condition["shared_demand"]
-    target = condition["capture"]["contacts"][int(demand["limb_12_contact_index"])]
+    contacts = condition["capture"].get("contacts")
+    if not isinstance(contacts, list):
+        raise TypeError("normal condition capture.contacts must be a list")
+    target_index = int(demand["limb_12_contact_index"])
+    if target_index < 0 or target_index >= len(contacts):
+        raise IndexError(
+            f"limb/12 contact index {target_index} is outside capture.contacts"
+        )
+    target = contacts[target_index]
+    # Preserve every native normal condition field.  The old aref helper only
+    # needs the three required entry fields; its cone-helper call additionally
+    # consumes the synthesized legacy budget.
+    adapted = dict(condition)
+    adapted["budget"] = {"selected": {"limb/12": {
+        "actual_tangential_impulse": target["tangential_impulse"],
+        "actual_tangential_impulse_norm": target["tangential_impulse_norm"],
+        "actual_normal_impulse": target["normal_impulse"],
+        "global_normal_conditioned_sticking_impulse": demand["limb_12_tangent_impulse_2d"],
+        "global_normal_conditioned_sticking_impulse_norm": float(
+            np.linalg.norm(demand["limb_12_tangent_impulse_2d"])
+        ),
+        "pre_tangential_speed": target["pre_tangential_speed"],
+    }}}
+    return adapted
+
+
+def _condition_schema_compatibility(condition: dict[str, Any]) -> dict[str, Any]:
+    """Report the audited normal-to-legacy helper schema boundary."""
+    missing = [
+        key for key in LEGACY_AREF_BASELINE_REQUIRED_KEYS if key not in condition
+    ]
+    native_missing = [
+        key for key in NORMAL_CONDITION_NATIVE_KEYS if key not in condition
+    ]
+    adapter_added = ["budget"]
+    legacy_after_adapter = [
+        key for key in LEGACY_CONE_BASELINE_REQUIRED_KEYS
+        if key not in set(condition) | set(adapter_added)
+    ]
+    if missing:
+        preserves_native = False
+    else:
+        adapted = _adapt_for_aref_baseline(condition)
+        preserves_native = all(key in adapted for key in condition)
+    status = (
+        "VALIDATED"
+        if not missing and not legacy_after_adapter and preserves_native
+        else "FAILED"
+    )
     return {
-        "capture": condition["capture"],
-        "budget": {"selected": {"limb/12": {
-            "actual_tangential_impulse": target["tangential_impulse"],
-            "actual_tangential_impulse_norm": target["tangential_impulse_norm"],
-            "actual_normal_impulse": target["normal_impulse"],
-            "global_normal_conditioned_sticking_impulse": demand["limb_12_tangent_impulse_2d"],
-            "global_normal_conditioned_sticking_impulse_norm": float(
-                np.linalg.norm(demand["limb_12_tangent_impulse_2d"])
-            ),
-            "pre_tangential_speed": target["pre_tangential_speed"],
-        }}},
-        "excess": condition["excess"],
+        "CONDITION_SCHEMA_COMPATIBILITY": status,
+        "LEGACY_AREF_BASELINE_REQUIRED_KEYS": list(
+            LEGACY_AREF_BASELINE_REQUIRED_KEYS
+        ),
+        "LEGACY_AREF_BASELINE_OPTIONAL_KEYS": list(
+            LEGACY_AREF_BASELINE_OPTIONAL_KEYS
+        ),
+        "LEGACY_CONE_BASELINE_REQUIRED_KEYS": list(
+            LEGACY_CONE_BASELINE_REQUIRED_KEYS
+        ),
+        "NORMAL_CONDITION_NATIVE_KEYS": list(NORMAL_CONDITION_NATIVE_KEYS),
+        "NORMAL_CONDITION_PRESENT_KEYS": sorted(str(key) for key in condition),
+        "NORMAL_CONDITION_NATIVE_MISSING_KEYS": native_missing,
+        "MISSING_COMPATIBILITY_KEYS": missing + legacy_after_adapter,
+        "ADAPTER_SYNTHESIZED_KEYS": adapter_added,
+        "ADAPTER_PRESERVES_NATIVE_FIELDS": preserves_native,
+        "AUDIT_NOTES": [
+            "aref.baseline_regression directly reads capture, shared_demand, and excess.",
+            "aref.baseline_regression constructs budget before calling cone_helper.baseline_regression.",
+            "cone_helper.baseline_regression consumes capture, budget, and excess.",
+            "The adapter is a shallow copy plus the synthesized legacy budget; native fields are not dropped.",
+        ],
     }
 
 
@@ -648,6 +753,12 @@ def _all_checks(value: Any) -> bool:
 def _normal_baseline_regression(
     condition: dict[str, Any], reference: dict[str, Any]
 ) -> dict[str, Any]:
+    schema = _condition_schema_compatibility(condition)
+    if schema["CONDITION_SCHEMA_COMPATIBILITY"] != "VALIDATED":
+        raise RuntimeError(
+            "normal/legacy baseline condition schema is incompatible: "
+            + ", ".join(schema["MISSING_COMPATIBILITY_KEYS"])
+        )
     oracle_result = aref.baseline_regression(
         _adapt_for_aref_baseline(condition), reference
     )
@@ -681,6 +792,7 @@ def _normal_baseline_regression(
         "sanity": _all_checks(sanity),
     }
     return {
+        "condition_schema_compatibility": schema,
         "corrected_oracle": oracle_result,
         "sanity": sanity,
         "checks": checks,
@@ -1214,6 +1326,10 @@ def _write_failure_placeholders(output: Path, error: Exception) -> None:
         "normal_aref_decomposition.json": {
             "status": "INSUFFICIENT_EVIDENCE"
         },
+        "condition_schema_compatibility.json": {
+            "CONDITION_SCHEMA_COMPATIBILITY": "INSUFFICIENT_EVIDENCE",
+            "MISSING_COMPATIBILITY_KEYS": [],
+        },
         "normal_aref_counterfactual_activation.json": {
             "NORMAL_AREF_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE"
         },
@@ -1263,6 +1379,7 @@ def _write_failure_placeholders(output: Path, error: Exception) -> None:
 
 def _failure_payload(error: Exception) -> dict[str, Any]:
     return {
+        "CONDITION_SCHEMA_COMPATIBILITY": "INSUFFICIENT_EVIDENCE",
         "NORMAL_AREF_BASELINE_REPRODUCTION": "FAIL",
         "NORMAL_AREF_COUNTERFACTUAL_ACTIVATION": "INSUFFICIENT_EVIDENCE",
         "NORMAL_AREF_COUNTERFACTUAL_ISOLATION": "INSUFFICIENT_EVIDENCE",
@@ -1337,6 +1454,16 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         conditions[name] = condition
         _write_condition(output, condition)
 
+    schema_compatibility = _condition_schema_compatibility(
+        conditions["normal_aref_scale_1_before"]
+    )
+    write_json(output / "condition_schema_compatibility.json", schema_compatibility)
+    if schema_compatibility["CONDITION_SCHEMA_COMPATIBILITY"] != "VALIDATED":
+        raise RuntimeError(
+            "normal/legacy baseline condition schema compatibility failed: "
+            + ", ".join(schema_compatibility["MISSING_COMPATIBILITY_KEYS"])
+        )
+
     activation = normal_aref_activation(
         decompositions,
         {
@@ -1384,6 +1511,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     invariant_valid = invariant["NORMAL_AREF_COUNTERFACTUAL_ISOLATION"] == "VALIDATED"
     common_gates = bool(
         staged_baseline["valid"]
+        and schema_compatibility["CONDITION_SCHEMA_COMPATIBILITY"] == "VALIDATED"
         and activation["NORMAL_AREF_COUNTERFACTUAL_ACTIVATION"] == "VALIDATED"
         and invariant_valid
         and baseline["NORMAL_AREF_BASELINE_REPRODUCTION"] == "PASS"
@@ -1410,6 +1538,9 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "STRONG_REDUCTION", "PARTIAL_REDUCTION", "LITTLE_OR_NO_REDUCTION", "INCREASED"
     })
     validation = {
+        "CONDITION_SCHEMA_COMPATIBILITY": schema_compatibility[
+            "CONDITION_SCHEMA_COMPATIBILITY"
+        ],
         "NORMAL_AREF_BASELINE_REPRODUCTION": baseline["NORMAL_AREF_BASELINE_REPRODUCTION"],
         "NORMAL_AREF_COUNTERFACTUAL_ACTIVATION": activation["NORMAL_AREF_COUNTERFACTUAL_ACTIVATION"],
         "NORMAL_AREF_COUNTERFACTUAL_ISOLATION": invariant["NORMAL_AREF_COUNTERFACTUAL_ISOLATION"],
@@ -1444,6 +1575,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     summary = {
         key: validation[key]
         for key in (
+            "CONDITION_SCHEMA_COMPATIBILITY",
             "NORMAL_AREF_BASELINE_REPRODUCTION",
             "NORMAL_AREF_COUNTERFACTUAL_ACTIVATION",
             "NORMAL_AREF_COUNTERFACTUAL_ISOLATION",
