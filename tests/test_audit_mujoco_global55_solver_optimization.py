@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 import numpy as np
 
@@ -243,10 +244,210 @@ class SolverOptimizationTests(unittest.TestCase):
         })]
         data = SimpleNamespace(solver_niter=1, solver=stats)
         result = AUDIT._solver_iteration_trace(data, _model())
-        self.assertEqual(result["solver_niter"], 1)
+        self.assertEqual(result["solver_niter"], [1])
         self.assertTrue(result["statistics_available"])
         self.assertTrue(result["all_statistics_finite"])
         self.assertEqual(result["trace"][0]["iteration_index"], 0)
+
+    @staticmethod
+    def _solver_stat(improvement=1.0, **overrides):
+        fields = {
+            "improvement": improvement,
+            "gradient": 2.0,
+            "lineslope": 3.0,
+            "nactive": 4,
+            "nchange": 5,
+            "neval": 6,
+            "nupdate": 7,
+        }
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    def test_solver_trace_uses_active_island_arrays_and_ignores_inactive_slots(self):
+        model = _model()
+        model.opt.iterations = 100
+        data = SimpleNamespace(
+            solver_niter=np.asarray([2] + [0] * 19, dtype=np.int32),
+            solver_nnz=np.asarray([361] + [0] * 19, dtype=np.int32),
+            nisland=1,
+            solver=[self._solver_stat(10.0), self._solver_stat(11.0)]
+            + [self._solver_stat(999.0) for _ in range(18)],
+        )
+        result = AUDIT._solver_iteration_trace(data, model)
+        self.assertEqual(result["active_solver_island_count"], 1)
+        self.assertEqual(result["active_solver_island_count_source"], "DATA_NISLAND")
+        self.assertEqual(len(result["islands"]), 1)
+        self.assertEqual(result["islands"][0]["niter"], 2)
+        self.assertEqual(result["islands"][0]["nnz"], 361)
+        self.assertTrue(result["islands"][0]["niter_below_limit"])
+        self.assertEqual(result["trace"][1]["improvement"], 11.0)
+
+    def test_solver_trace_flat_layout_island_major(self):
+        model = _model()
+        model.opt.iterations = 100
+        stats = [self._solver_stat(0.0) for _ in range(40)]
+        stats[0] = self._solver_stat(10.0)
+        stats[20] = self._solver_stat(20.0)
+        data = SimpleNamespace(
+            solver_niter=np.asarray([1, 1] + [0] * 18, dtype=np.int32),
+            solver_nnz=np.asarray([100, 200] + [0] * 18, dtype=np.int32),
+            nisland=2,
+            solver=stats,
+        )
+        result = AUDIT._solver_iteration_trace(
+            data, model, {"solver_layout": {"layout": "FLAT", "solver_slots_per_island": 20}}
+        )
+        self.assertEqual([item["island_id"] for item in result["islands"]], [0, 1])
+        self.assertEqual(result["islands"][0]["iterations"][0]["improvement"], 10.0)
+        self.assertEqual(result["islands"][1]["iterations"][0]["improvement"], 20.0)
+
+    def test_solver_trace_supports_two_dimensional_layout(self):
+        model = _model()
+        model.opt.iterations = 100
+        data = SimpleNamespace(
+            solver_niter=np.asarray([1, 1], dtype=np.int32),
+            solver_nnz=np.asarray([100, 200], dtype=np.int32),
+            nisland=2,
+            solver=[
+                [self._solver_stat(10.0)],
+                [self._solver_stat(20.0)],
+            ],
+        )
+        result = AUDIT._solver_iteration_trace(data, model)
+        self.assertEqual(result["solver_layout"]["layout"], "2D")
+        self.assertEqual(result["islands"][1]["iterations"][0]["improvement"], 20.0)
+
+    def test_solver_trace_optional_stat_fields_do_not_fail_available_numeric_stats(self):
+        model = _model()
+        model.opt.iterations = 100
+        data = SimpleNamespace(
+            solver_niter=np.asarray([1], dtype=np.int32),
+            solver_nnz=np.asarray([1], dtype=np.int32),
+            nisland=1,
+            solver=[SimpleNamespace(improvement=1.0)],
+        )
+        result = AUDIT._solver_iteration_trace(data, model)
+        self.assertTrue(result["statistics_available"])
+        self.assertFalse(result["statistics_complete"])
+        self.assertTrue(result["all_statistics_finite"])
+
+    def test_solver_trace_nonfinite_active_stat_fails_finite_gate(self):
+        model = _model()
+        model.opt.iterations = 100
+        data = SimpleNamespace(
+            solver_niter=np.asarray([1], dtype=np.int32),
+            solver_nnz=np.asarray([1], dtype=np.int32),
+            nisland=1,
+            solver=[self._solver_stat(gradient=np.nan)],
+        )
+        result = AUDIT._solver_iteration_trace(data, model)
+        self.assertTrue(result["statistics_available"])
+        self.assertFalse(result["all_statistics_finite"])
+        self.assertEqual(result["status"], "INSUFFICIENT_EVIDENCE")
+
+    def test_solver_stat_api_discovery_records_runtime_layout(self):
+        model = _model()
+        model.opt.iterations = 100
+        probe_data = SimpleNamespace(
+            solver_niter=np.asarray([2] + [0] * 19, dtype=np.int32),
+            solver_nnz=np.asarray([361] + [0] * 19, dtype=np.int32),
+            nisland=1,
+            solver=[self._solver_stat() for _ in range(20)],
+        )
+
+        class FakeMujoco:
+            __version__ = "3.8.1"
+            mjNISLAND = 20
+            mjNSOLVER = 20
+
+            @staticmethod
+            def MjData(_model):
+                return probe_data
+
+            @staticmethod
+            def mj_copyData(_dst, _model, _src):
+                return None
+
+            @staticmethod
+            def mj_fwdConstraint(_model, _data):
+                return None
+
+        with mock.patch.object(AUDIT.aref, "stage_to_constraint", return_value=["stage"]):
+            report = AUDIT._solver_stat_api_discovery(
+                FakeMujoco, model, SimpleNamespace(), probe_model=model
+            )
+        self.assertEqual(report["status"], "VALID")
+        self.assertEqual(report["active_solver_island_count"], 1)
+        self.assertEqual(report["active_solver_island_count_source"], "DATA_NISLAND")
+        self.assertEqual(report["solver_layout"]["solver_slots_per_island"], 20)
+        self.assertEqual(report["probe_constraint_solve_count"], 1)
+
+    def test_baseline_gate_aggregation_accepts_pyramidal_oracle_key(self):
+        report = AUDIT._baseline_gate_components(
+            {"PYRAMIDAL_BASELINE_REPRODUCTION": "PASS", "checks": {"rows": True}},
+            {"status": "PASS", "checks": {"excess": True}},
+            {"sanity": True},
+        )
+        self.assertEqual(report["oracle_status_key"], "PYRAMIDAL_BASELINE_REPRODUCTION")
+        self.assertEqual(report["BASELINE_STATUS_CONSISTENCY"], "PASS")
+        self.assertTrue(report["all_components_pass"])
+
+    def test_baseline_gate_aggregation_rejects_failed_component(self):
+        report = AUDIT._baseline_gate_components(
+            {"PYRAMIDAL_BASELINE_REPRODUCTION": "PASS", "checks": {"rows": "FAIL"}},
+            {"status": "PASS", "checks": {"excess": True}},
+            {"sanity": True},
+        )
+        self.assertEqual(report["BASELINE_STATUS_CONSISTENCY"], "FAIL")
+        self.assertFalse(report["all_components_pass"])
+
+    def test_warmstart_computational_effect_is_separate_from_physical_sensitivity(self):
+        conditions = {
+            "production_warmstart_production_tolerance": {"solver_numerics": {"active_solver_niter": [2]}},
+            "zero_warmstart_production_tolerance": {"solver_numerics": {"active_solver_niter": [3]}},
+            "production_warmstart_tight_tolerance": {"solver_numerics": {"active_solver_niter": [2]}},
+            "zero_warmstart_tight_tolerance": {"solver_numerics": {"active_solver_niter": [3]}},
+        }
+        result = AUDIT._warmstart_computational_effect(conditions)
+        self.assertEqual(result["WARMSTART_COMPUTATIONAL_EFFECT"], "REDUCES_ITERATION_COUNT")
+
+    def test_convergence_ignores_inactive_solver_slots(self):
+        conditions = {}
+        for name, _, _, _ in AUDIT.CONDITIONS:
+            trace = {
+                "active_solver_island_count": 1,
+                "active_solver_island_count_source": "DATA_NISLAND",
+                "all_statistics_finite": True,
+                "statistics_available": True,
+                "statistics_complete": True,
+                "iterations_limit": 100,
+                "last_iteration": {},
+                "last_iterations": [{}],
+                "islands": [{
+                    "island_id": 0,
+                    "niter": 2,
+                    "nnz": 361,
+                    "niter_below_limit": True,
+                }],
+            }
+            conditions[name] = {
+                "solver_iteration_trace": trace,
+                "solver_numerics": {
+                    "solver_niter": [2, 0, 100],
+                    "solver_nnz": [361, 0, 0],
+                    "active_solver_niter": [2],
+                    "active_solver_nnz": [361],
+                    "finite": True,
+                },
+            }
+        result = AUDIT._convergence_assessment(
+            conditions,
+            {"OPTIMIZATION_BASELINE_REPRODUCTION": "PASS"},
+            {"SOLVER_WARMSTART_SENSITIVITY": "INSENSITIVE"},
+            {"SOLVER_TOLERANCE_SENSITIVITY": "INSENSITIVE"},
+        )
+        self.assertEqual(result["PRODUCTION_NEWTON_CONVERGENCE"], "VALIDATED")
+        self.assertFalse(result["any_iteration_limit_reached"])
 
     def test_solver_iteration_trace_fails_closed_for_missing_statistics(self):
         data = SimpleNamespace(solver_niter=1, solver=[])

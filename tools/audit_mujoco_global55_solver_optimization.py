@@ -786,44 +786,340 @@ def _stat_value(stat: Any, name: str) -> Any:
         return None
 
 
-def _solver_iteration_trace(data: Any, model: Any) -> dict[str, Any]:
-    niter_raw = _scalar(data, "solver_niter")
+def _array_metadata(value: Any) -> dict[str, Any]:
+    """Return JSON-safe shape/type/value evidence for a MuJoCo array view."""
+    if value is None:
+        return {"available": False, "type": None, "reason": "unavailable"}
     try:
-        niter = int(niter_raw)
-    except (TypeError, ValueError):
-        niter = -1
-    limit = int(getattr(model.opt, "iterations", -1))
+        array = np.asarray(value)
+    except (TypeError, ValueError) as error:
+        return {
+            "available": False,
+            "type": type(value).__name__,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    numeric = False
+    try:
+        numeric = bool(np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.bool_))
+    except TypeError:
+        numeric = False
+    result = {
+        "available": True,
+        "type": type(value).__name__,
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "size": int(array.size),
+        "values": array.copy() if numeric else None,
+        "values_available": numeric,
+    }
+    if not numeric and array.size:
+        try:
+            result["element_type"] = type(array.reshape(-1)[0]).__name__
+        except Exception:
+            result["element_type"] = None
+    return result
+
+
+def _integer_vector(data: Any, name: str) -> tuple[list[int], str | None]:
+    value = getattr(data, name, None)
+    if value is None:
+        return [], f"{name} is unavailable"
+    try:
+        array = np.asarray(value)
+        if array.size == 0:
+            return [], f"{name} is empty"
+        numeric = np.asarray(array, dtype=np.float64).reshape(-1)
+        if not np.isfinite(numeric).all() or not np.equal(numeric, np.floor(numeric)).all():
+            return [], f"{name} contains non-finite or non-integer values"
+        return [int(item) for item in numeric], None
+    except (TypeError, ValueError) as error:
+        return [], f"{name}: {type(error).__name__}: {error}"
+
+
+def _safe_public_fields(value: Any) -> list[str]:
+    try:
+        return sorted(name for name in dir(value) if not name.startswith("_"))
+    except Exception:
+        return []
+
+
+def _solver_layout(
+    data: Any,
+    mujoco: Any = None,
+    active_count: int = 1,
+    island_capacity: int | None = None,
+) -> dict[str, Any]:
+    """Discover how the Python binding exposes mjSolverStat slots."""
     stats = getattr(data, "solver", None)
-    trace = []
-    errors = []
-    if niter >= 0 and stats is not None:
-        for index in range(niter):
+    result: dict[str, Any] = {
+        "available": stats is not None,
+        "type": type(stats).__name__ if stats is not None else None,
+        "layout": None,
+        "shape": None,
+        "dtype": None,
+        "length": None,
+        "element_type": None,
+        "element_fields": [],
+        "solver_slots_per_island": None,
+        "errors": [],
+    }
+    if stats is None:
+        result["errors"].append("data.solver is unavailable")
+        return result
+    try:
+        array = np.asarray(stats)
+        result["shape"] = list(array.shape)
+        result["dtype"] = str(array.dtype)
+        result["length"] = int(array.size)
+        if array.ndim >= 2 and array.shape[0] >= max(1, active_count):
+            result["layout"] = "2D"
+            result["solver_slots_per_island"] = int(array.shape[1])
+        else:
+            result["layout"] = "FLAT"
+    except (TypeError, ValueError) as error:
+        result["errors"].append(f"array view: {type(error).__name__}: {error}")
+        try:
+            result["length"] = int(len(stats))
+            result["layout"] = "FLAT"
+        except Exception as length_error:
+            result["errors"].append(
+                f"length: {type(length_error).__name__}: {length_error}"
+            )
+
+    constant = getattr(mujoco, "mjNSOLVER", None) if mujoco is not None else None
+    try:
+        constant = int(constant) if constant is not None else None
+    except (TypeError, ValueError):
+        constant = None
+    result["mjNSOLVER"] = constant
+    length = result["length"]
+    if result["solver_slots_per_island"] is None and length is not None:
+        if constant is not None and length >= max(1, active_count) * constant:
+            result["solver_slots_per_island"] = constant
+        elif isinstance(island_capacity, int) and island_capacity > 0 and length % island_capacity == 0:
+            result["solver_slots_per_island"] = int(length // island_capacity)
+        elif active_count > 0 and length % active_count == 0:
+            result["solver_slots_per_island"] = int(length // active_count)
+        elif active_count == 1 and length > 0:
+            result["solver_slots_per_island"] = int(length)
+    try:
+        first = stats[0]
+        result["element_type"] = type(first).__name__
+        result["element_fields"] = _safe_public_fields(first)
+    except Exception as error:
+        result["errors"].append(f"first element: {type(error).__name__}: {error}")
+    return result
+
+
+def _active_solver_island_count(
+    data: Any,
+    niter_values: list[int],
+    nnz_values: list[int],
+    fallback: int | None = None,
+) -> tuple[int, str, list[str]]:
+    evidence: list[str] = []
+    for name, source in (
+        ("solver_nisland", "SOLVER_NISLAND"),
+        ("nsolver_island", "NSOLVER_ISLAND"),
+        ("nisland", "DATA_NISLAND"),
+    ):
+        value = getattr(data, name, None)
+        try:
+            array = np.asarray(value)
+            if value is not None and array.size == 1:
+                count = int(array.reshape(-1)[0])
+                if count >= 0:
+                    evidence.append(f"{name}={count}")
+                    return count, source, evidence
+        except (TypeError, ValueError):
+            pass
+    nonzero = [index for index, value in enumerate(niter_values) if value > 0]
+    nonzero += [index for index, value in enumerate(nnz_values) if value > 0]
+    if nonzero:
+        count = max(nonzero) + 1
+        evidence.append(f"nonzero_solver_arrays_through_island={count - 1}")
+        return count, "NONZERO_SOLVER_ARRAYS", evidence
+    if fallback is not None and fallback >= 0:
+        evidence.append(f"fallback={fallback}")
+        return int(fallback), "FALLBACK", evidence
+    return 0, "UNAVAILABLE", evidence
+
+
+def _solver_stat_api_discovery(
+    mujoco: Any,
+    model: Any,
+    snapshot: Any,
+    probe_model: Any = None,
+) -> dict[str, Any]:
+    """Probe one ordinary staged Newton solve and record the runtime layout."""
+    active_model = model if probe_model is None else probe_model
+    report: dict[str, Any] = {
+        "mujoco_version": getattr(mujoco, "__version__", None),
+        "probe_staged_forward_count": 0,
+        "probe_constraint_solve_count": 0,
+        "solver_niter": {},
+        "solver_nnz": {},
+        "solver_nisland": {},
+        "nsolver_island": {},
+        "nisland": {},
+        "solver": {},
+        "constants": {},
+        "active_solver_island_count": None,
+        "active_solver_island_count_source": None,
+        "solver_layout": {},
+        "status": "INSUFFICIENT_EVIDENCE",
+        "errors": [],
+    }
+    for name in ("mjNISLAND", "mjNSOLVER"):
+        value = getattr(mujoco, name, None)
+        try:
+            report["constants"][name] = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            report["constants"][name] = None
+    try:
+        data = mujoco.MjData(active_model)
+        mujoco.mj_copyData(data, active_model, snapshot)
+        stage_calls = aref.stage_to_constraint(mujoco, active_model, data)
+        mujoco.mj_fwdConstraint(active_model, data)
+        report["probe_staged_forward_count"] = 1
+        report["probe_constraint_solve_count"] = 1
+        report["stage_calls"] = stage_calls
+        for name in ("solver_niter", "solver_nnz", "solver_nisland", "nsolver_island", "nisland"):
+            present = bool(hasattr(data, name))
+            report[name] = _array_metadata(getattr(data, name, None) if present else None)
+            report[name]["hasattr"] = present
+        solver_present = bool(hasattr(data, "solver"))
+        report["solver"] = _array_metadata(
+            getattr(data, "solver", None) if solver_present else None
+        )
+        report["solver"]["hasattr"] = solver_present
+        niter_values, niter_error = _integer_vector(data, "solver_niter")
+        nnz_values, nnz_error = _integer_vector(data, "solver_nnz")
+        active_count, source, evidence = _active_solver_island_count(
+            data, niter_values, nnz_values
+        )
+        report["active_solver_island_count"] = active_count
+        report["active_solver_island_count_source"] = source
+        report["active_solver_island_count_evidence"] = evidence
+        if niter_error:
+            report["errors"].append(niter_error)
+        if nnz_error:
+            report["errors"].append(nnz_error)
+        report["solver_layout"] = _solver_layout(
+            data, mujoco, max(1, active_count), island_capacity=len(niter_values)
+        )
+        report["solver_stat_fields"] = report["solver_layout"].get("element_fields", [])
+        report["status"] = "VALID" if (
+            active_count > 0
+            and not niter_error
+            and report["solver_layout"].get("available")
+            and (report["solver_layout"].get("solver_slots_per_island") or 0) > 0
+        ) else "INSUFFICIENT_EVIDENCE"
+    except Exception as error:  # pragma: no cover - binding/runtime-specific
+        report["errors"].append(f"{type(error).__name__}: {error}")
+    return report
+
+
+def _solver_stat_at(data: Any, layout: dict[str, Any], island_id: int, iteration: int) -> Any:
+    stats = getattr(data, "solver", None)
+    if stats is None:
+        raise RuntimeError("data.solver is unavailable")
+    slots = layout.get("solver_slots_per_island")
+    if not isinstance(slots, int) or slots <= 0:
+        raise RuntimeError("solver slots per island are unavailable")
+    if layout.get("layout") == "2D":
+        try:
+            return stats[island_id, iteration]
+        except Exception:
+            return stats[island_id][iteration]
+    return stats[island_id * slots + iteration]
+
+
+def _solver_iteration_trace(
+    data: Any, model: Any, solver_api: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    niter_values, niter_error = _integer_vector(data, "solver_niter")
+    nnz_values, nnz_error = _integer_vector(data, "solver_nnz")
+    fallback_count = None
+    if solver_api is not None:
+        value = solver_api.get("active_solver_island_count")
+        if isinstance(value, (int, np.integer)):
+            fallback_count = int(value)
+    active_count, count_source, count_evidence = _active_solver_island_count(
+        data, niter_values, nnz_values, fallback_count
+    )
+    limit = int(getattr(model.opt, "iterations", -1))
+    layout = (solver_api or {}).get("solver_layout") or _solver_layout(
+        data, None, max(1, active_count), island_capacity=len(niter_values)
+    )
+    islands = []
+    errors = [item for item in (niter_error, nnz_error) if item]
+    for island_id in range(active_count):
+        niter = niter_values[island_id] if island_id < len(niter_values) else -1
+        nnz = nnz_values[island_id] if island_id < len(nnz_values) else None
+        iterations = []
+        island_errors = []
+        for iteration in range(max(0, niter)):
             try:
-                stat = stats[index]
-                row = {"iteration_index": index}
+                stat = _solver_stat_at(data, layout, island_id, iteration)
+                row = {"island_id": island_id, "iteration_index": iteration}
                 row.update({name: _stat_value(stat, name) for name in REQUIRED_SOLVER_STAT_FIELDS})
-                trace.append(row)
+                available = [name for name in REQUIRED_SOLVER_STAT_FIELDS if row[name] is not None]
+                row["available_fields"] = available
+                row["statistics_available"] = bool(available)
+                row["statistics_complete"] = len(available) == len(REQUIRED_SOLVER_STAT_FIELDS)
+                row["statistics_finite"] = bool(available and all(_finite(row[name]) for name in available))
+                iterations.append(row)
             except Exception as error:
-                errors.append(f"iteration {index}: {type(error).__name__}: {error}")
-    required_available = bool(
-        niter >= 0 and niter > 0 and len(trace) == niter
-        and all(all(row[name] is not None for name in REQUIRED_SOLVER_STAT_FIELDS) for row in trace)
-    )
-    finite = bool(
-        required_available
-        and all(_finite(value) for row in trace for value in row.values())
-    )
-    last = trace[-1] if trace else {}
+                message = f"island {island_id} iteration {iteration}: {type(error).__name__}: {error}"
+                island_errors.append(message)
+                errors.append(message)
+        island_available = bool(
+            niter > 0 and len(iterations) == niter
+            and all(row["statistics_available"] for row in iterations)
+        )
+        island_finite = bool(
+            island_available and all(row["statistics_finite"] for row in iterations)
+        )
+        islands.append({
+            "island_id": island_id,
+            "niter": niter,
+            "nnz": nnz,
+            "iterations_limit": limit,
+            "niter_below_limit": bool(niter >= 0 and niter < limit),
+            "iterations": iterations,
+            "last_iteration": iterations[-1] if iterations else {},
+            "statistics_available": island_available,
+            "statistics_complete": bool(
+                island_available
+                and all(row["statistics_complete"] for row in iterations)
+            ),
+            "statistics_finite": island_finite,
+            "errors": island_errors,
+        })
+    active_valid = bool(islands and all(item["statistics_available"] for item in islands))
+    active_finite = bool(active_valid and all(item["statistics_finite"] for item in islands))
     return {
-        "solver_niter": niter_raw,
+        "active_solver_island_count": active_count,
+        "active_solver_island_count_source": count_source,
+        "active_solver_island_count_evidence": count_evidence,
+        "solver_niter": niter_values,
+        "solver_nnz": nnz_values,
         "iterations_limit": limit,
-        "trace": trace,
-        "last_iteration": last,
+        "solver_layout": layout,
+        "islands": islands,
+        # Keep trace/last_iteration for compatibility with prior artifacts and tests.
+        "trace": [row for island in islands for row in island["iterations"]],
+        "last_iteration": islands[-1]["last_iteration"] if islands else {},
+        "last_iterations": [island["last_iteration"] for island in islands],
         "required_fields": list(REQUIRED_SOLVER_STAT_FIELDS),
-        "statistics_available": required_available,
-        "all_statistics_finite": finite,
+        "statistics_available": active_valid,
+        "statistics_complete": bool(
+            active_valid and all(item["statistics_complete"] for item in islands)
+        ),
+        "all_statistics_finite": active_finite,
         "errors": errors,
-        "status": "VALID" if finite else "INSUFFICIENT_EVIDENCE",
+        "status": "VALID" if active_finite else "INSUFFICIENT_EVIDENCE",
     }
 
 
@@ -835,15 +1131,16 @@ def _solver_numerics(
     configuration: dict[str, Any],
 ) -> dict[str, Any]:
     warmstart = np.asarray(warmstart_input, dtype=np.float64).copy()
-    fields = {
-        name: _scalar(data, name)
-        for name in ("solver_niter", "solver_nnz", "solver_fwdinv")
-    }
+    fields = {"solver_fwdinv": _scalar(data, "solver_fwdinv")}
     finite = all(_finite(value) for value in fields.values() if value is not None)
     finite = bool(finite and _finite(warmstart) and trace["all_statistics_finite"])
     return {
-        "solver_niter": fields["solver_niter"],
-        "solver_nnz": fields["solver_nnz"],
+        "solver_niter": trace.get("solver_niter", []),
+        "solver_nnz": trace.get("solver_nnz", []),
+        "active_solver_islands": [item["island_id"] for item in trace.get("islands", [])],
+        "active_solver_island_count": trace.get("active_solver_island_count", 0),
+        "active_solver_niter": [item["niter"] for item in trace.get("islands", [])],
+        "active_solver_nnz": [item["nnz"] for item in trace.get("islands", [])],
         "solver_fwdinv": fields["solver_fwdinv"],
         "tolerance": float(model.opt.tolerance),
         "iterations_limit": int(model.opt.iterations),
@@ -910,6 +1207,7 @@ def _run_condition(
     production_options: dict[str, Any],
     isolation_method: str,
     mjb_path: Path | None,
+    solver_api: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     transactional = isolation_method == "TRANSACTIONAL_SOLVER_OPTION_RESTORE"
     clone_smoke = None
@@ -939,7 +1237,7 @@ def _run_condition(
         post_constraint = regularization._constraint_snapshot(
             solver_data, mujoco, model, read_physical_contact_forces=True
         )
-        trace = _solver_iteration_trace(solver_data, model)
+        trace = _solver_iteration_trace(solver_data, model, solver_api)
         numerics = _solver_numerics(solver_data, model, warmstart_input, trace, configuration)
         mujoco.mj_Euler(model, data)
         capture = regularization.capture_after_integration(
@@ -1112,6 +1410,68 @@ def _baseline_from_recent_artifact(
     }
 
 
+def _all_gate_checks(value: Any) -> bool:
+    """Evaluate nested artifact gates without treating a failure string as truthy."""
+    if not isinstance(value, dict) or not value:
+        return False
+    result = []
+    for item in value.values():
+        if isinstance(item, dict):
+            result.append(_all_gate_checks(item))
+        elif isinstance(item, (bool, np.bool_)):
+            result.append(bool(item))
+        elif isinstance(item, str):
+            result.append(item.upper() in {"PASS", "VALIDATED", "TRUE"})
+        else:
+            result.append(bool(item))
+    return bool(result) and all(result)
+
+
+def _baseline_gate_components(
+    corrected_oracle: dict[str, Any],
+    recent_regularization_artifact: dict[str, Any],
+    sanity: dict[str, Any],
+) -> dict[str, Any]:
+    oracle_status = next(
+        (
+            corrected_oracle.get(key)
+            for key in (
+                "PYRAMIDAL_BASELINE_REPRODUCTION",
+                "R_BASELINE_REPRODUCTION",
+                "BASELINE_REPRODUCTION",
+            )
+            if corrected_oracle.get(key) is not None
+        ),
+        None,
+    )
+    oracle_checks = corrected_oracle.get("checks")
+    recent_checks = recent_regularization_artifact.get("checks")
+    components = {
+        "corrected_oracle_status_pass": oracle_status == "PASS",
+        "corrected_oracle_checks_all_pass": _all_gate_checks(oracle_checks),
+        "recent_regularization_artifact_status_pass": (
+            recent_regularization_artifact.get("status") == "PASS"
+        ),
+        "recent_regularization_artifact_checks_all_pass": _all_gate_checks(recent_checks),
+        "sanity_all_pass": _all_gate_checks(sanity),
+    }
+    return {
+        "oracle_status_key": (
+            "PYRAMIDAL_BASELINE_REPRODUCTION"
+            if corrected_oracle.get("PYRAMIDAL_BASELINE_REPRODUCTION") is not None
+            else "R_BASELINE_REPRODUCTION"
+            if corrected_oracle.get("R_BASELINE_REPRODUCTION") is not None
+            else "BASELINE_REPRODUCTION"
+            if corrected_oracle.get("BASELINE_REPRODUCTION") is not None
+            else None
+        ),
+        "oracle_status": oracle_status,
+        "components": components,
+        "all_components_pass": bool(all(components.values())),
+        "BASELINE_STATUS_CONSISTENCY": "PASS" if all(components.values()) else "FAIL",
+    }
+
+
 def _baseline_regression(
     condition: dict[str, Any],
     corrected_reference: dict[str, Any],
@@ -1143,12 +1503,14 @@ def _baseline_regression(
         "solver_excess_vector_norm": _allclose(condition["excess"]["solver_excess_vector_norm"], 0.8072255552101076),
         "post_slip_speed": _allclose(np.linalg.norm(condition["excess"]["post_slip"]), 0.1713507113360867),
     }
-    oracle_pass = oracle_result.get("R_BASELINE_REPRODUCTION") == "PASS"
-    valid = bool(oracle_pass and recent_result.get("status") == "PASS" and all(sanity.values()))
+    gate_components = _baseline_gate_components(oracle_result, recent_result, sanity)
+    valid = bool(gate_components["all_components_pass"])
     return {
         "corrected_oracle": oracle_result,
         "recent_regularization_artifact": recent_result,
         "sanity": sanity,
+        "baseline_gate_components": gate_components,
+        "BASELINE_STATUS_CONSISTENCY": gate_components["BASELINE_STATUS_CONSISTENCY"],
         "OPTIMIZATION_BASELINE_REPRODUCTION": "PASS" if valid else "FAIL",
     }
 
@@ -1291,25 +1653,42 @@ def _convergence_assessment(
     for name, _, _, _ in CONDITIONS:
         trace = conditions[name]["solver_iteration_trace"]
         numerics = conditions[name]["solver_numerics"]
-        niter = numerics.get("solver_niter")
-        limit = numerics.get("iterations_limit")
+        islands = trace.get("islands", [])
+        active_count = int(trace.get("active_solver_island_count", 0) or 0)
+        source = trace.get("active_solver_island_count_source")
+        active_count_known = bool(active_count > 0 and source not in {None, "UNAVAILABLE"})
+        active_limit_checks = [
+            bool(item.get("niter_below_limit"))
+            for item in islands[:active_count]
+        ]
         assessments[name] = {
-            "statistics_finite": bool(numerics.get("finite")),
-            "statistics_complete": bool(trace.get("statistics_available")),
-            "niter": niter,
-            "iterations_limit": limit,
-            "niter_below_limit": bool(
-                isinstance(niter, (int, float, np.integer, np.floating))
-                and isinstance(limit, (int, float, np.integer, np.floating))
-                and int(niter) < int(limit)
+            "active_solver_island_count": active_count,
+            "active_solver_island_count_source": source,
+            "active_solver_island_count_known": active_count_known,
+            "statistics_finite": bool(
+                numerics.get("finite") and trace.get("all_statistics_finite")
             ),
+            "statistics_available": bool(trace.get("statistics_available")),
+            "statistics_complete": bool(trace.get("statistics_complete")),
+            "solver_niter": numerics.get("solver_niter", []),
+            "solver_nnz": numerics.get("solver_nnz", []),
+            "active_solver_niter": numerics.get("active_solver_niter", []),
+            "active_solver_nnz": numerics.get("active_solver_nnz", []),
+            "iterations_limit": trace.get("iterations_limit"),
+            "niter_below_limit": bool(active_limit_checks and all(active_limit_checks)),
+            "islands": islands,
             "last_iteration": trace.get("last_iteration", {}),
+            "last_iterations": trace.get("last_iterations", []),
         }
     all_valid_stats = all(
-        item["statistics_finite"] and item["statistics_complete"]
+        item["active_solver_island_count_known"]
+        and item["statistics_finite"]
+        and item["statistics_available"]
         for item in assessments.values()
     )
-    any_limit_hit = any(not item["niter_below_limit"] for item in assessments.values())
+    any_limit_hit = any(
+        not item["niter_below_limit"] for item in assessments.values()
+    )
     baseline_pass = baseline["OPTIMIZATION_BASELINE_REPRODUCTION"] == "PASS"
     converged = bool(
         all_valid_stats and not any_limit_hit and baseline_pass
@@ -1328,8 +1707,91 @@ def _convergence_assessment(
         "conditions": assessments,
         "baseline_reproduction": baseline["OPTIMIZATION_BASELINE_REPRODUCTION"],
         "all_statistics_finite": all_valid_stats,
+        "active_solver_island_count_known": all(
+            item["active_solver_island_count_known"] for item in assessments.values()
+        ),
+        "active_solver_island_counts": {
+            name: item["active_solver_island_count"]
+            for name, item in assessments.items()
+        },
         "any_iteration_limit_reached": any_limit_hit,
         "PRODUCTION_NEWTON_CONVERGENCE": status,
+    }
+
+
+def _active_niter_values(condition: dict[str, Any]) -> list[int]:
+    numerics = condition.get("solver_numerics", {})
+    value = numerics.get("active_solver_niter")
+    if isinstance(value, (list, tuple, np.ndarray)):
+        try:
+            return [int(item) for item in np.asarray(value).reshape(-1)]
+        except (TypeError, ValueError):
+            return []
+    value = numerics.get("solver_niter")
+    if isinstance(value, (list, tuple, np.ndarray)):
+        try:
+            return [int(item) for item in np.asarray(value).reshape(-1)]
+        except (TypeError, ValueError):
+            return []
+    try:
+        return [int(value)] if value is not None else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _warmstart_computational_effect(
+    conditions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    pairs = {
+        "production_tolerance_A_vs_B": (
+            "production_warmstart_production_tolerance",
+            "zero_warmstart_production_tolerance",
+        ),
+        "tight_tolerance_C_vs_D": (
+            "production_warmstart_tight_tolerance",
+            "zero_warmstart_tight_tolerance",
+        ),
+    }
+    comparisons = {}
+    classifications = []
+    for name, (left_name, right_name) in pairs.items():
+        left_values = _active_niter_values(conditions[left_name])
+        right_values = _active_niter_values(conditions[right_name])
+        if not left_values or not right_values or len(left_values) != len(right_values):
+            comparisons[name] = {
+                "left_active_solver_niter": left_values,
+                "right_active_solver_niter": right_values,
+                "classification": "INSUFFICIENT_EVIDENCE",
+            }
+            classifications.append("INSUFFICIENT_EVIDENCE")
+            continue
+        left_total, right_total = sum(left_values), sum(right_values)
+        if right_total > left_total:
+            classification = "REDUCES_ITERATION_COUNT"
+        elif right_total < left_total:
+            classification = "INCREASES_ITERATION_COUNT"
+        else:
+            classification = "NO_ITERATION_EFFECT"
+        comparisons[name] = {
+            "left_active_solver_niter": left_values,
+            "right_active_solver_niter": right_values,
+            "left_total_iterations": left_total,
+            "right_total_iterations": right_total,
+            "delta_zero_minus_production": right_total - left_total,
+            "classification": classification,
+        }
+        classifications.append(classification)
+    if not classifications or any(item == "INSUFFICIENT_EVIDENCE" for item in classifications):
+        classification = "INSUFFICIENT_EVIDENCE"
+    elif any(item == "REDUCES_ITERATION_COUNT" for item in classifications):
+        classification = "REDUCES_ITERATION_COUNT"
+    elif any(item == "INCREASES_ITERATION_COUNT" for item in classifications):
+        classification = "INCREASES_ITERATION_COUNT"
+    else:
+        classification = "NO_ITERATION_EFFECT"
+    return {
+        "comparisons": comparisons,
+        "WARMSTART_COMPUTATIONAL_EFFECT": classification,
     }
 
 
@@ -1622,13 +2084,27 @@ def _write_failure_placeholders(output: Path, error: Exception) -> None:
         "clone_data_state_fidelity.json": {
             "CLONE_DATA_STATE_FIDELITY": "FAIL",
         },
+        "solver_stat_api_discovery.json": {
+            "status": "INSUFFICIENT_EVIDENCE",
+            "active_solver_island_count": None,
+            "active_solver_island_count_source": "UNAVAILABLE",
+        },
         "solver_optimization_invariant_validation.json": {
             "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION": "INSUFFICIENT_EVIDENCE",
         },
         "warmstart_activation.json": {"ZERO_WARMSTART_ACTIVATION": "FAILED"},
         "tight_tolerance_activation.json": {"TIGHT_TOLERANCE_ACTIVATION": "FAILED"},
-        "baseline_regression.json": {"OPTIMIZATION_BASELINE_REPRODUCTION": "FAIL"},
+        "baseline_regression.json": {
+            "BASELINE_STATUS_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
+            "OPTIMIZATION_BASELINE_REPRODUCTION": "FAIL",
+        },
+        "baseline_gate_components.json": {
+            "BASELINE_STATUS_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
+        },
         "warmstart_sensitivity.json": {"SOLVER_WARMSTART_SENSITIVITY": "INSUFFICIENT_EVIDENCE"},
+        "warmstart_computational_effect.json": {
+            "WARMSTART_COMPUTATIONAL_EFFECT": "INSUFFICIENT_EVIDENCE"
+        },
         "tolerance_sensitivity.json": {"SOLVER_TOLERANCE_SENSITIVITY": "INSUFFICIENT_EVIDENCE"},
         "solver_convergence_assessment.json": {"PRODUCTION_NEWTON_CONVERGENCE": "INSUFFICIENT_EVIDENCE"},
         "custom_pipeline_one_step_regression.json": {"CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION": "INSUFFICIENT_EVIDENCE"},
@@ -1665,12 +2141,17 @@ def _failure_payload(error: Exception) -> dict[str, Any]:
         "EXACT_MODEL_CLONE_FIDELITY": "FAIL",
         "CLONE_DATA_STATE_FIDELITY": "FAIL",
         "OPTIMIZATION_BASELINE_REPRODUCTION": "FAIL",
+        "BASELINE_STATUS_CONSISTENCY": "INSUFFICIENT_EVIDENCE",
         "ZERO_WARMSTART_ACTIVATION": "FAILED",
         "TIGHT_TOLERANCE_ACTIVATION": "FAILED",
         "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION": "INSUFFICIENT_EVIDENCE",
         "SOLVER_WARMSTART_SENSITIVITY": "INSUFFICIENT_EVIDENCE",
+        "WARMSTART_COMPUTATIONAL_EFFECT": "INSUFFICIENT_EVIDENCE",
         "SOLVER_TOLERANCE_SENSITIVITY": "INSUFFICIENT_EVIDENCE",
         "PRODUCTION_NEWTON_CONVERGENCE": "INSUFFICIENT_EVIDENCE",
+        "SOLVER_STAT_API_DISCOVERY": "INSUFFICIENT_EVIDENCE",
+        "SOLVER_ISLAND_COUNT_SOURCE": "UNAVAILABLE",
+        "ACTIVE_SOLVER_ISLAND_COUNT": None,
         "MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS": "INSUFFICIENT_EVIDENCE",
         "NEXT_ACTION": "DIAGNOSTIC_IMPLEMENTATION_FIX_REQUIRED",
         "UNCONDITIONAL_ZIP_PACKAGING": "ENABLED",
@@ -1747,6 +2228,10 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         raise RuntimeError("exact compiled-model clone fidelity gate failed")
     if clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"] != "PASS":
         raise RuntimeError("clone-data state fidelity gate failed")
+    solver_stat_api = _solver_stat_api_discovery(
+        mujoco, model, snapshot, probe_model=probe_clone
+    )
+    write_json(output / "solver_stat_api_discovery.json", solver_stat_api)
     write_json(output / "global55_pre_state_snapshot.json", aref.cone_helper.state_input_snapshot(snapshot))
     write_json(output / "state_copy_manifest.json", {
         **aref.cone_helper.state_copy_manifest(snapshot),
@@ -1763,6 +2248,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         condition = _run_condition(
             mujoco, model, snapshot, mapping, name, label,
             zero_warmstart, tight, production_options, isolation_method, mjb_path,
+            solver_api=solver_stat_api,
         )
         conditions[name] = condition
         _write_condition(output, condition)
@@ -1776,6 +2262,7 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         paths["regularization_reference"],
     )
     warmstart_sensitivity = _warmstart_sensitivity(conditions)
+    warmstart_computational_effect = _warmstart_computational_effect(conditions)
     tolerance_sensitivity = _tolerance_sensitivity(conditions)
     convergence = _convergence_assessment(
         conditions, baseline, warmstart_sensitivity, tolerance_sensitivity
@@ -1798,7 +2285,15 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     write_json(output / "warmstart_activation.json", warmstart_activation)
     write_json(output / "tight_tolerance_activation.json", tight_activation)
     write_json(output / "baseline_regression.json", baseline)
+    write_json(
+        output / "baseline_gate_components.json",
+        baseline["baseline_gate_components"],
+    )
     write_json(output / "warmstart_sensitivity.json", warmstart_sensitivity)
+    write_json(
+        output / "warmstart_computational_effect.json",
+        warmstart_computational_effect,
+    )
     write_json(output / "tolerance_sensitivity.json", tolerance_sensitivity)
     write_json(output / "solver_convergence_assessment.json", convergence)
     write_json(output / "custom_pipeline_one_step_regression.json", custom_step)
@@ -1813,10 +2308,12 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     )
     gates = bool(
         baseline["OPTIMIZATION_BASELINE_REPRODUCTION"] == "PASS"
+        and baseline["BASELINE_STATUS_CONSISTENCY"] == "PASS"
         and warmstart_activation["ZERO_WARMSTART_ACTIVATION"] == "VALIDATED"
         and tight_activation["TIGHT_TOLERANCE_ACTIVATION"] == "VALIDATED"
         and invariant["SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION"] == "VALIDATED"
-        and convergence["PRODUCTION_NEWTON_CONVERGENCE"] in {"VALIDATED", "QUESTIONABLE"}
+        and convergence["PRODUCTION_NEWTON_CONVERGENCE"] == "VALIDATED"
+        and solver_stat_api["status"] == "VALID"
         and custom_step["CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION"] == "PASS"
         and source_unchanged
         and model_restore["only_allowed"]
@@ -1837,12 +2334,17 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "EXACT_MODEL_CLONE_FIDELITY": clone_fidelity["EXACT_MODEL_CLONE_FIDELITY"],
         "CLONE_DATA_STATE_FIDELITY": clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"],
         "OPTIMIZATION_BASELINE_REPRODUCTION": baseline["OPTIMIZATION_BASELINE_REPRODUCTION"],
+        "BASELINE_STATUS_CONSISTENCY": baseline["BASELINE_STATUS_CONSISTENCY"],
         "ZERO_WARMSTART_ACTIVATION": warmstart_activation["ZERO_WARMSTART_ACTIVATION"],
         "TIGHT_TOLERANCE_ACTIVATION": tight_activation["TIGHT_TOLERANCE_ACTIVATION"],
         "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION": invariant["SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION"],
         "SOLVER_WARMSTART_SENSITIVITY": warmstart_sensitivity["SOLVER_WARMSTART_SENSITIVITY"],
+        "WARMSTART_COMPUTATIONAL_EFFECT": warmstart_computational_effect["WARMSTART_COMPUTATIONAL_EFFECT"],
         "SOLVER_TOLERANCE_SENSITIVITY": tolerance_sensitivity["SOLVER_TOLERANCE_SENSITIVITY"],
         "PRODUCTION_NEWTON_CONVERGENCE": convergence["PRODUCTION_NEWTON_CONVERGENCE"],
+        "SOLVER_STAT_API_DISCOVERY": solver_stat_api["status"],
+        "SOLVER_ISLAND_COUNT_SOURCE": solver_stat_api.get("active_solver_island_count_source"),
+        "ACTIVE_SOLVER_ISLAND_COUNT": solver_stat_api.get("active_solver_island_count"),
         "MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS": final["MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS"],
         "NEXT_ACTION": final["NEXT_ACTION"],
         "formal_replay_physics_substeps": len(recorder.records),
@@ -1865,9 +2367,12 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "RUNTIME_MODEL_STRUCTURE", "EXACT_MODEL_CLONE_API", "MODEL_CLONE_METHOD",
         "EXACT_MODEL_CLONE_FIDELITY", "CLONE_DATA_STATE_FIDELITY",
         "OPTIMIZATION_BASELINE_REPRODUCTION", "ZERO_WARMSTART_ACTIVATION",
+        "BASELINE_STATUS_CONSISTENCY",
         "TIGHT_TOLERANCE_ACTIVATION", "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION",
-        "SOLVER_WARMSTART_SENSITIVITY", "SOLVER_TOLERANCE_SENSITIVITY",
-        "PRODUCTION_NEWTON_CONVERGENCE", "MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS",
+        "SOLVER_WARMSTART_SENSITIVITY", "WARMSTART_COMPUTATIONAL_EFFECT",
+        "SOLVER_TOLERANCE_SENSITIVITY", "PRODUCTION_NEWTON_CONVERGENCE",
+        "SOLVER_STAT_API_DISCOVERY", "SOLVER_ISLAND_COUNT_SOURCE",
+        "ACTIVE_SOLVER_ISLAND_COUNT", "MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS",
         "NEXT_ACTION", "UNCONDITIONAL_ZIP_PACKAGING", "LOCAL_IMPLEMENTATION",
     )}
     summary["interpretation"] = final.get("interpretation")
@@ -1890,10 +2395,15 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "MODEL_CLONE_METHOD": isolation_method,
         "EXACT_MODEL_CLONE_FIDELITY": clone_fidelity["EXACT_MODEL_CLONE_FIDELITY"],
         "CLONE_DATA_STATE_FIDELITY": clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"],
+        "solver_stat_api_discovery": solver_stat_api,
         "runtime_model_structure": source_inventory["RUNTIME_MODEL_STRUCTURE"],
         "condition_staged_forward_count": 4,
         "condition_constraint_solve_count": 4,
         "condition_custom_integration_count": 4,
+        "solver_stat_probe_staged_forward_count": solver_stat_api["probe_staged_forward_count"],
+        "solver_stat_probe_constraint_solve_count": solver_stat_api["probe_constraint_solve_count"],
+        "active_solver_island_count": solver_stat_api.get("active_solver_island_count"),
+        "solver_island_count_source": solver_stat_api.get("active_solver_island_count_source"),
         "production_options": production_options,
         "semantic_scope": validation["semantic_scope"],
     }
