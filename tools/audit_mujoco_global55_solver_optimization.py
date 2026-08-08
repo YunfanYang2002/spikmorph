@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
+import hashlib
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -66,6 +68,23 @@ REQUIRED_SOLVER_STAT_FIELDS = (
 )
 FORBIDDEN_OPTION_TOKENS = (
     "cone", "friction", "solref", "solimp", "aref", "regularization",
+)
+CLONE_COUNT_FIELDS = (
+    "nq", "nv", "na", "nu", "nbody", "njnt", "ngeom", "nsite",
+    "npair", "nexclude", "ntendon", "nsensor", "nkey",
+)
+CLONE_ARRAY_FIELDS = (
+    "geom_friction", "geom_solref", "geom_solimp", "geom_contype",
+    "geom_conaffinity", "geom_bodyid", "body_mass", "body_inertia",
+    "body_pos", "body_quat", "jnt_type", "jnt_bodyid", "jnt_axis",
+    "jnt_range", "dof_armature", "dof_damping", "dof_frictionloss",
+    "actuator_trnid", "actuator_gear", "actuator_forcelimited",
+    "actuator_forcerange", "actuator_ctrllimited", "actuator_ctrlrange",
+)
+CLONE_NAME_OBJECTS = (
+    ("geom", "mjOBJ_GEOM", "ngeom"),
+    ("body", "mjOBJ_BODY", "nbody"),
+    ("joint", "mjOBJ_JOINT", "njnt"),
 )
 
 
@@ -196,101 +215,174 @@ def _finite(value: Any) -> bool:
         return False
 
 
-def _synchronize_recompiled_model(
-    model: Any, expected_options: dict[str, Any]
-) -> None:
-    """Copy runtime model options/arrays from the formal base model.
-
-    The environment may apply validated runtime defaults after compiling the
-    XML (for example disableflags or per-geom contact parameters).  Reusing
-    the raw XML alone would therefore create a different physical model.  The
-    copy is made only on the independent clone; the formal base model is never
-    modified.
-    """
-    for name, expected in expected_options.items():
-        owner = model.opt if name.startswith("opt.") else model
-        attribute = name[4:] if name.startswith("opt.") else name
-        current = getattr(owner, attribute, None)
-        if expected is None:
-            if current is not None:
-                raise RuntimeError(
-                    f"recompiled clone field {name} is present while base field is None"
-                )
-            continue
-        if isinstance(expected, np.ndarray):
-            if current is None:
-                raise RuntimeError(f"recompiled clone field {name} is missing")
-            target = np.asarray(current)
-            if target.shape != expected.shape:
-                raise RuntimeError(
-                    f"recompiled clone field {name} shape mismatch: "
-                    f"{target.shape} vs {expected.shape}"
-                )
-            if not target.flags.writeable:
-                raise RuntimeError(f"recompiled clone field {name} is read-only")
-            target[...] = expected
-        else:
-            setattr(owner, attribute, expected)
+def _safe_signature(value: Any) -> str | None:
+    try:
+        return str(inspect.signature(value))
+    except (TypeError, ValueError):
+        return None
 
 
-def _validate_or_sync_recompiled_model(
-    model: Any, expected_options: dict[str, Any] | None
-) -> None:
-    if expected_options is None:
-        return
-    _synchronize_recompiled_model(model, expected_options)
-    option_diff = _option_difference(expected_options, _model_option_snapshot(model))
-    if not option_diff["only_allowed"]:
-        raise RuntimeError(
-            "recompiled clone changed production model options after sync: "
-            + ", ".join(option_diff["unexpected_changed_fields"])
+def _safe_docstring(value: Any) -> str | None:
+    doc = getattr(value, "__doc__", None)
+    return None if doc is None else str(doc).strip()[:2000]
+
+
+def _capability_discovery(mujoco: Any) -> dict[str, Any]:
+    symbols = {}
+    for name, owner in (
+        ("mj_copyModel", mujoco),
+        ("mj_saveModel", mujoco),
+        ("MjModel.from_binary_path", getattr(mujoco, "MjModel", None)),
+    ):
+        attribute = name.rsplit(".", 1)[-1]
+        value = getattr(owner, attribute, None) if owner is not None else None
+        symbols[name] = {
+            "available": bool(callable(value)),
+            "signature": _safe_signature(value) if callable(value) else None,
+            "docstring": _safe_docstring(value) if callable(value) else None,
+        }
+    return {
+        "mujoco_version": getattr(mujoco, "__version__", None),
+        "symbols": symbols,
+        "formal_xml_clone_forbidden": True,
+        "runtime_smoke": {},
+        "EXACT_MODEL_CLONE_API": "UNAVAILABLE",
+        "MODEL_CLONE_METHOD": None,
+    }
+
+
+def _model_counts(model: Any) -> dict[str, int | None]:
+    return {
+        name: (int(getattr(model, name)) if getattr(model, name, None) is not None else None)
+        for name in CLONE_COUNT_FIELDS
+    }
+
+
+def _array_digest(value: Any) -> dict[str, Any]:
+    array = np.asarray(value)
+    contiguous = np.ascontiguousarray(array)
+    return {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+    }
+
+
+def _clone_smoke(mujoco: Any, source: Any, clone: Any) -> dict[str, Any]:
+    checks: dict[str, bool] = {
+        "clone_is_not_source": clone is not source,
+        "counts_equal": _model_counts(source) == _model_counts(clone),
+    }
+    source_tolerance = float(source.opt.tolerance)
+    clone_tolerance_before = float(clone.opt.tolerance)
+    clone_tolerance = source_tolerance * 0.5 if source_tolerance > 0 else np.nextafter(0.0, 1.0)
+    try:
+        clone.opt.tolerance = clone_tolerance
+        checks["clone_option_mutation_is_local"] = bool(
+            float(source.opt.tolerance) == source_tolerance
         )
+    except Exception:
+        checks["clone_option_mutation_is_local"] = False
+    finally:
+        try:
+            clone.opt.tolerance = clone_tolerance_before
+        except Exception:
+            checks["clone_restore_after_smoke"] = False
+        else:
+            checks["clone_restore_after_smoke"] = True
+    return {
+        "checks": checks,
+        "source_counts": _model_counts(source),
+        "clone_counts": _model_counts(clone),
+        "source_tolerance_after_clone_mutation": float(source.opt.tolerance),
+        "CLONE_SMOKE": "PASS" if all(checks.values()) else "FAIL",
+    }
+
+
+def _save_model_mjb(mujoco: Any, model: Any, path: Path) -> dict[str, Any]:
+    saver = getattr(mujoco, "mj_saveModel", None)
+    if not callable(saver):
+        raise RuntimeError("mj_saveModel is unavailable")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    signature = _safe_signature(saver)
+    attempts = []
+    if signature is not None:
+        try:
+            parameters = list(inspect.signature(saver).parameters.values())
+            positional = [item for item in parameters if item.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )]
+            has_variadic = any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters)
+            if len(positional) == 3 or has_variadic:
+                saver(model, str(path), None)
+            elif len(positional) == 2:
+                saver(model, str(path))
+            else:
+                raise RuntimeError(f"unsupported mj_saveModel signature: {signature}")
+        except Exception as error:
+            attempts.append(f"signature {signature}: {type(error).__name__}: {error}")
+    else:
+        # The documented C API has (model, filename, vfs); this path is used
+        # only when the wheel does not expose an inspectable signature.
+        try:
+            saver(model, str(path), None)
+        except Exception as error:
+            attempts.append(f"documented 3-argument call: {type(error).__name__}: {error}")
+    if not path.is_file() or path.stat().st_size == 0:
+        attempts.append("mj_saveModel returned without a non-empty MJB")
+    if attempts:
+        raise RuntimeError("; ".join(attempts))
+    return {
+        "path": str(path),
+        "signature": signature,
+        "size_bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _load_model_mjb(mujoco: Any, path: Path) -> Any:
+    model_type = getattr(mujoco, "MjModel", None)
+    loader = getattr(model_type, "from_binary_path", None)
+    if not callable(loader):
+        raise RuntimeError("MjModel.from_binary_path is unavailable")
+    return loader(str(path))
 
 
 def _copy_model(
     mujoco: Any,
     model: Any,
-    morphology_xml: Path,
-    expected_options: dict[str, Any] | None = None,
-) -> tuple[Any, str]:
-    copier = getattr(mujoco, "mj_copyModel", None)
-    errors = []
-    if callable(copier):
-        for arguments in ((model,), (None, model)):
+    method: str,
+    mjb_path: Path | None = None,
+) -> tuple[Any, str, dict[str, Any]]:
+    if method == "MJ_COPY_MODEL":
+        copier = getattr(mujoco, "mj_copyModel", None)
+        if not callable(copier):
+            raise RuntimeError("selected mj_copyModel method is unavailable")
+        errors = []
+        for arguments in ((None, model), (model,)):
             try:
-                copied = copier(*arguments)
-                if copied is not None:
-                    return copied, "mujoco.mj_copyModel"
-            except Exception as error:  # pragma: no cover - binding-specific signature
-                errors.append(f"mj_copyModel: {type(error).__name__}: {error}")
-
-    # MuJoCo 3.8.1's Python wheel does not expose mj_copyModel.  Recompile
-    # the already SHA-validated source XML without changing its contents;
-    # this produces an independent model with the same compiled topology.
-    model_type = getattr(mujoco, "MjModel", None)
-    from_xml_path = getattr(model_type, "from_xml_path", None)
-    if callable(from_xml_path):
-        try:
-            copied = from_xml_path(str(morphology_xml))
-            if copied is not None:
-                _validate_or_sync_recompiled_model(copied, expected_options)
-                return copied, "mujoco.MjModel.from_xml_path+base_snapshot_sync"
-        except Exception as error:  # pragma: no cover - server binding/path dependent
-            errors.append(f"from_xml_path: {type(error).__name__}: {error}")
-
-    from_xml_string = getattr(model_type, "from_xml_string", None)
-    if callable(from_xml_string):
-        try:
-            copied = from_xml_string(morphology_xml.read_text(encoding="utf-8"))
-            if copied is not None:
-                _validate_or_sync_recompiled_model(copied, expected_options)
-                return copied, "mujoco.MjModel.from_xml_string+base_snapshot_sync"
-        except Exception as error:  # pragma: no cover - server binding/path dependent
-            errors.append(f"from_xml_string: {type(error).__name__}: {error}")
-
-    if not errors:
-        errors.append("no supported model-copy or XML-recompile API")
-    raise RuntimeError("independent MuJoCo model clone failed: " + "; ".join(errors))
+                clone = copier(*arguments)
+                if clone is None:
+                    raise RuntimeError("copy returned None")
+                smoke = _clone_smoke(mujoco, model, clone)
+                if smoke["CLONE_SMOKE"] != "PASS":
+                    raise RuntimeError(json.dumps(_json_normalize(smoke), sort_keys=True))
+                return clone, "MJ_COPY_MODEL", smoke
+            except Exception as error:  # pragma: no cover - binding-specific
+                errors.append(f"{type(error).__name__}: {error}")
+        raise RuntimeError("mj_copyModel failed: " + "; ".join(errors))
+    if method == "MJB_ROUNDTRIP":
+        if mjb_path is None:
+            raise RuntimeError("MJB roundtrip requires a condition-specific path")
+        saved = _save_model_mjb(mujoco, model, mjb_path)
+        clone = _load_model_mjb(mujoco, mjb_path)
+        smoke = _clone_smoke(mujoco, model, clone)
+        smoke["mjb"] = saved
+        if smoke["CLONE_SMOKE"] != "PASS":
+            raise RuntimeError(json.dumps(_json_normalize(smoke), sort_keys=True))
+        return clone, "MJB_ROUNDTRIP", smoke
+    raise RuntimeError(f"_copy_model does not support method {method}")
 
 
 def _scalar(data: Any, name: str, default: Any = None) -> Any:
@@ -341,6 +433,255 @@ def _option_difference(
         "only_allowed": not unexpected,
         "details": details,
     }
+
+
+def _decode_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _named_sequence(mujoco: Any, model: Any, object_name: str, count_name: str) -> list[str | None]:
+    enum_type = getattr(getattr(mujoco, "mjtObj", None), object_name, None)
+    if enum_type is None:
+        return []
+    count = int(getattr(model, count_name, 0))
+    return [
+        _decode_name(mujoco.mj_id2name(model, enum_type, index))
+        for index in range(count)
+    ]
+
+
+def _geom_inventory(mujoco: Any, model: Any) -> list[dict[str, Any]]:
+    result = []
+    for index in range(int(getattr(model, "ngeom", 0))):
+        geom_name = _named_sequence(mujoco, model, "mjOBJ_GEOM", "ngeom")
+        geom_name = geom_name[index] if index < len(geom_name) else None
+        body_id = int(np.asarray(model.geom_bodyid)[index])
+        body_names = _named_sequence(mujoco, model, "mjOBJ_BODY", "nbody")
+        result.append({
+            "geom_id": index,
+            "geom_name": geom_name,
+            "geom_type": int(np.asarray(model.geom_type)[index]),
+            "body_id": body_id,
+            "body_name": body_names[body_id] if body_id < len(body_names) else None,
+            "friction": np.asarray(model.geom_friction)[index].copy(),
+            "contype": int(np.asarray(model.geom_contype)[index]),
+            "conaffinity": int(np.asarray(model.geom_conaffinity)[index]),
+        })
+    return result
+
+
+def _runtime_source_geom_inventory(
+    mujoco: Any, live_model: Any, morphology_xml: Path
+) -> dict[str, Any]:
+    live = _geom_inventory(mujoco, live_model)
+    source = []
+    source_error = None
+    loader = getattr(getattr(mujoco, "MjModel", None), "from_xml_path", None)
+    if callable(loader):
+        try:
+            source = _geom_inventory(mujoco, loader(str(morphology_xml)))
+        except Exception as error:  # diagnostic only; never a formal clone path
+            source_error = f"{type(error).__name__}: {error}"
+    else:
+        source_error = "MjModel.from_xml_path unavailable for source diagnostic"
+    live_names = [item["geom_name"] for item in live]
+    source_names = [item["geom_name"] for item in source]
+    live_name_set, source_name_set = set(live_names), set(source_names)
+    live_only_names = sorted(name for name in live_name_set - source_name_set if name is not None)
+    source_only_names = sorted(name for name in source_name_set - live_name_set if name is not None)
+    live_only_ids = [item["geom_id"] for item in live if item["geom_name"] in live_only_names]
+    source_only_ids = [item["geom_id"] for item in source if item["geom_name"] in source_only_names]
+    exact = bool(
+        source_error is None
+        and live_names == source_names
+        and len(live) == len(source)
+        and all(
+            item["geom_type"] == other["geom_type"]
+            and item["body_id"] == other["body_id"]
+            and item["contype"] == other["contype"]
+            and item["conaffinity"] == other["conaffinity"]
+            and _allclose(item["friction"], other["friction"])
+            for item, other in zip(live, source)
+        )
+    )
+    if exact:
+        structure = "MATCHES_SOURCE_XML"
+    elif source_error is None and live_only_names and not source_only_names:
+        structure = "HAS_RUNTIME_AUGMENTATION"
+    else:
+        structure = "OTHER_MISMATCH"
+    return {
+        "live_compiled_model": live,
+        "source_xml_recompiled_diagnostic_model": source,
+        "live_only_geom_ids": live_only_ids,
+        "live_only_geom_names": live_only_names,
+        "source_only_geom_ids": source_only_ids,
+        "source_only_geom_names": source_only_names,
+        "source_diagnostic_error": source_error,
+        "RUNTIME_MODEL_STRUCTURE": structure,
+        "formal_clone_path_used_source_xml": False,
+    }
+
+
+def _exact_value_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return isinstance(left, np.ndarray) and isinstance(right, np.ndarray) and np.array_equal(left, right)
+    return left == right
+
+
+def _model_clone_fidelity(mujoco: Any, source: Any, clone: Any, method: str) -> dict[str, Any]:
+    count_checks = {
+        name: int(getattr(source, name, -1)) == int(getattr(clone, name, -2))
+        for name in CLONE_COUNT_FIELDS
+    }
+    source_options = _model_option_snapshot(source)
+    clone_options = _model_option_snapshot(clone)
+    option_checks = {
+        name: _exact_value_equal(value, clone_options.get(name))
+        for name, value in source_options.items()
+    }
+    array_checks = {}
+    for name in CLONE_ARRAY_FIELDS:
+        left = getattr(source, name, None)
+        right = getattr(clone, name, None)
+        if left is None or right is None:
+            array_checks[name] = {
+                "available": left is None and right is None,
+                "equal": left is right,
+            }
+            continue
+        left_array, right_array = np.asarray(left), np.asarray(right)
+        same_shape = left_array.shape == right_array.shape
+        equal = bool(same_shape and np.array_equal(left_array, right_array))
+        array_checks[name] = {
+            "available": True,
+            "shape_equal": same_shape,
+            "dtype_equal": str(left_array.dtype) == str(right_array.dtype),
+            "max_abs_difference": float(
+                np.max(np.abs(left_array.astype(np.float64) - right_array.astype(np.float64)))
+            ) if same_shape and left_array.size else 0.0 if same_shape else None,
+            "source_bytes": _array_digest(left_array),
+            "clone_bytes": _array_digest(right_array),
+            "equal": equal,
+        }
+    name_checks = {}
+    for label, object_name, count_name in CLONE_NAME_OBJECTS:
+        name_checks[label] = {
+            "source": _named_sequence(mujoco, source, object_name, count_name),
+            "clone": _named_sequence(mujoco, clone, object_name, count_name),
+        }
+        name_checks[label]["equal"] = name_checks[label]["source"] == name_checks[label]["clone"]
+    valid = bool(
+        method in {"MJ_COPY_MODEL", "MJB_ROUNDTRIP"}
+        and all(count_checks.values())
+        and all(option_checks.values())
+        and all(item.get("equal", False) for item in array_checks.values())
+        and all(item["equal"] for item in name_checks.values())
+    )
+    return {
+        "method": method,
+        "source_counts": _model_counts(source),
+        "clone_counts": _model_counts(clone),
+        "count_checks": count_checks,
+        "solver_option_checks": option_checks,
+        "source_options": source_options,
+        "clone_options": clone_options,
+        "physical_array_checks": array_checks,
+        "name_order_checks": name_checks,
+        "EXACT_MODEL_CLONE_FIDELITY": "PASS" if valid else "FAIL",
+    }
+
+
+def _clone_data_state_fidelity(
+    mujoco: Any, model: Any, snapshot: Any, method: str
+) -> dict[str, Any]:
+    try:
+        data = mujoco.MjData(model)
+        mujoco.mj_copyData(data, model, snapshot)
+        equality = aref.cone_helper.state_equality(snapshot, data)
+        valid = bool(equality.get("STATE_COPY_EQUAL"))
+        return {
+            "method": method,
+            "state_equality": equality,
+            "CLONE_DATA_STATE_FIDELITY": "PASS" if valid else "FAIL",
+        }
+    except Exception as error:
+        return {
+            "method": method,
+            "error": f"{type(error).__name__}: {error}",
+            "CLONE_DATA_STATE_FIDELITY": "FAIL",
+        }
+
+
+def _transactional_smoke(mujoco: Any, model: Any) -> dict[str, Any]:
+    before = _model_option_snapshot(model)
+    checks = {}
+    try:
+        original_tolerance = float(model.opt.tolerance)
+        original_iterations = int(model.opt.iterations)
+        model.opt.tolerance = original_tolerance * 0.5
+        model.opt.iterations = original_iterations + 1
+        checks["tolerance_mutation_is_available"] = float(model.opt.tolerance) != original_tolerance
+        checks["iterations_mutation_is_available"] = int(model.opt.iterations) == original_iterations + 1
+    except Exception:
+        checks["tolerance_mutation_is_available"] = False
+        checks["iterations_mutation_is_available"] = False
+    finally:
+        model.opt.tolerance = before["opt.tolerance"]
+        model.opt.iterations = before["opt.iterations"]
+    after = _model_option_snapshot(model)
+    checks["exact_restore"] = _option_difference(before, after)["only_allowed"]
+    return {
+        "checks": checks,
+        "before": before,
+        "after": after,
+        "TRANSACTIONAL_SMOKE": "PASS" if all(checks.values()) else "FAIL",
+    }
+
+
+def _select_model_isolation_method(
+    mujoco: Any, model: Any, discovery: dict[str, Any], mjb_root: Path
+) -> tuple[str, str, Any | None]:
+    if discovery["symbols"]["mj_copyModel"]["available"]:
+        try:
+            clone, _, smoke = _copy_model(mujoco, model, "MJ_COPY_MODEL")
+            discovery["runtime_smoke"]["mj_copyModel"] = smoke
+            discovery["EXACT_MODEL_CLONE_API"] = "PYTHON_MJ_COPY_MODEL"
+            discovery["MODEL_CLONE_METHOD"] = "MJ_COPY_MODEL"
+            return "MJ_COPY_MODEL", "PYTHON_MJ_COPY_MODEL", clone
+        except Exception as error:
+            discovery["runtime_smoke"]["mj_copyModel"] = {
+                "error": f"{type(error).__name__}: {error}",
+                "CLONE_SMOKE": "FAIL",
+            }
+    if (
+        discovery["symbols"]["mj_saveModel"]["available"]
+        and discovery["symbols"]["MjModel.from_binary_path"]["available"]
+    ):
+        try:
+            probe_path = mjb_root / "solver_optimization_live_model_capability_probe.mjb"
+            clone, _, smoke = _copy_model(mujoco, model, "MJB_ROUNDTRIP", probe_path)
+            discovery["runtime_smoke"]["mjb_roundtrip"] = smoke
+            discovery["EXACT_MODEL_CLONE_API"] = "MJB_ROUNDTRIP"
+            discovery["MODEL_CLONE_METHOD"] = "MJB_ROUNDTRIP"
+            return "MJB_ROUNDTRIP", "MJB_ROUNDTRIP", clone
+        except Exception as error:
+            discovery["runtime_smoke"]["mjb_roundtrip"] = {
+                "error": f"{type(error).__name__}: {error}",
+                "CLONE_SMOKE": "FAIL",
+            }
+    transaction = _transactional_smoke(mujoco, model)
+    discovery["runtime_smoke"]["transactional_shared_model"] = transaction
+    if transaction["TRANSACTIONAL_SMOKE"] == "PASS":
+        discovery["EXACT_MODEL_CLONE_API"] = "TRANSACTIONAL_SHARED_MODEL"
+        discovery["MODEL_CLONE_METHOD"] = "TRANSACTIONAL_SOLVER_OPTION_RESTORE"
+        return "TRANSACTIONAL_SOLVER_OPTION_RESTORE", "TRANSACTIONAL_SHARED_MODEL", None
+    discovery["EXACT_MODEL_CLONE_API"] = "UNAVAILABLE"
+    raise RuntimeError("no safe compiled-model clone or transactional option path is available")
 
 
 def _tight_tolerance(production: float) -> tuple[float, str]:
@@ -543,6 +884,20 @@ def _condition_state_validation(
     }
 
 
+def _restore_transactional_solver_options(
+    model: Any, production_options: dict[str, Any]
+) -> dict[str, Any]:
+    model.opt.tolerance = production_options["opt.tolerance"]
+    model.opt.iterations = production_options["opt.iterations"]
+    after = _model_option_snapshot(model)
+    difference = _option_difference(production_options, after)
+    return {
+        "after_options": after,
+        "difference": difference,
+        "MODEL_OPTION_RESTORE": "PASS" if difference["only_allowed"] else "FAIL",
+    }
+
+
 def _run_condition(
     mujoco: Any,
     base_model: Any,
@@ -553,69 +908,88 @@ def _run_condition(
     zero_warmstart: bool,
     tight: bool,
     production_options: dict[str, Any],
-    morphology_xml: Path,
+    isolation_method: str,
+    mjb_path: Path | None,
 ) -> dict[str, Any]:
-    model, model_copy_api = _copy_model(
-        mujoco, base_model, morphology_xml, production_options
-    )
+    transactional = isolation_method == "TRANSACTIONAL_SOLVER_OPTION_RESTORE"
+    clone_smoke = None
+    if transactional:
+        model = base_model
+        model_copy_api = "TRANSACTIONAL_SHARED_MODEL"
+    else:
+        model, model_copy_api, clone_smoke = _copy_model(
+            mujoco, base_model, isolation_method, mjb_path
+        )
     configuration = _configure_model(model, production_options, tight)
-    data = mujoco.MjData(model)
-    mujoco.mj_copyData(data, model, snapshot)
-    state_before_stage = aref.cone_helper.state_input_snapshot(data)
-    if zero_warmstart:
-        data.qacc_warmstart[:] = 0
-    staged_calls = aref.stage_to_constraint(mujoco, model, data)
-    state_validation = _condition_state_validation(snapshot, data, zero_warmstart)
-    pre_constraint = regularization._constraint_snapshot(data, mujoco, model)
-    pre_geometry = _contact_geometry(data, mujoco, model)
-    warmstart_input = np.asarray(data.qacc_warmstart, dtype=np.float64).copy()
-    mujoco.mj_fwdConstraint(model, data)
-    solver_data = mujoco.MjData(model)
-    mujoco.mj_copyData(solver_data, model, data)
-    post_constraint = regularization._constraint_snapshot(
-        solver_data, mujoco, model, read_physical_contact_forces=True
-    )
-    trace = _solver_iteration_trace(solver_data, model)
-    numerics = _solver_numerics(solver_data, model, warmstart_input, trace, configuration)
-    mujoco.mj_Euler(model, data)
-    capture = regularization.capture_after_integration(
-        mujoco, model, data, snapshot, mapping, solver_data
-    )
-    demand = regularization._run_shared_demand(capture)
-    excess = regularization._run_excess(capture, demand)
-    return {
-        "condition_name": name,
-        "condition_label": label,
-        "zero_warmstart": bool(zero_warmstart),
-        "tight_tolerance": bool(tight),
-        "model_copy_api": model_copy_api,
-        "model_options": _model_option_snapshot(model),
-        "configuration": configuration,
-        "state_validation": state_validation,
-        "state_before_stage": state_before_stage,
-        "pre_constraint": pre_constraint,
-        "pre_contact_geometry": pre_geometry,
-        "post_constraint": post_constraint,
-        "capture": capture,
-        "shared_demand": demand,
-        "excess": excess,
-        "solver_iteration_trace": trace,
-        "solver_numerics": numerics,
-        "one_step_result": {
-            "post_qpos": np.asarray(data.qpos, dtype=np.float64).copy(),
-            "post_qvel": np.asarray(data.qvel, dtype=np.float64).copy(),
-            "post_time": float(data.time),
-            "target_post_slip": excess["post_slip"],
-        },
-        "counts": {
-            "condition_staged_forward_count": 1,
-            "constraint_solve_count": 1,
-            "custom_integration_count": 1,
-            "staged_calls": staged_calls,
-            "solver_calls": ["mj_fwdConstraint"],
-            "integration_api": "mujoco.mj_Euler",
-        },
-    }
+    result = None
+    try:
+        data = mujoco.MjData(model)
+        mujoco.mj_copyData(data, model, snapshot)
+        state_before_stage = aref.cone_helper.state_input_snapshot(data)
+        if zero_warmstart:
+            data.qacc_warmstart[:] = 0
+        staged_calls = aref.stage_to_constraint(mujoco, model, data)
+        state_validation = _condition_state_validation(snapshot, data, zero_warmstart)
+        pre_constraint = regularization._constraint_snapshot(data, mujoco, model)
+        pre_geometry = _contact_geometry(data, mujoco, model)
+        warmstart_input = np.asarray(data.qacc_warmstart, dtype=np.float64).copy()
+        mujoco.mj_fwdConstraint(model, data)
+        solver_data = mujoco.MjData(model)
+        mujoco.mj_copyData(solver_data, model, data)
+        post_constraint = regularization._constraint_snapshot(
+            solver_data, mujoco, model, read_physical_contact_forces=True
+        )
+        trace = _solver_iteration_trace(solver_data, model)
+        numerics = _solver_numerics(solver_data, model, warmstart_input, trace, configuration)
+        mujoco.mj_Euler(model, data)
+        capture = regularization.capture_after_integration(
+            mujoco, model, data, snapshot, mapping, solver_data
+        )
+        demand = regularization._run_shared_demand(capture)
+        excess = regularization._run_excess(capture, demand)
+        result = {
+            "condition_name": name,
+            "condition_label": label,
+            "zero_warmstart": bool(zero_warmstart),
+            "tight_tolerance": bool(tight),
+            "model_copy_api": model_copy_api,
+            "model_clone_method": isolation_method,
+            "clone_smoke": clone_smoke,
+            "model_options": _model_option_snapshot(model),
+            "configuration": configuration,
+            "state_validation": state_validation,
+            "state_before_stage": state_before_stage,
+            "pre_constraint": pre_constraint,
+            "pre_contact_geometry": pre_geometry,
+            "post_constraint": post_constraint,
+            "capture": capture,
+            "shared_demand": demand,
+            "excess": excess,
+            "solver_iteration_trace": trace,
+            "solver_numerics": numerics,
+            "one_step_result": {
+                "post_qpos": np.asarray(data.qpos, dtype=np.float64).copy(),
+                "post_qvel": np.asarray(data.qvel, dtype=np.float64).copy(),
+                "post_time": float(data.time),
+                "target_post_slip": excess["post_slip"],
+            },
+            "counts": {
+                "condition_staged_forward_count": 1,
+                "constraint_solve_count": 1,
+                "custom_integration_count": 1,
+                "staged_calls": staged_calls,
+                "solver_calls": ["mj_fwdConstraint"],
+                "integration_api": "mujoco.mj_Euler",
+            },
+        }
+    finally:
+        if transactional:
+            restore = _restore_transactional_solver_options(model, production_options)
+        else:
+            restore = {"MODEL_OPTION_RESTORE": "NOT_APPLICABLE_INDEPENDENT_CLONE"}
+        if result is not None:
+            result["model_option_restore"] = restore
+    return result
 
 
 def _relative_delta(left: float, right: float) -> float | None:
@@ -1003,7 +1377,7 @@ def _classify_final(
             action = "SOLVER_TOLERANCE_COUNTERFACTUAL"
         elif convergence["PRODUCTION_NEWTON_CONVERGENCE"] == "VALIDATED":
             status = "ROBUST_CONVERGED_SOLUTION"
-            action = "FORMULATION_LEVEL_DIFFERENCE_CONFIRMED"
+            action = "NORMAL_REFERENCE_ACCELERATION_COUNTERFACTUAL"
         else:
             status = "INSUFFICIENT_EVIDENCE"
             action = "INSUFFICIENT_EVIDENCE"
@@ -1073,6 +1447,9 @@ def _tolerance_sensitivity(
 def _condition_payload(condition: dict[str, Any]) -> dict[str, Any]:
     capture = condition["capture"]
     return {
+        "model_clone_method": condition["model_clone_method"],
+        "clone_smoke": condition["clone_smoke"],
+        "model_option_restore": condition["model_option_restore"],
         "state_validation": condition["state_validation"],
         "solver_iteration_trace": condition["solver_iteration_trace"],
         "solver_numerics": condition["solver_numerics"],
@@ -1167,11 +1544,20 @@ def _custom_one_step_regression(
     snapshot: Any,
     mapping: dict[str, Any],
     production_options: dict[str, Any],
-    morphology_xml: Path,
+    isolation_method: str,
+    staged_mjb_path: Path | None,
+    full_mjb_path: Path | None,
 ) -> dict[str, Any]:
-    staged_model, staged_copy_api = _copy_model(
-        mujoco, base_model, morphology_xml, production_options
-    )
+    if isolation_method == "TRANSACTIONAL_SOLVER_OPTION_RESTORE":
+        staged_model = full_model = base_model
+        staged_copy_api = full_copy_api = "TRANSACTIONAL_SHARED_MODEL"
+    else:
+        staged_model, staged_copy_api, _ = _copy_model(
+            mujoco, base_model, isolation_method, staged_mjb_path
+        )
+        full_model, full_copy_api, _ = _copy_model(
+            mujoco, base_model, isolation_method, full_mjb_path
+        )
     staged_data = mujoco.MjData(staged_model)
     mujoco.mj_copyData(staged_data, staged_model, snapshot)
     aref.stage_to_constraint(mujoco, staged_model, staged_data)
@@ -1180,9 +1566,6 @@ def _custom_one_step_regression(
     mujoco.mj_copyData(staged_solver, staged_model, staged_data)
     mujoco.mj_Euler(staged_model, staged_data)
 
-    full_model, full_copy_api = _copy_model(
-        mujoco, base_model, morphology_xml, production_options
-    )
     full_data = mujoco.MjData(full_model)
     mujoco.mj_copyData(full_data, full_model, snapshot)
     mujoco.mj_step(full_model, full_data)
@@ -1211,14 +1594,34 @@ def _custom_one_step_regression(
             "mj_fwdPosition", "mj_fwdVelocity", "mj_fwdActuation",
             "mj_fwdAcceleration", "mj_fwdConstraint", "mj_Euler",
         ],
-        "full_validation_calls": ["mj_step on independent model/data clone"],
+        "full_validation_calls": [
+            "mj_step on independent model/data clone"
+            if isolation_method != "TRANSACTIONAL_SOLVER_OPTION_RESTORE"
+            else "mj_step on independent MjData clone using transactional shared model"
+        ],
         "model_copy_api": [staged_copy_api, full_copy_api],
+        "model_clone_method": isolation_method,
         "CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION": "PASS" if all(checks.values()) else "FAIL",
     }
 
 
 def _write_failure_placeholders(output: Path, error: Exception) -> None:
     placeholders = {
+        "model_clone_api_discovery.json": {
+            "EXACT_MODEL_CLONE_API": "UNAVAILABLE",
+            "MODEL_CLONE_METHOD": None,
+            "status": "INSUFFICIENT_EVIDENCE",
+        },
+        "runtime_vs_source_geom_inventory.json": {
+            "RUNTIME_MODEL_STRUCTURE": "OTHER_MISMATCH",
+            "status": "INSUFFICIENT_EVIDENCE",
+        },
+        "model_clone_fidelity.json": {
+            "EXACT_MODEL_CLONE_FIDELITY": "FAIL",
+        },
+        "clone_data_state_fidelity.json": {
+            "CLONE_DATA_STATE_FIDELITY": "FAIL",
+        },
         "solver_optimization_invariant_validation.json": {
             "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION": "INSUFFICIENT_EVIDENCE",
         },
@@ -1256,6 +1659,11 @@ def _write_failure_placeholders(output: Path, error: Exception) -> None:
 
 def _failure_payload(error: Exception) -> dict[str, Any]:
     return {
+        "RUNTIME_MODEL_STRUCTURE": "OTHER_MISMATCH",
+        "EXACT_MODEL_CLONE_API": "UNAVAILABLE",
+        "MODEL_CLONE_METHOD": None,
+        "EXACT_MODEL_CLONE_FIDELITY": "FAIL",
+        "CLONE_DATA_STATE_FIDELITY": "FAIL",
         "OPTIMIZATION_BASELINE_REPRODUCTION": "FAIL",
         "ZERO_WARMSTART_ACTIVATION": "FAILED",
         "TIGHT_TOLERANCE_ACTIVATION": "FAILED",
@@ -1280,6 +1688,8 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     source_before = _source_hashes(paths)
     corrected_reference = aref.cone_helper.load_reference(paths["corrected_oracle"])
     mujoco = __import__("mujoco")
+    discovery = _capability_discovery(mujoco)
+    write_json(output / "model_clone_api_discovery.json", discovery)
     recorder, mapping = aref.cone_helper.replay_once(args, paths)
     model = recorder.raw_model
     snapshot = recorder.global55_snapshot
@@ -1301,6 +1711,42 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     if int(model.opt.solver) != production_solver:
         raise RuntimeError("formal optimization diagnostic requires mjSOL_NEWTON")
     production_options = _model_option_snapshot(model)
+    source_inventory = _runtime_source_geom_inventory(
+        mujoco, model, paths["morphology_xml"]
+    )
+    write_json(output / "runtime_vs_source_geom_inventory.json", source_inventory)
+    run_stamp = output.name.replace("mujoco_global55_solver_optimization_", "")
+    mjb_root = REPO_ROOT / "tmp" / f"solver_optimization_live_model_{run_stamp}"
+    isolation_method, exact_clone_api, probe_clone = _select_model_isolation_method(
+        mujoco, model, discovery, mjb_root
+    )
+    discovery["EXACT_MODEL_CLONE_API"] = exact_clone_api
+    discovery["MODEL_CLONE_METHOD"] = isolation_method
+    write_json(output / "model_clone_api_discovery.json", discovery)
+    if probe_clone is None:
+        clone_fidelity = {
+            "method": isolation_method,
+            "EXACT_MODEL_CLONE_FIDELITY": "NOT_APPLICABLE_TRANSACTIONAL",
+        }
+        clone_data_fidelity = _clone_data_state_fidelity(
+            mujoco, model, snapshot, isolation_method
+        )
+    else:
+        clone_fidelity = _model_clone_fidelity(
+            mujoco, model, probe_clone, isolation_method
+        )
+        clone_data_fidelity = _clone_data_state_fidelity(
+            mujoco, probe_clone, snapshot, isolation_method
+        )
+    write_json(output / "model_clone_fidelity.json", clone_fidelity)
+    write_json(output / "clone_data_state_fidelity.json", clone_data_fidelity)
+    exact_fidelity_valid = clone_fidelity["EXACT_MODEL_CLONE_FIDELITY"] in {
+        "PASS", "NOT_APPLICABLE_TRANSACTIONAL"
+    }
+    if not exact_fidelity_valid:
+        raise RuntimeError("exact compiled-model clone fidelity gate failed")
+    if clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"] != "PASS":
+        raise RuntimeError("clone-data state fidelity gate failed")
     write_json(output / "global55_pre_state_snapshot.json", aref.cone_helper.state_input_snapshot(snapshot))
     write_json(output / "state_copy_manifest.json", {
         **aref.cone_helper.state_copy_manifest(snapshot),
@@ -1309,9 +1755,14 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
 
     conditions: dict[str, dict[str, Any]] = {}
     for name, label, zero_warmstart, tight in CONDITIONS:
+        mjb_path = (
+            REPO_ROOT / "tmp"
+            / f"solver_optimization_live_model_{run_stamp}_{name}.mjb"
+            if isolation_method == "MJB_ROUNDTRIP" else None
+        )
         condition = _run_condition(
             mujoco, model, snapshot, mapping, name, label,
-            zero_warmstart, tight, production_options, paths["morphology_xml"],
+            zero_warmstart, tight, production_options, isolation_method, mjb_path,
         )
         conditions[name] = condition
         _write_condition(output, condition)
@@ -1331,7 +1782,17 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
     )
     custom_step = _custom_one_step_regression(
         mujoco, model, snapshot, mapping, production_options,
-        paths["morphology_xml"],
+        isolation_method,
+        (
+            REPO_ROOT / "tmp"
+            / f"solver_optimization_live_model_{run_stamp}_custom_staged.mjb"
+            if isolation_method == "MJB_ROUNDTRIP" else None
+        ),
+        (
+            REPO_ROOT / "tmp"
+            / f"solver_optimization_live_model_{run_stamp}_custom_full.mjb"
+            if isolation_method == "MJB_ROUNDTRIP" else None
+        ),
     )
     write_json(output / "solver_optimization_invariant_validation.json", invariant)
     write_json(output / "warmstart_activation.json", warmstart_activation)
@@ -1359,6 +1820,8 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         and custom_step["CUSTOM_PIPELINE_ONE_STEP_REPRODUCTION"] == "PASS"
         and source_unchanged
         and model_restore["only_allowed"]
+        and exact_fidelity_valid
+        and clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"] == "PASS"
         and len(recorder.records) == EXPECTED_SUBSTEPS
     )
     if not gates and final["MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS"] == "ROBUST_CONVERGED_SOLUTION":
@@ -1368,6 +1831,11 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
             "interpretation": None,
         }
     validation = {
+        "RUNTIME_MODEL_STRUCTURE": source_inventory["RUNTIME_MODEL_STRUCTURE"],
+        "EXACT_MODEL_CLONE_API": discovery["EXACT_MODEL_CLONE_API"],
+        "MODEL_CLONE_METHOD": isolation_method,
+        "EXACT_MODEL_CLONE_FIDELITY": clone_fidelity["EXACT_MODEL_CLONE_FIDELITY"],
+        "CLONE_DATA_STATE_FIDELITY": clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"],
         "OPTIMIZATION_BASELINE_REPRODUCTION": baseline["OPTIMIZATION_BASELINE_REPRODUCTION"],
         "ZERO_WARMSTART_ACTIVATION": warmstart_activation["ZERO_WARMSTART_ACTIVATION"],
         "TIGHT_TOLERANCE_ACTIVATION": tight_activation["TIGHT_TOLERANCE_ACTIVATION"],
@@ -1387,9 +1855,15 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "UNCONDITIONAL_ZIP_PACKAGING": "ENABLED",
         "LOCAL_IMPLEMENTATION": "READY_FOR_SERVER_VALIDATION",
         "COUNTERFACTUAL_VALID": gates,
-        "semantic_scope": "Only qacc_warmstart, solver tolerance, and solver iterations were changed on independent clones.",
+        "semantic_scope": (
+            "Only qacc_warmstart, solver tolerance, and solver iterations were changed; "
+            "conditions use independent compiled-model clones when available, otherwise "
+            "transactional shared-model solver-option restore with independent MjData."
+        ),
     }
     summary = {key: validation[key] for key in (
+        "RUNTIME_MODEL_STRUCTURE", "EXACT_MODEL_CLONE_API", "MODEL_CLONE_METHOD",
+        "EXACT_MODEL_CLONE_FIDELITY", "CLONE_DATA_STATE_FIDELITY",
         "OPTIMIZATION_BASELINE_REPRODUCTION", "ZERO_WARMSTART_ACTIVATION",
         "TIGHT_TOLERANCE_ACTIVATION", "SOLVER_OPTIMIZATION_DIAGNOSTIC_ISOLATION",
         "SOLVER_WARMSTART_SENSITIVITY", "SOLVER_TOLERANCE_SENSITIVITY",
@@ -1412,6 +1886,11 @@ def execute(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
         "solver": "mjSOL_NEWTON",
         "cone": "mjCONE_PYRAMIDAL",
         "conditions": [label for _, label, _, _ in CONDITIONS],
+        "EXACT_MODEL_CLONE_API": discovery["EXACT_MODEL_CLONE_API"],
+        "MODEL_CLONE_METHOD": isolation_method,
+        "EXACT_MODEL_CLONE_FIDELITY": clone_fidelity["EXACT_MODEL_CLONE_FIDELITY"],
+        "CLONE_DATA_STATE_FIDELITY": clone_data_fidelity["CLONE_DATA_STATE_FIDELITY"],
+        "runtime_model_structure": source_inventory["RUNTIME_MODEL_STRUCTURE"],
         "condition_staged_forward_count": 4,
         "condition_constraint_solve_count": 4,
         "condition_custom_integration_count": 4,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-08
+
+- 修复 global55 Newton optimization diagnostic 的 compiled `MjModel` clone：禁止 XML 重编译作为正式 clone，新增 `mj_copyModel` smoke、MJB roundtrip、transactional solver-option restore、runtime/source geom inventory、clone fidelity 与 clone-data state evidence。
+
 ## 2026-08-06
 
 - 新增固定 global55 的 Newton solver optimization diagnostic：仅在独立 clone 上比较 production/zero warmstart 与 tight tolerance/iteration limit，记录完整 solver iteration statistics、敏感性、收敛性和自动 ZIP artifact；不修改接触物理或已有正式工具。

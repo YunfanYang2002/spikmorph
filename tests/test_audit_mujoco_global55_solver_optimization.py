@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -126,46 +127,109 @@ class SolverOptimizationTests(unittest.TestCase):
         AUDIT._configure_model(model, production, False)
         self.assertTrue(AUDIT._option_difference(production, AUDIT._model_option_snapshot(model))["only_allowed"])
 
-    def test_model_clone_falls_back_to_validated_xml_when_copy_symbol_is_missing(self):
-        seen = []
+    def test_mj_copy_model_is_preferred_and_smoked(self):
+        source = _model()
 
-        class FakeModel:
+        class FakeMujoco:
             @staticmethod
-            def from_xml_path(path):
-                seen.append(path)
+            def mj_copyModel(destination, model):
+                self.assertIsNone(destination)
                 return _model()
 
-        fake_mujoco = SimpleNamespace(MjModel=FakeModel)
-        copied, method = AUDIT._copy_model(
-            fake_mujoco, _model(), Path("model.xml"), AUDIT._model_option_snapshot(_model())
+        clone, method, smoke = AUDIT._copy_model(
+            FakeMujoco, source, "MJ_COPY_MODEL"
         )
-        self.assertIsNotNone(copied)
-        self.assertEqual(method, "mujoco.MjModel.from_xml_path+base_snapshot_sync")
-        self.assertEqual(seen, ["model.xml"])
+        self.assertIsNot(clone, source)
+        self.assertEqual(method, "MJ_COPY_MODEL")
+        self.assertEqual(smoke["CLONE_SMOKE"], "PASS")
 
-    def test_xml_clone_syncs_runtime_model_options_and_contact_arrays(self):
-        reference = _model()
-        reference.opt.disableflags = 7
-        reference.geom_friction[0, 0] = 0.9
-        reference.geom_solref[0, 0] = 0.02
-        reference.geom_solimp[0, 0] = 0.8
-        compiled = _model()
+    def test_mjb_roundtrip_preserves_compiled_runtime_model(self):
+        class FakeModel:
+            @staticmethod
+            def from_binary_path(path):
+                self.assertTrue(Path(path).is_file())
+                return _model()
+
+        def save_model(model, path, _vfs):
+            Path(path).write_bytes(b"compiled-mjb")
+
+        with tempfile.TemporaryDirectory() as directory:
+            clone, method, smoke = AUDIT._copy_model(
+                SimpleNamespace(mj_saveModel=save_model, MjModel=FakeModel),
+                _model(),
+                "MJB_ROUNDTRIP",
+                Path(directory) / "live_model.mjb",
+            )
+        self.assertIsNotNone(clone)
+        self.assertEqual(method, "MJB_ROUNDTRIP")
+        self.assertEqual(smoke["CLONE_SMOKE"], "PASS")
+
+    def test_transactional_fallback_restores_solver_options(self):
+        model = _model()
+        before = AUDIT._model_option_snapshot(model)
+        report = AUDIT._transactional_smoke(SimpleNamespace(), model)
+        self.assertEqual(report["TRANSACTIONAL_SMOKE"], "PASS")
+        self.assertTrue(AUDIT._option_difference(before, AUDIT._model_option_snapshot(model))["only_allowed"])
+
+    def test_formal_copy_function_has_no_xml_clone_fallback(self):
+        source = inspect.getsource(AUDIT._copy_model)
+        self.assertNotIn("from_xml_path", source)
+        self.assertNotIn("from_xml_string", source)
+
+    def test_runtime_source_inventory_reports_live_augmentation(self):
+        def geom_model(count):
+            model = _model()
+            model.ngeom = count
+            model.nbody = 1
+            model.geom_type = np.zeros(count, dtype=np.int32)
+            model.geom_bodyid = np.zeros(count, dtype=np.int32)
+            model.geom_contype = np.ones(count, dtype=np.int32)
+            model.geom_conaffinity = np.ones(count, dtype=np.int32)
+            model.geom_friction = np.ones((count, 3))
+            return model
+
+        live, source = geom_model(2), geom_model(1)
 
         class FakeModel:
             @staticmethod
             def from_xml_path(_path):
-                return compiled
+                return source
 
-        copied, _ = AUDIT._copy_model(
-            SimpleNamespace(MjModel=FakeModel),
-            reference,
-            Path("model.xml"),
-            AUDIT._model_option_snapshot(reference),
+        class Obj:
+            mjOBJ_GEOM = 0
+            mjOBJ_BODY = 1
+
+        def name(_model, object_type, index):
+            if object_type == Obj.mjOBJ_GEOM:
+                return ["floor", "runtime_augmented"][index]
+            return "world"
+
+        report = AUDIT._runtime_source_geom_inventory(
+            SimpleNamespace(MjModel=FakeModel, mjtObj=Obj, mj_id2name=name),
+            live,
+            Path("source.xml"),
         )
-        self.assertEqual(copied.opt.disableflags, 7)
-        np.testing.assert_array_equal(copied.geom_friction, reference.geom_friction)
-        np.testing.assert_array_equal(copied.geom_solref, reference.geom_solref)
-        np.testing.assert_array_equal(copied.geom_solimp, reference.geom_solimp)
+        self.assertEqual(report["RUNTIME_MODEL_STRUCTURE"], "HAS_RUNTIME_AUGMENTATION")
+        self.assertEqual(report["live_only_geom_names"], ["runtime_augmented"])
+
+    def test_capability_discovery_records_symbols_without_replay(self):
+        def copy_model(_destination, _source):
+            return None
+
+        class FakeModel:
+            from_binary_path = staticmethod(lambda _path: None)
+
+        report = AUDIT._capability_discovery(
+            SimpleNamespace(
+                __version__="3.8.1",
+                mj_copyModel=copy_model,
+                mj_saveModel=lambda _model, _path, _vfs: None,
+                MjModel=FakeModel,
+            )
+        )
+        self.assertTrue(report["symbols"]["mj_copyModel"]["available"])
+        self.assertTrue(report["symbols"]["mj_saveModel"]["available"])
+        self.assertTrue(report["symbols"]["MjModel.from_binary_path"]["available"])
 
     def test_solver_iteration_trace_reads_all_required_statistics(self):
         stats = [SimpleNamespace(**{
@@ -218,7 +282,7 @@ class SolverOptimizationTests(unittest.TestCase):
         baseline = {"OPTIMIZATION_BASELINE_REPRODUCTION": "PASS"}
         result = AUDIT._classify_final(invariant, warm, tolerance, convergence, baseline)
         self.assertEqual(result["MUJOCO_SOLVER_EXCESS_OPTIMIZATION_STATUS"], "ROBUST_CONVERGED_SOLUTION")
-        self.assertEqual(result["NEXT_ACTION"], "FORMULATION_LEVEL_DIFFERENCE_CONFIRMED")
+        self.assertEqual(result["NEXT_ACTION"], "NORMAL_REFERENCE_ACCELERATION_COUNTERFACTUAL")
 
         warm["SOLVER_WARMSTART_SENSITIVITY"] = "SENSITIVE"
         result = AUDIT._classify_final(invariant, warm, tolerance, convergence, baseline)
@@ -236,6 +300,20 @@ class SolverOptimizationTests(unittest.TestCase):
         payload = AUDIT._failure_payload(RuntimeError("boom"))
         self.assertEqual(payload["LOCAL_IMPLEMENTATION"], "INCOMPLETE")
         self.assertEqual(payload["UNCONDITIONAL_ZIP_PACKAGING"], "ENABLED")
+
+    def test_failure_placeholders_include_clone_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "artifact"
+            artifact.mkdir()
+            AUDIT._write_failure_placeholders(artifact, RuntimeError("boom"))
+            for filename in (
+                "model_clone_api_discovery.json",
+                "runtime_vs_source_geom_inventory.json",
+                "model_clone_fidelity.json",
+                "clone_data_state_fidelity.json",
+                "failure_context.json",
+            ):
+                self.assertTrue((artifact / filename).is_file())
 
     def test_zip_helper_contract(self):
         with tempfile.TemporaryDirectory() as directory:
