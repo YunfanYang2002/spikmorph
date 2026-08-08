@@ -2,6 +2,8 @@
 
 ## 2026-08-08
 
+- 新增固定 global55 normal `efc_aref` component 单因素反事实工具：复用已验证 replay 与 pyramidal row geometry decomposition，仅缩放 active floor-contact edge rows 的 normal reference acceleration，并加入 normal-contact regime、friction-cap、per-island Newton numerics、baseline/restore、custom-step 与无条件 ZIP 校验。
+
 - 修复 global55 Newton optimization diagnostic 的 compiled `MjModel` clone：禁止 XML 重编译作为正式 clone，新增 `mj_copyModel` smoke、MJB roundtrip、transactional solver-option restore、runtime/source geom inventory、clone fidelity 与 clone-data state evidence。
 
 ## 2026-08-06
